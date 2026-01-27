@@ -1966,14 +1966,14 @@ mod tests {
 
         let public_input = vec![Fp::from(1)];
 
-        let test = true;
-        // let test = fasle;
+        // let test = true;
+        let test = false;
 
         if test {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_obj_q13";
+            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_obj_q3";
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

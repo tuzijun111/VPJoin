@@ -2110,7 +2110,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/sql/param16";
+        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param16";
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -2280,8 +2280,8 @@ mod tests {
 
         let public_input = vec![Fp::from(1)];
 
-        let test = true;
-        // let test = false;
+        // let test = true;
+        let test = false;
 
         if test {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();

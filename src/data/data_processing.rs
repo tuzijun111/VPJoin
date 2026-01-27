@@ -3,6 +3,11 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
+fn count_lines(file_path: &str) -> io::Result<usize> {
+    let file = File::open(Path::new(file_path))?;
+    Ok(io::BufReader::new(file).lines().count())
+}
+
 #[derive(Debug)]
 pub(crate) struct Nation {
     pub n_nationkey: u64,
@@ -330,8 +335,10 @@ mod tests {
         // Call the function with different file paths
 
         if let Ok(records) =
-            // customer_read_records_from_file("/Users/binbingu/halo2-TPCH/src/data/customer.tbl")
-            customer_read_records_from_file("/home/cc/halo2-TPCH/src/data/customer.tbl")
+            // customer_read_records_from_file("/home2/binbin/PoneglyphDB/src/data/customer.tbl")
+            customer_read_records_from_file(
+                "/home2/binbin/PoneglyphDB/src/data/customer.tbl",
+            )
         {
             println!("{:?}", string_to_u64(&records[4].c_mktsegment));
         } else {
@@ -339,7 +346,7 @@ mod tests {
         }
 
         if let Ok(records) =
-            orders_read_records_from_file("/Users/binbingu/halo2-TPCH/src/data/orders.tbl")
+            orders_read_records_from_file("/home2/binbin/PoneglyphDB/src/data/orders.tbl")
         {
             println!("{:?}", string_to_u64(&records[0].o_orderdate));
         } else {
@@ -347,7 +354,7 @@ mod tests {
         }
 
         if let Ok(records) =
-            lineitem_read_records_from_file("/Users/binbingu/halo2-TPCH/src/data/lineitem.tbl")
+            lineitem_read_records_from_file("/home2/binbin/PoneglyphDB/src/data/lineitem.tbl")
         {
             println!("{:?}", string_to_u64(&records[0].l_shipdate));
             // println!("{:?}", string_to_u64(&records[1].l_shipdate));
@@ -356,11 +363,52 @@ mod tests {
             println!("Failed to read records from file1");
         }
 
-        if let Ok(records) = region_read_records_from_cvs("/home/cc/halo2-TPCH/src/data/region.cvs")
+        if let Ok(records) =
+            region_read_records_from_cvs("/home2/binbin/PoneglyphDB/src/data/region.cvs")
         {
             println!("{:?}", string_to_u64(&records[3].r_name));
         } else {
             println!("Failed to read records from file2");
         }
+    }
+
+    #[test]
+    fn print_counts_fast() {
+        let base = "/home2/binbin/PoneglyphDB/src/data";
+
+        println!(
+            "nation:   {}",
+            count_lines(&format!("{base}/nation.tbl")).unwrap()
+        );
+        println!(
+            "part:     {}",
+            count_lines(&format!("{base}/part.tbl")).unwrap()
+        );
+        println!(
+            "customer: {}",
+            count_lines(&format!("{base}/customer.tbl")).unwrap()
+        );
+        println!(
+            "orders:   {}",
+            count_lines(&format!("{base}/orders.tbl")).unwrap()
+        );
+        println!(
+            "lineitem: {}",
+            count_lines(&format!("{base}/lineitem.tbl")).unwrap()
+        );
+        println!(
+            "partsupp: {}",
+            count_lines(&format!("{base}/partsupp.tbl")).unwrap()
+        );
+        println!(
+            "supplier: {}",
+            count_lines(&format!("{base}/supplier.tbl")).unwrap()
+        );
+
+        // for your region.cvs (pipe-delimited, no headers), line count works too:
+        println!(
+            "region:   {}",
+            count_lines(&format!("{base}/region.cvs")).unwrap()
+        );
     }
 }

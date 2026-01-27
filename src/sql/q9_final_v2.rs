@@ -19,7 +19,6 @@ use std::collections::HashSet;
 
 use std::mem;
 
-
 const NUM_BYTES: usize = 5;
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
@@ -1120,7 +1119,7 @@ mod tests {
         // Time to generate parameters
         // let params_time_start = Instant::now();
         // let params: ParamsIPA<vesta::Affine> = ParamsIPA::new(k);
-        let params_path = "/home/cc/halo2-TPCH/src/sql/param18";
+        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param16";
         // let mut fd = std::fs::File::create(&proof_path).unwrap();
         // params.write(&mut fd).unwrap();
         // println!("Time to generate params {:?}", params_time);
@@ -1212,12 +1211,12 @@ mod tests {
         // let nation_file_path = "/Users/binbingu/halo2-TPCH/src/data/nation.tbl";
         // let region_file_path = "/Users/binbingu/halo2-TPCH/src/data/region.csv";
 
-        let part_file_path = "/home/cc/halo2-TPCH/src/data/part.tbl";
-        let supplier_file_path = "/home/cc/halo2-TPCH/src/data/supplier.tbl";
-        let lineitem_file_path = "/home/cc/halo2-TPCH/src/data/lineitem_240K.tbl";
-        let orders_file_path = "/home/cc/halo2-TPCH/src/data/orders.tbl";
-        let partsupp_file_path = "/home/cc/halo2-TPCH/src/data/partsupp.tbl";
-        let nation_file_path = "/home/cc/halo2-TPCH/src/data/nation.tbl";
+        let part_file_path = "/home2/binbin/PoneglyphDB/src/data/part.tbl";
+        let supplier_file_path = "/home2/binbin/PoneglyphDB/src/data/supplier.tbl";
+        let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
+        let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
+        let partsupp_file_path = "/home2/binbin/PoneglyphDB/src/data/partsupp.tbl";
+        let nation_file_path = "/home2/binbin/PoneglyphDB/src/data/nation.tbl";
 
         let mut part: Vec<Vec<u64>> = Vec::new();
         let mut supplier: Vec<Vec<u64>> = Vec::new();
@@ -1329,7 +1328,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home/cc/halo2-TPCH/src/sql/proof_q9_240K";
+            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_q9";
             generate_and_verify_proof(k, circuit, &public_input, proof_path);
         }
     }
