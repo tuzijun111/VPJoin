@@ -1790,7 +1790,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param22";
+        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param18";
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -1888,11 +1888,13 @@ mod tests {
     fn test() {
         let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
 
-        // let mut edges =
-        //     read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
-
         let mut edges =
-            read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
+            read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
+        // The length of n12 is: 232943
+        // 203 * 89 = 18067
+
+        // let mut edges =
+        //     read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
         // The length of n12 is: 2690019
 
         // let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
@@ -1904,8 +1906,8 @@ mod tests {
 
         let circuit = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra: 0,
-            bag2_pad_extra: 0,
+            bag1_pad_extra: 18067,
+            bag2_pad_extra: 18067,
             _marker: PhantomData,
         };
         let public_input = vec![Fp::from(cnt)];
@@ -1918,7 +1920,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/facebook_proof_q3";
+            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/last_proof_q3_dp";
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }
