@@ -17,6 +17,7 @@ pub mod overflow_check;
 pub mod overflow_check_v2;
 pub mod poseidon;
 
+pub mod graph_gadget;
 pub mod less_than_v1_test;
 pub mod permutation_any_test;
 pub mod poseidon_test;

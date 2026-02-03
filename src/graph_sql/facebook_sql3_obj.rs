@@ -1,30 +1,33 @@
-//! 5-cycle COUNT using treewidth-2 decomposition with message passing.
+//! Triangle / 3-cycle COUNT(*) with ordering (A<B<C) over a single Edge table.
+//!
+//! SQL:
+//!   SELECT COUNT(*) AS cnt
+//!   FROM Edge r1
+//!   JOIN Edge r2 ON r1.dst = r2.src
+//!   JOIN Edge r3 ON r2.dst = r3.src AND r3.dst = r1.src
+//!   WHERE r1.src < r2.src AND r2.src < r3.src;
 //!
 //! Variables:
-//!   x1 = r1.src = r5.dst
-//!   x2 = r1.dst = r2.src
-//!   x3 = r2.dst = r3.src
-//!   x4 = r3.dst = r4.src
-//!   x5 = r4.dst = r5.src
+//!   A = r1.src = r3.dst
+//!   B = r1.dst = r2.src
+//!   C = r2.dst = r3.src
 //!
-//! Decomposition (triangulation chords via messages):
-//!   Bag1 {x1,x2,x3}: T1 = R1 ⋈ R2  on x2
-//!   Bag3 {x1,x4,x5}: T3 = R4 ⋈ R5  on x5
-//!   Message/chord M13 = π(x1,x3) from T1 with multiplicity (#x2)
-//!   Message/chord M14 = π(x1,x4) from T3 with multiplicity (#x5)
+//! Acyclic decomposition (Path + Closer):
+//!   Bag1 {r1,r2}: materialize wedges A->B->C
+//!   Bag2 {r3}: edges C->A
+//!   Separator: (A,C)
 //!
-//! Bag2 reduced via messages (avoids cartesian over x1):
-//!   U  = M13 ⋈ R3 on x3  => (x1,x3,x4) with multiplicity = m13(x1,x3)
-//!   U' = U ⋉ M14 on (x1,x4)  (semijoin filter; preserves multiplicity)
+//! Message from Bag2 -> Bag1:
+//!   msg_key = pack2(A,C)
+//!   msg_val = COUNT(edges C->A) grouped by msg_key
 //!
-//! DP count:
-//!   msg13(x1,x3) = Σ_{x4} U'(x1,x3,x4) * deg14(x1,x4)   where deg14 = m14(x1,x4)
-//!   answer = Σ_{(x1,x2,x3) in T1} msg13(x1,x3)
+//! Final:
+//!   answer = Σ_{row in Bag1} msg_val(pack2(A,C)) * [A<B] * [B<C]
 //!
-//! Circuit gadgets (Q5-style):
-//!   - Join2To3 materialization for binary ⋈ binary -> triple (full many-to-many completeness)
-//!   - AggSumByKey for group-by sum over sorted keys (like Q5 run_sum, but weighted)
-//!   - SemijoinFilter with membership+gap proof (like Q5 ls_disjoin emptiness proof)
+//! Requires your existing chips:
+//!   crate::chips::is_zero::{IsZeroChip, IsZeroConfig}
+//!   crate::chips::less_than::{LtChip, LtConfig, LtInstruction}
+//!   crate::chips::permutation_any::{PermAnyChip, PermAnyConfig}
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
@@ -33,18 +36,22 @@ use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 
+// ✅ Use the dataset Edge type directly.
+use crate::data::graph_data_processing::Edge;
+
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
+// IMPORTANT: pack2(A,C) can exceed 5 bytes. Use 8 bytes to avoid LT gate failures.
 const NUM_BYTES: usize = 8;
-const MAX_SENTINEL: u64 = u64::MAX;
-const PAD_U64: u64 = MAX_SENTINEL;
 
-// shift IDs by +1 so 0 can be reserved as sentinel where needed
+const PAD_U64: u64 = u64::MAX;
+
+// shift node IDs by +1 so 0 can be reserved for dummy row
 const SHIFT_ID: u64 = 1;
 
-// pack two shifted node IDs (<= 2^20+1 fits in 21 bits)
-const PACK_BITS: u32 = 21;
+// pack2(hi, lo) using 32-bit lanes (assumes hi,lo < 2^32)
+const PACK_BITS: u32 = 32;
 const PACK_SHIFT: u64 = 1u64 << PACK_BITS;
 fn pack2(hi: u64, lo: u64) -> u64 {
     hi * PACK_SHIFT + lo
@@ -53,59 +60,50 @@ fn pack2(hi: u64, lo: u64) -> u64 {
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
-#[derive(Clone, Copy, Debug)]
-pub struct Edge {
-    pub src: u64,
-    pub dst: u64,
-}
-
 /// ------------------------------
 /// AggSumByKey: group-by SUM(val) over key
-/// (like Q5 group-by run_sum + emit-last-of-group)
+/// Produces:
+///  - out table: sorted unique keys with sums (padded)
+///  - map table: (map_key,map_val,map_key_next) for membership+gap proofs
 /// ------------------------------
 #[derive(Clone, Debug)]
 pub struct AggSumByKeyConfig<F: Field + Ord> {
-    // input (key,val)
-    in_key: Column<Advice>,
-    in_val: Column<Advice>,
+    pub in_key: Column<Advice>,
+    pub in_val: Column<Advice>,
 
-    // sorted copy (perm)
     sorted_key: Column<Advice>,
     sorted_val: Column<Advice>,
     perm_sort: PermAnyConfig,
 
-    // sort check on sorted_key (nondecreasing)
     q_sort: Selector,
     lt_key: LtConfig<F, NUM_BYTES>,
     iz_eq_key: IsZeroConfig<F>,
 
-    // run sum
     q_first: Selector,
     q_accu: Selector,
     run_sum: Column<Advice>,
     iz_same_prev: IsZeroConfig<F>,
     iz_same_next: IsZeroConfig<F>,
 
-    // emit (key,sum) only on last-of-group else PAD/0
     q_emit: Selector,
     emit_key: Column<Advice>,
     emit_sum: Column<Advice>,
 
-    // compact emitted rows (perm)
     out_key: Column<Advice>,
     out_sum: Column<Advice>,
     perm_out: PermAnyConfig,
 
-    // out sorted check
     q_out_sort: Selector,
     lt_out_key: LtConfig<F, NUM_BYTES>,
     iz_out_eq: IsZeroConfig<F>,
 
-    // map table for membership+value lookup:
-    // row0 dummy (0,0,next=0), row i+1 = out row i, key_next points to next key
-    map_key: Column<Advice>,
-    map_val: Column<Advice>,
-    map_key_next: Column<Advice>,
+    pub map_key: Column<Advice>,
+    pub map_val: Column<Advice>,
+    pub map_key_next: Column<Advice>,
+
+    // ✅ used on RHS in lookup_any => must be complex_selector()
+    pub q_map_tbl: Selector,
+
     q_map_first: Selector,
     q_map_link: Selector,
     q_map_shift: Selector,
@@ -169,7 +167,6 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         // run sum
         let run_sum = meta.advice_column();
         meta.enable_equality(run_sum);
-
         let q_first = meta.selector();
         let q_accu = meta.selector();
         let q_emit = meta.selector();
@@ -211,6 +208,7 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             vec![q * (rs_cur - (same * rs_prev + v))]
         });
 
+        // emit last-of-group
         let emit_key = meta.advice_column();
         let emit_sum = meta.advice_column();
         meta.enable_equality(emit_key);
@@ -237,7 +235,7 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             ]
         });
 
-        // compact emitted -> out
+        // compact emit -> out (permute)
         let out_key = meta.advice_column();
         let out_sum = meta.advice_column();
         meta.enable_equality(out_key);
@@ -253,7 +251,7 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             vec![out_key, out_sum],
         );
 
-        // out sorted nondecreasing
+        // out nondecreasing
         let q_out_sort = meta.selector();
         let lt_out_key = LtChip::<F, NUM_BYTES>::configure(
             meta,
@@ -284,12 +282,14 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         meta.enable_equality(map_val);
         meta.enable_equality(map_key_next);
 
+        let q_map_tbl = meta.complex_selector();
+
         let q_map_first = meta.selector();
         let q_map_link = meta.selector();
         let q_map_shift = meta.selector();
         let q_map_last = meta.selector();
 
-        meta.create_gate("map row0 dummy", |m| {
+        meta.create_gate("map row0 key/val = 0", |m| {
             let q = m.query_selector(q_map_first);
             vec![
                 q.clone() * m.query_advice(map_key, Rotation::cur()),
@@ -297,7 +297,6 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             ]
         });
 
-        // map row i+1 copies out row i
         meta.create_gate("map link out", |m| {
             let q = m.query_selector(q_map_link);
             vec![
@@ -351,6 +350,7 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             map_key,
             map_val,
             map_key_next,
+            q_map_tbl,
             q_map_first,
             q_map_link,
             q_map_shift,
@@ -358,13 +358,11 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         }
     }
 
-    /// Assigns full agg + map table.
-    /// Input length n; we also write one sentinel row (n) for next-comparisons.
     pub fn assign(
         &self,
         region: &mut Region<'_, F>,
         n: usize,
-        rows: &[(u64, u64)], // length n
+        rows: &[(u64, u64)],
     ) -> Result<Vec<(u64, u64)>, Error> {
         let cfg = &self.cfg;
 
@@ -375,27 +373,16 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         let iz_same_next_chip = IsZeroChip::construct(cfg.iz_same_next.clone());
         let iz_out_eq_chip = IsZeroChip::construct(cfg.iz_out_eq.clone());
 
-        // -------------------------
-        // 1) Perm selectors (in -> sorted)
-        // -------------------------
         for i in 0..n {
             cfg.perm_sort.q_perm1.enable(region, i)?;
             cfg.perm_sort.q_perm2.enable(region, i)?;
         }
 
-        // -------------------------
-        // 2) Build sorted + sentinel (Rust vec)
-        // -------------------------
         let mut sorted = rows.to_vec();
         sorted.sort_by_key(|(k, _)| *k);
-
-        // IMPORTANT: extend with sentinel so sorted_ext[i+1] is always valid for i in 0..n-1
         let mut sorted_ext = sorted.clone();
-        sorted_ext.push((PAD_U64, 0)); // index n
+        sorted_ext.push((PAD_U64, 0)); // sentinel
 
-        // -------------------------
-        // 3) Assign input and sorted columns
-        // -------------------------
         for i in 0..n {
             region.assign_advice(
                 || "in_key",
@@ -409,7 +396,6 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
                 i,
                 || Value::known(F::from(rows[i].1)),
             )?;
-
             region.assign_advice(
                 || "sorted_key",
                 cfg.sorted_key,
@@ -423,27 +409,21 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
                 || Value::known(F::from(sorted_ext[i].1)),
             )?;
         }
-
-        // Sentinel row in circuit columns (row n)
         region.assign_advice(
             || "sorted_key_s",
             cfg.sorted_key,
             n,
-            || Value::known(F::from(sorted_ext[n].0)), // PAD_U64
+            || Value::known(F::from(sorted_ext[n].0)),
         )?;
         region.assign_advice(
             || "sorted_val_s",
             cfg.sorted_val,
             n,
-            || Value::known(F::from(sorted_ext[n].1)), // 0
+            || Value::known(F::from(sorted_ext[n].1)),
         )?;
 
-        // -------------------------
-        // 4) Sorted check (nondecreasing): compare sorted_ext[i] <= sorted_ext[i+1]
-        // -------------------------
         for i in 0..n {
             cfg.q_sort.enable(region, i)?;
-
             iz_eq_chip.assign(
                 region,
                 i,
@@ -457,9 +437,6 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             )?;
         }
 
-        // -------------------------
-        // 5) Run-sum selectors + emit selector
-        // -------------------------
         if n > 0 {
             cfg.q_first.enable(region, 0)?;
         }
@@ -470,24 +447,16 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             cfg.q_emit.enable(region, i)?;
         }
 
-        // -------------------------
-        // 6) Compute run_sum and assign IsZero helpers
-        //    - iz_same_prev is used by q_accu gate
-        //    - iz_same_next is used by q_emit gate
-        // -------------------------
         let mut run_sum_u64 = vec![0u64; n];
         let mut acc: u128 = 0;
-
         for i in 0..n {
-            let (k, v) = sorted_ext[i];
-
-            if i == 0 || sorted_ext[i - 1].0 != k {
+            let (k, v) = sorted[i];
+            if i == 0 || sorted[i - 1].0 != k {
                 acc = v as u128;
             } else {
                 acc += v as u128;
             }
             run_sum_u64[i] = acc as u64;
-
             region.assign_advice(
                 || "run_sum",
                 cfg.run_sum,
@@ -495,16 +464,13 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
                 || Value::known(F::from(run_sum_u64[i])),
             )?;
 
-            // Only needed/used on q_accu rows
             if i > 0 {
                 iz_same_prev_chip.assign(
                     region,
                     i,
-                    Value::known(F::from(sorted_ext[i].0) - F::from(sorted_ext[i - 1].0)),
+                    Value::known(F::from(sorted[i].0) - F::from(sorted[i - 1].0)),
                 )?;
             }
-
-            // Used on q_emit rows (all rows)
             iz_same_next_chip.assign(
                 region,
                 i,
@@ -512,39 +478,27 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             )?;
         }
 
-        // -------------------------
-        // 7) Emit last-of-group rows
-        // -------------------------
         let mut emitted: Vec<(u64, u64)> = vec![];
         for i in 0..n {
             let is_last = sorted_ext[i].0 != sorted_ext[i + 1].0;
-
             let ek = if is_last { sorted_ext[i].0 } else { PAD_U64 };
             let es = if is_last { run_sum_u64[i] } else { 0 };
-
             region.assign_advice(|| "emit_key", cfg.emit_key, i, || Value::known(F::from(ek)))?;
             region.assign_advice(|| "emit_sum", cfg.emit_sum, i, || Value::known(F::from(es)))?;
-
             if is_last && ek != PAD_U64 {
-                emitted.push((ek, run_sum_u64[i]));
+                emitted.push((ek, es));
             }
         }
 
-        // -------------------------
-        // 8) Pad emitted -> out table length n
-        // -------------------------
         let mut out = emitted.clone();
         while out.len() < n {
             out.push((PAD_U64, 0));
         }
 
-        // perm out selectors
         for i in 0..n {
             cfg.perm_out.q_perm1.enable(region, i)?;
             cfg.perm_out.q_perm2.enable(region, i)?;
         }
-
-        // assign out + circuit sentinel row
         for i in 0..n {
             region.assign_advice(
                 || "out_key",
@@ -559,7 +513,6 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
                 || Value::known(F::from(out[i].1)),
             )?;
         }
-
         region.assign_advice(
             || "out_key_s",
             cfg.out_key,
@@ -568,13 +521,10 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         )?;
         region.assign_advice(|| "out_sum_s", cfg.out_sum, n, || Value::known(F::ZERO))?;
 
-        // out sorted check needs a Rust-side sentinel too
         let mut out_ext = out.clone();
         out_ext.push((PAD_U64, 0));
-
         for i in 0..n {
             cfg.q_out_sort.enable(region, i)?;
-
             iz_out_eq_chip.assign(
                 region,
                 i,
@@ -588,28 +538,23 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             )?;
         }
 
-        // -------------------------
-        // 9) Map table (length n+1)
-        // -------------------------
-
+        // map rows 0..n
+        cfg.q_map_tbl.enable(region, 0)?;
         cfg.q_map_first.enable(region, 0)?;
         region.assign_advice(|| "map_key0", cfg.map_key, 0, || Value::known(F::ZERO))?;
         region.assign_advice(|| "map_val0", cfg.map_val, 0, || Value::known(F::ZERO))?;
-
-        // IMPORTANT: row0.key_next must equal map_key at row1 (which is out[0].0)
-        // so that the shift gate at row0 passes and also gives a valid gap below the first key.
-        let first_key = out[0].0; // safe since n >= 1 in all your callers
+        let first_key = out.get(0).map(|x| x.0).unwrap_or(PAD_U64);
         region.assign_advice(
             || "map_kn0",
             cfg.map_key_next,
             0,
             || Value::known(F::from(first_key)),
         )?;
+        cfg.q_map_shift.enable(region, 0)?;
 
         for i in 0..n {
+            cfg.q_map_tbl.enable(region, i + 1)?;
             cfg.q_map_link.enable(region, i)?;
-            cfg.q_map_shift.enable(region, i)?;
-
             region.assign_advice(
                 || "map_key",
                 cfg.map_key,
@@ -622,125 +567,339 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
                 i + 1,
                 || Value::known(F::from(out[i].1)),
             )?;
+        }
 
-            let nextk = if i + 1 < n { out[i + 1].0 } else { PAD_U64 };
+        for r in 1..n {
+            cfg.q_map_shift.enable(region, r)?;
+            let nextk = out.get(r).map(|x| x.0).unwrap_or(PAD_U64);
             region.assign_advice(
                 || "map_kn",
                 cfg.map_key_next,
-                i + 1,
+                r,
                 || Value::known(F::from(nextk)),
             )?;
         }
 
-        // constrain last map_key_next == PAD
+        cfg.q_map_tbl.enable(region, n)?;
         cfg.q_map_last.enable(region, n)?;
+        region.assign_advice(
+            || "map_kn_last",
+            cfg.map_key_next,
+            n,
+            || Value::known(F::from(PAD_U64)),
+        )?;
 
         Ok(emitted)
     }
 }
+
 /// ------------------------------
-/// SemijoinFilter: keep rows whose key is in a set (map table),
-/// with membership+gap proof for disjoin rows.
-/// Similar to Q5 LS partition.
+/// Indexed view: (key,val,eid) sorted by (key,eid), plus idx within key-group.
+/// Used to prove join rows by lookup: (key, idx) -> (val, eid)
 /// ------------------------------
 #[derive(Clone, Debug)]
-pub struct SemijoinFilterConfig<F: Field + Ord> {
-    // input rows (k1,k2, payload...) of fixed arity W
-    in_cols: Vec<Column<Advice>>,
-    // output rows (same arity) padded to same length as input
-    out_cols: Vec<Column<Advice>>,
-    // keep bit per row
-    keep: Column<Advice>,
+pub struct IndexedViewConfig<F: Field + Ord> {
+    in_key: Column<Advice>,
+    in_val: Column<Advice>,
+    in_eid: Column<Advice>,
 
-    // permutation to compact kept rows to front
+    pub sorted_key: Column<Advice>,
+    pub sorted_val: Column<Advice>,
+    pub sorted_eid: Column<Advice>,
     perm: PermAnyConfig,
 
-    // disjoin membership+gap proof
-    q_flag: Selector,
-    q_complex: Selector,
+    q_sort: Selector,
+    lt_key: LtConfig<F, NUM_BYTES>,
+    iz_eq_key: IsZeroConfig<F>,
 
-    in_set: Column<Advice>, // boolean: membership
-    low: Column<Advice>,
-    high: Column<Advice>,
-
-    // lt checks for gap
-    lt_low: LtConfig<F, NUM_BYTES>,
-    lt_high: LtConfig<F, NUM_BYTES>,
-    // map key tables provided externally:
-    // map_key, map_key_next (and map_val if needed)
-    // (we use lookup constraints directly in configure to those columns)
-    q_copy_key: Selector,
-    q_filter: Selector,
+    pub idx: Column<Advice>,
+    q_idx0: Selector,
+    q_idx: Selector,
+    iz_same_prev: IsZeroConfig<F>,
 }
 
 #[derive(Clone, Debug)]
-pub struct SemijoinFilterChip<F: Field + Ord> {
-    cfg: SemijoinFilterConfig<F>,
+pub struct IndexedViewChip<F: Field + Ord> {
+    cfg: IndexedViewConfig<F>,
 }
-impl<F: Field + Ord> SemijoinFilterChip<F> {
-    pub fn construct(cfg: SemijoinFilterConfig<F>) -> Self {
+impl<F: Field + Ord> IndexedViewChip<F> {
+    pub fn construct(cfg: IndexedViewConfig<F>) -> Self {
         Self { cfg }
     }
 
-    /// Configure a semijoin filter keyed by a single packed key column `key_col`
-    /// that must be looked up in `map_key/map_key_next`.
-    pub fn configure(
-        meta: &mut ConstraintSystem<F>,
-        width: usize,
-        key_col: Column<Advice>, // the packed key column inside in_cols[0] (we will constrain copy)
-        map_key: Column<Advice>,
-        map_key_next: Column<Advice>,
-    ) -> SemijoinFilterConfig<F> {
-        let in_cols: Vec<_> = (0..width).map(|_| meta.advice_column()).collect();
-        let out_cols: Vec<_> = (0..width).map(|_| meta.advice_column()).collect();
-        for &c in in_cols.iter().chain(out_cols.iter()) {
+    pub fn configure(meta: &mut ConstraintSystem<F>) -> IndexedViewConfig<F> {
+        let in_key = meta.advice_column();
+        let in_val = meta.advice_column();
+        let in_eid = meta.advice_column();
+        for c in [in_key, in_val, in_eid] {
             meta.enable_equality(c);
         }
 
-        let keep = meta.advice_column();
-        meta.enable_equality(keep);
+        let sorted_key = meta.advice_column();
+        let sorted_val = meta.advice_column();
+        let sorted_eid = meta.advice_column();
+        for c in [sorted_key, sorted_val, sorted_eid] {
+            meta.enable_equality(c);
+        }
 
-        // copy in_cols[0] to provided key_col (so caller can build key from other columns)
-        let q_copy_key = meta.selector();
-        meta.create_gate("copy packed key", |m| {
-            let q = m.query_selector(q_copy_key);
-            vec![
-                q * (m.query_advice(in_cols[0], Rotation::cur())
-                    - m.query_advice(key_col, Rotation::cur())),
-            ]
-        });
-
-        // filter-to-pad: out = keep ? in : PAD
-        let q_filter = meta.selector();
-        meta.create_gate("out = keep?in:PAD", |m| {
-            let q = m.query_selector(q_filter);
-            let k = m.query_advice(keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let drop = one.clone() - k.clone();
-
-            let mut cs = vec![q.clone() * k.clone() * (one - k.clone())];
-            for j in 0..width {
-                let inp = m.query_advice(in_cols[j], Rotation::cur());
-                let outp = m.query_advice(out_cols[j], Rotation::cur());
-                let pad = Expression::Constant(F::from(PAD_U64));
-                cs.push(q.clone() * (outp - (k.clone() * inp + drop.clone() * pad)));
-            }
-            cs
-        });
-
-        // compact perm (out_cols -> compacted_out_cols) reusing PermAny with out_cols as side A.
-        // We'll compact by permuting out_cols into itself (front kept, back PAD).
         let q1 = meta.complex_selector();
         let q2 = meta.complex_selector();
-        let perm = PermAnyChip::configure(meta, q1, q2, out_cols.clone(), out_cols.clone());
+        let perm = PermAnyChip::configure(
+            meta,
+            q1,
+            q2,
+            vec![in_key, in_val, in_eid],
+            vec![sorted_key, sorted_val, sorted_eid],
+        );
 
-        // Membership+gap proof on dropped rows:
+        let q_sort = meta.selector();
+        let lt_key = LtChip::<F, NUM_BYTES>::configure(
+            meta,
+            |m| m.query_selector(q_sort),
+            |m| m.query_advice(sorted_key, Rotation::cur()),
+            |m| m.query_advice(sorted_key, Rotation::next()),
+        );
+        let aux = meta.advice_column();
+        let iz_eq_key = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(q_sort),
+            |m| {
+                m.query_advice(sorted_key, Rotation::next())
+                    - m.query_advice(sorted_key, Rotation::cur())
+            },
+            aux,
+        );
+        meta.create_gate("view key nondecreasing", |m| {
+            let q = m.query_selector(q_sort);
+            let le = lt_key.is_lt(m, None) + iz_eq_key.expr();
+            vec![q * (le - Expression::Constant(F::ONE))]
+        });
+
+        let idx = meta.advice_column();
+        meta.enable_equality(idx);
+        let q_idx0 = meta.selector();
+        let q_idx = meta.selector();
+
+        let aux_same = meta.advice_column();
+        let iz_same_prev = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(q_idx),
+            |m| {
+                m.query_advice(sorted_key, Rotation::cur())
+                    - m.query_advice(sorted_key, Rotation::prev())
+            },
+            aux_same,
+        );
+
+        meta.create_gate("idx0=0", |m| {
+            let q = m.query_selector(q_idx0);
+            vec![q * m.query_advice(idx, Rotation::cur())]
+        });
+        meta.create_gate("idx recurrence", |m| {
+            let q = m.query_selector(q_idx);
+            let same = iz_same_prev.expr();
+            let idx_cur = m.query_advice(idx, Rotation::cur());
+            let idx_prev = m.query_advice(idx, Rotation::prev());
+            vec![q * (idx_cur - (same * (idx_prev + Expression::Constant(F::ONE))))]
+        });
+
+        IndexedViewConfig {
+            in_key,
+            in_val,
+            in_eid,
+            sorted_key,
+            sorted_val,
+            sorted_eid,
+            perm,
+            q_sort,
+            lt_key,
+            iz_eq_key,
+            idx,
+            q_idx0,
+            q_idx,
+            iz_same_prev,
+        }
+    }
+
+    pub fn assign(
+        &self,
+        region: &mut Region<'_, F>,
+        n: usize,
+        in_rows: &[(u64, u64, u64)],
+    ) -> Result<(), Error> {
+        let cfg = &self.cfg;
+
+        let lt_key_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_key.clone());
+        let iz_eq_chip = IsZeroChip::construct(cfg.iz_eq_key.clone());
+        let iz_same_prev_chip = IsZeroChip::construct(cfg.iz_same_prev.clone());
+
+        for i in 0..n {
+            cfg.perm.q_perm1.enable(region, i)?;
+            cfg.perm.q_perm2.enable(region, i)?;
+        }
+
+        for i in 0..n {
+            region.assign_advice(
+                || "in_key",
+                cfg.in_key,
+                i,
+                || Value::known(F::from(in_rows[i].0)),
+            )?;
+            region.assign_advice(
+                || "in_val",
+                cfg.in_val,
+                i,
+                || Value::known(F::from(in_rows[i].1)),
+            )?;
+            region.assign_advice(
+                || "in_eid",
+                cfg.in_eid,
+                i,
+                || Value::known(F::from(in_rows[i].2)),
+            )?;
+        }
+
+        let mut sorted = in_rows.to_vec();
+        sorted.sort_by_key(|(k, _, eid)| (*k, *eid));
+        let mut sorted_ext = sorted.clone();
+        sorted_ext.push((PAD_U64, 0, 0));
+
+        for i in 0..n {
+            region.assign_advice(
+                || "sorted_key",
+                cfg.sorted_key,
+                i,
+                || Value::known(F::from(sorted_ext[i].0)),
+            )?;
+            region.assign_advice(
+                || "sorted_val",
+                cfg.sorted_val,
+                i,
+                || Value::known(F::from(sorted_ext[i].1)),
+            )?;
+            region.assign_advice(
+                || "sorted_eid",
+                cfg.sorted_eid,
+                i,
+                || Value::known(F::from(sorted_ext[i].2)),
+            )?;
+        }
+        region.assign_advice(
+            || "sorted_key_s",
+            cfg.sorted_key,
+            n,
+            || Value::known(F::from(sorted_ext[n].0)),
+        )?;
+        region.assign_advice(
+            || "sorted_val_s",
+            cfg.sorted_val,
+            n,
+            || Value::known(F::from(sorted_ext[n].1)),
+        )?;
+        region.assign_advice(
+            || "sorted_eid_s",
+            cfg.sorted_eid,
+            n,
+            || Value::known(F::from(sorted_ext[n].2)),
+        )?;
+
+        for i in 0..n {
+            cfg.q_sort.enable(region, i)?;
+            iz_eq_chip.assign(
+                region,
+                i,
+                Value::known(F::from(sorted_ext[i + 1].0) - F::from(sorted_ext[i].0)),
+            )?;
+            lt_key_chip.assign(
+                region,
+                i,
+                Value::known(F::from(sorted_ext[i].0)),
+                Value::known(F::from(sorted_ext[i + 1].0)),
+            )?;
+        }
+
+        // idx within key-group
+        let mut idx_u64 = vec![0u64; n];
+        for i in 0..n {
+            if i == 0 {
+                idx_u64[i] = 0;
+            } else {
+                idx_u64[i] = if sorted[i].0 == sorted[i - 1].0 {
+                    idx_u64[i - 1] + 1
+                } else {
+                    0
+                };
+            }
+            region.assign_advice(|| "idx", cfg.idx, i, || Value::known(F::from(idx_u64[i])))?;
+        }
+        region.assign_advice(|| "idx_s", cfg.idx, n, || Value::known(F::ZERO))?;
+
+        if n > 0 {
+            cfg.q_idx0.enable(region, 0)?;
+        }
+        for i in 1..n {
+            cfg.q_idx.enable(region, i)?;
+            iz_same_prev_chip.assign(
+                region,
+                i,
+                Value::known(F::from(sorted[i].0) - F::from(sorted[i - 1].0)),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// ------------------------------
+/// MapLookup: membership+gap lookup into AggSumByKey map table
+/// - If in_set=1: (key,val) must appear in map tables
+/// - If in_set=0: prove a gap (low < key < high) where (low,high) is consecutive in map_key/key_next
+/// ------------------------------
+#[derive(Clone, Debug)]
+pub struct MapLookupConfig<F: Field + Ord> {
+    pub q_flag: Selector,
+    pub q_complex: Selector,
+
+    pub key: Column<Advice>,
+    pub in_set: Column<Advice>,
+    pub low: Column<Advice>,
+    pub high: Column<Advice>,
+    pub val: Column<Advice>,
+
+    pub lt_low: LtConfig<F, NUM_BYTES>,
+    pub lt_high: LtConfig<F, NUM_BYTES>,
+
+    map_key: Column<Advice>,
+    map_val: Column<Advice>,
+    map_key_next: Column<Advice>,
+    q_tbl: Selector,
+}
+
+#[derive(Clone, Debug)]
+pub struct MapLookupChip<F: Field + Ord> {
+    cfg: MapLookupConfig<F>,
+}
+impl<F: Field + Ord> MapLookupChip<F> {
+    pub fn construct(cfg: MapLookupConfig<F>) -> Self {
+        Self { cfg }
+    }
+
+    pub fn configure(
+        meta: &mut ConstraintSystem<F>,
+        map_key: Column<Advice>,
+        map_val: Column<Advice>,
+        map_key_next: Column<Advice>,
+        q_tbl: Selector,
+    ) -> MapLookupConfig<F> {
         let q_flag = meta.selector();
         let q_complex = meta.complex_selector();
+
+        let key = meta.advice_column();
         let in_set = meta.advice_column();
         let low = meta.advice_column();
         let high = meta.advice_column();
-        for c in [in_set, low, high] {
+        let val = meta.advice_column();
+        for c in [key, in_set, low, high, val] {
             meta.enable_equality(c);
         }
 
@@ -752,7 +911,7 @@ impl<F: Field + Ord> SemijoinFilterChip<F> {
                 q * (Expression::Constant(F::ONE) - inside)
             },
             |m| m.query_advice(low, Rotation::cur()),
-            |m| m.query_advice(in_cols[0], Rotation::cur()),
+            |m| m.query_advice(key, Rotation::cur()),
         );
         let lt_high = LtChip::<F, NUM_BYTES>::configure(
             meta,
@@ -761,330 +920,40 @@ impl<F: Field + Ord> SemijoinFilterChip<F> {
                 let inside = m.query_advice(in_set, Rotation::cur());
                 q * (Expression::Constant(F::ONE) - inside)
             },
-            |m| m.query_advice(in_cols[0], Rotation::cur()),
+            |m| m.query_advice(key, Rotation::cur()),
             |m| m.query_advice(high, Rotation::cur()),
         );
 
-        // member lookup (when in_set=1): key in map_key
-        meta.lookup_any("semijoin member", |m| {
+        meta.lookup_any("msg member", |m| {
             let q = m.query_selector(q_complex);
             let inside = m.query_advice(in_set, Rotation::cur());
-            vec![(
-                q * inside * m.query_advice(in_cols[0], Rotation::cur()),
-                m.query_advice(map_key, Rotation::cur()),
-            )]
-        });
-        // gap lookup (when missing): (low,high) equals (map_key, map_key_next)
-        meta.lookup_any("semijoin gap pair", |m| {
-            let q = m.query_selector(q_complex);
-            let inside = m.query_advice(in_set, Rotation::cur());
-            let gate = q * (Expression::Constant(F::ONE) - inside);
+            let gate = q.clone() * inside;
+
+            let tk = m.query_selector(q_tbl) * m.query_advice(map_key, Rotation::cur());
+            let tv = m.query_selector(q_tbl) * m.query_advice(map_val, Rotation::cur());
+
             vec![
-                (
-                    gate.clone() * m.query_advice(low, Rotation::cur()),
-                    m.query_advice(map_key, Rotation::cur()),
-                ),
-                (
-                    gate * m.query_advice(high, Rotation::cur()),
-                    m.query_advice(map_key_next, Rotation::cur()),
-                ),
+                (gate.clone() * m.query_advice(key, Rotation::cur()), tk),
+                (gate * m.query_advice(val, Rotation::cur()), tv),
             ]
         });
 
-        meta.create_gate("semijoin correctness", |m| {
+        meta.lookup_any("msg gap", |m| {
+            let q = m.query_selector(q_complex);
+            let inside = m.query_advice(in_set, Rotation::cur());
+            let gate = q * (Expression::Constant(F::ONE) - inside);
+
+            let tk = m.query_selector(q_tbl) * m.query_advice(map_key, Rotation::cur());
+            let tkn = m.query_selector(q_tbl) * m.query_advice(map_key_next, Rotation::cur());
+
+            vec![
+                (gate.clone() * m.query_advice(low, Rotation::cur()), tk),
+                (gate * m.query_advice(high, Rotation::cur()), tkn),
+            ]
+        });
+
+        meta.create_gate("msg lookup correctness", |m| {
             let q = m.query_selector(q_flag);
-            let inside = m.query_advice(in_set, Rotation::cur());
-            let keepq = m.query_advice(keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-
-            let low_ok = lt_low.is_lt(m, None);
-            let high_ok = lt_high.is_lt(m, None);
-
-            vec![
-                // booleans
-                q.clone() * inside.clone() * (one.clone() - inside.clone()),
-                q.clone() * keepq.clone() * (one.clone() - keepq.clone()),
-                // keep == inside
-                q.clone() * (keepq - inside.clone()),
-                // when missing, prove gap and (not both)
-                q.clone() * (one.clone() - inside.clone()) * (one.clone() - low_ok),
-                q * (one.clone() - inside) * (one - high_ok),
-            ]
-        });
-
-        // NOTE: q_copy_key and q_filter selectors are not returned; they are enabled in assignment using `keep` enabling rows.
-        // We reuse `keep` column and enable q_filter per row in assign.
-
-        SemijoinFilterConfig {
-            in_cols,
-            out_cols,
-            keep,
-            perm,
-            q_copy_key,
-            q_filter,
-            q_flag,
-            q_complex,
-            in_set,
-            low,
-            high,
-            lt_low,
-            lt_high,
-        }
-    }
-}
-
-/// ------------------------------
-/// Join2To3: full materialization of binary ⋈ binary on a key
-/// Left:  (a, k)
-/// Right: (k, b)
-/// Out:   (a, k, b) with full many-to-many completeness (host enumerated, constraints enforce membership + deterministic enumeration by sorted groups)
-///
-/// For this problem we only need soundness+completeness of OUT as the full join result.
-/// We implement completeness by:
-///  - Build degL(k) and degR(k) with AggSumByKey on (k,1) streams
-///  - Enumerate OUT in host as cartesian product per k
-///  - Enforce each OUT row matches a real left row and right row via table lookups into sorted lists with indices
-///
-/// To keep code compact, we use the “index table” method:
-///  - left_sorted_by_k: rows (k, a, idx) where idx runs 0..degL-1 per k
-///  - right_sorted_by_k: rows (k, b, idx) where idx runs 0..degR-1 per k
-///  - OUT rows provide (k, i, j, a, b) and lookup into those index tables
-///
-/// This is the same idea as a full join enumerator, but specialized to 2-way join.
-/// ------------------------------
-
-// (To keep the response size reasonable, I’m not pasting the entire Join2To3 gadget here;
-// it’s ~450 LOC with all constraints and the witness builder, and it’s mechanically similar
-// to the JoinMat idea you already saw earlier.)
-// Instead, below is the *complete end-to-end circuit* that calls Join2To3 as a black box.
-//
-// In your repo, drop in your existing join-enumerator gadget (the one you’re using for other many-to-many joins),
-// and wire it exactly at the three join sites indicated below:
-//
-//   T1 = Join2To3(R1, R2)  on x2
-//   T3 = Join2To3(R4, R5)  on x5
-//   U  = Join2To3(M13, R3) on x3
-//
-// Everything else (aggregation, semijoin filter, DP count) is fully coded and correct.
-
-/// ------------------------------
-/// Main circuit config (calls Join2To3 gadget at 3 places)
-/// ------------------------------
-#[derive(Clone, Debug)]
-pub struct Cycle5Config<F: Field + Ord> {
-    instance: Column<Instance>,
-
-    // base edges (shifted)
-    r1_src: Column<Advice>,
-    r1_dst: Column<Advice>,
-    r2_src: Column<Advice>,
-    r2_dst: Column<Advice>,
-    r3_src: Column<Advice>,
-    r3_dst: Column<Advice>,
-    r4_src: Column<Advice>,
-    r4_dst: Column<Advice>,
-    r5_src: Column<Advice>,
-    r5_dst: Column<Advice>,
-
-    // ---- outputs of joins (you will assign using your Join2To3 gadget) ----
-    // T1 rows: (x1,x2,x3)
-    t1_x1: Column<Advice>,
-    t1_x2: Column<Advice>,
-    t1_x3: Column<Advice>,
-
-    // T3 rows: (x1,x4,x5)
-    t3_x1: Column<Advice>,
-    t3_x4: Column<Advice>,
-    t3_x5: Column<Advice>,
-
-    // ---- M13: key=pack(x1,x3) val = count (#x2)
-    agg_m13: AggSumByKeyConfig<F>,
-    // ---- M14: key=pack(x1,x4) val = count (#x5)
-    agg_m14: AggSumByKeyConfig<F>,
-
-    // ---- U = M13 ⋈ R3 on x3
-    // We materialize U rows: (x1,x3,x4, m13)
-    u_x1: Column<Advice>,
-    u_x3: Column<Advice>,
-    u_x4: Column<Advice>,
-    u_m13: Column<Advice>,
-
-    // ---- semijoin U by M14 on key pack(x1,x4)
-    u_key14: Column<Advice>,                // packed key column for semijoin
-    semi_u_by_m14: SemijoinFilterConfig<F>, // input/out are (key14,x1,x3,x4,m13)
-
-    // ---- DP: compute per-row weight = m13 * m14(x1,x4), then group-by pack(x1,x3)
-    dp_key13: Column<Advice>,
-    dp_val: Column<Advice>,          // weight per row
-    agg_msg13: AggSumByKeyConfig<F>, // msg13 map: key13 -> sum weight
-
-    // ---- Final sum over T1 rows: lookup msg13(key13) and sum
-    // membership+gap lookup like Q5 to get value or 0
-    q_lookup: Selector,
-    q_lookup_complex: Selector,
-    in_set: Column<Advice>,
-    low: Column<Advice>,
-    high: Column<Advice>,
-    looked_val: Column<Advice>,
-    lt_low: LtConfig<F, NUM_BYTES>,
-    lt_high: LtConfig<F, NUM_BYTES>,
-
-    q_sum_first: Selector,
-    q_sum_accu: Selector,
-    run_sum: Column<Advice>,
-
-    out: Column<Advice>,
-    q_out: Selector,
-}
-
-#[derive(Clone, Debug)]
-pub struct Cycle5Chip<F: Field + Ord> {
-    cfg: Cycle5Config<F>,
-}
-impl<F: Field + Ord> Cycle5Chip<F> {
-    pub fn construct(cfg: Cycle5Config<F>) -> Self {
-        Self { cfg }
-    }
-
-    pub fn configure(meta: &mut ConstraintSystem<F>) -> Cycle5Config<F> {
-        let instance = meta.instance_column();
-        meta.enable_equality(instance);
-
-        // mk2 DOES NOT capture meta anymore
-        let mut mk2 = |meta: &mut ConstraintSystem<F>| meta.advice_column();
-
-        let (r1_src, r1_dst) = (mk2(meta), mk2(meta));
-        let (r2_src, r2_dst) = (mk2(meta), mk2(meta));
-        let (r3_src, r3_dst) = (mk2(meta), mk2(meta));
-        let (r4_src, r4_dst) = (mk2(meta), mk2(meta));
-        let (r5_src, r5_dst) = (mk2(meta), mk2(meta));
-
-        for &c in [
-            r1_src, r1_dst, r2_src, r2_dst, r3_src, r3_dst, r4_src, r4_dst, r5_src, r5_dst,
-        ]
-        .iter()
-        {
-            meta.enable_equality(c);
-        }
-
-        // Join outputs
-        let t1_x1 = mk2(meta);
-        let t1_x2 = mk2(meta);
-        let t1_x3 = mk2(meta);
-        let t3_x1 = mk2(meta);
-        let t3_x4 = mk2(meta);
-        let t3_x5 = mk2(meta);
-
-        for &c in [t1_x1, t1_x2, t1_x3, t3_x1, t3_x4, t3_x5].iter() {
-            meta.enable_equality(c);
-        }
-
-        // Agg configs
-        let agg_m13 = AggSumByKeyChip::<F>::configure(meta);
-        let agg_m14 = AggSumByKeyChip::<F>::configure(meta);
-
-        // U rows
-        let u_x1 = mk2(meta);
-        let u_x3 = mk2(meta);
-        let u_x4 = mk2(meta);
-        let u_m13 = mk2(meta);
-        for c in [u_x1, u_x3, u_x4, u_m13] {
-            meta.enable_equality(c);
-        }
-
-        // semijoin U by M14: in/out width=5 => (key14,x1,x3,x4,m13)
-        let u_key14 = mk2(meta);
-        meta.enable_equality(u_key14);
-        let semi_u_by_m14 = SemijoinFilterChip::<F>::configure(
-            meta,
-            5,
-            u_key14,
-            agg_m14.map_key,
-            agg_m14.map_key_next,
-        );
-
-        // DP weight and agg
-        let dp_key13 = mk2(meta);
-        let dp_val = mk2(meta);
-        meta.enable_equality(dp_key13);
-        meta.enable_equality(dp_val);
-
-        // dp_val = u_m13 * m14(x1,x4) will be assigned and checked by a gate
-        let q_dp_mul = meta.selector();
-        meta.create_gate("dp_val = m13 * m14", |m| {
-            let q = m.query_selector(q_dp_mul);
-            let m13 = m.query_advice(u_m13, Rotation::cur());
-            let m14 = m.query_advice(agg_m14.map_val, Rotation::cur()); // NOTE: we will constrain-equal a looked m14 into this column per-row in assign
-            let out = m.query_advice(dp_val, Rotation::cur());
-            vec![q * (out - m13 * m14)]
-        });
-
-        let agg_msg13 = AggSumByKeyChip::<F>::configure(meta);
-
-        // Final lookup key13 in msg13 map, get value or 0 (membership+gap)
-        let q_lookup = meta.selector();
-        let q_lookup_complex = meta.complex_selector();
-        let in_set = mk2(meta);
-        let low = mk2(meta);
-        let high = mk2(meta);
-        let looked_val = mk2(meta);
-        for c in [in_set, low, high, looked_val] {
-            meta.enable_equality(c);
-        }
-
-        let lt_low = LtChip::<F, NUM_BYTES>::configure(
-            meta,
-            |m| {
-                let q = m.query_selector(q_lookup);
-                let inside = m.query_advice(in_set, Rotation::cur());
-                q * (Expression::Constant(F::ONE) - inside)
-            },
-            |m| m.query_advice(low, Rotation::cur()),
-            |m| m.query_advice(dp_key13, Rotation::cur()),
-        );
-        let lt_high = LtChip::<F, NUM_BYTES>::configure(
-            meta,
-            |m| {
-                let q = m.query_selector(q_lookup);
-                let inside = m.query_advice(in_set, Rotation::cur());
-                q * (Expression::Constant(F::ONE) - inside)
-            },
-            |m| m.query_advice(dp_key13, Rotation::cur()),
-            |m| m.query_advice(high, Rotation::cur()),
-        );
-
-        meta.lookup_any("msg13 member", |m| {
-            let q = m.query_selector(q_lookup_complex);
-            let inside = m.query_advice(in_set, Rotation::cur());
-            vec![
-                (
-                    q.clone() * inside.clone() * m.query_advice(dp_key13, Rotation::cur()),
-                    m.query_advice(agg_msg13.map_key, Rotation::cur()),
-                ),
-                (
-                    q * m.query_advice(looked_val, Rotation::cur()),
-                    m.query_advice(agg_msg13.map_val, Rotation::cur()),
-                ),
-            ]
-        });
-        meta.lookup_any("msg13 gap", |m| {
-            let q = m.query_selector(q_lookup_complex);
-            let inside = m.query_advice(in_set, Rotation::cur());
-            let gate = q * (Expression::Constant(F::ONE) - inside);
-            vec![
-                (
-                    gate.clone() * m.query_advice(low, Rotation::cur()),
-                    m.query_advice(agg_msg13.map_key, Rotation::cur()),
-                ),
-                (
-                    gate * m.query_advice(high, Rotation::cur()),
-                    m.query_advice(agg_msg13.map_key_next, Rotation::cur()),
-                ),
-            ]
-        });
-
-        meta.create_gate("lookup correctness", |m| {
-            let q = m.query_selector(q_lookup);
             let inside = m.query_advice(in_set, Rotation::cur());
             let one = Expression::Constant(F::ONE);
             let low_ok = lt_low.is_lt(m, None);
@@ -1094,36 +963,305 @@ impl<F: Field + Ord> Cycle5Chip<F> {
                 q.clone() * inside.clone() * (one.clone() - inside.clone()),
                 q.clone() * (one.clone() - inside.clone()) * (one.clone() - low_ok),
                 q.clone() * (one.clone() - inside.clone()) * (one.clone() - high_ok),
-                // if missing => looked_val = 0
-                q * (one - inside) * m.query_advice(looked_val, Rotation::cur()),
+                q * (one - inside) * m.query_advice(val, Rotation::cur()),
             ]
         });
 
-        // sum over T1 rows
-        let run_sum = mk2(meta);
-        meta.enable_equality(run_sum);
-        let q_sum_first = meta.selector();
-        let q_sum_accu = meta.selector();
-        meta.create_gate("sum_first", |m| {
-            let q = m.query_selector(q_sum_first);
+        MapLookupConfig {
+            q_flag,
+            q_complex,
+            key,
+            in_set,
+            low,
+            high,
+            val,
+            lt_low,
+            lt_high,
+            map_key,
+            map_val,
+            map_key_next,
+            q_tbl,
+        }
+    }
+}
+
+/// ------------------------------
+/// Main circuit config (Triangle, Path+Closer)
+/// ------------------------------
+#[derive(Clone, Debug)]
+pub struct TrianglePathCloserConfig<F: Field + Ord> {
+    instance: Column<Instance>,
+
+    // indexed views of the edge multiset
+    in_by_dst: IndexedViewConfig<F>,  // key=dst, val=src
+    out_by_src: IndexedViewConfig<F>, // key=src, val=dst
+
+    // Bag1 rows: A->B->C
+    t12_a: Column<Advice>,
+    t12_b: Column<Advice>,
+    t12_c: Column<Advice>,
+    t12_i_r1: Column<Advice>,
+    t12_j_r2: Column<Advice>,
+    t12_r1_eid: Column<Advice>,
+    t12_r2_eid: Column<Advice>,
+    t12_real: Column<Advice>,
+    q_t12_lookup: Selector,
+    q_t12_key: Selector,
+
+    // Bag2 rows: edge C->A (closer)
+    t3_c: Column<Advice>,
+    t3_a: Column<Advice>,
+    t3_j_r3: Column<Advice>,
+    t3_r3_eid: Column<Advice>,
+    t3_real: Column<Advice>,
+    q_t3_lookup: Selector,
+    q_t3_msg_in: Selector,
+
+    // message: msg_key=pack2(A,C), msg_val=count
+    agg_msg: AggSumByKeyConfig<F>,
+    msg_lookup: MapLookupConfig<F>,
+
+    // ordering checks in Bag1: A<B and B<C
+    q_order: Selector,
+    lt_ab: LtConfig<F, NUM_BYTES>,
+    lt_bc: LtConfig<F, NUM_BYTES>,
+
+    // contrib and sum
+    contrib: Column<Advice>,
+    q_contrib: Selector,
+
+    run_sum: Column<Advice>,
+    q_sum0: Selector,
+    q_sum: Selector,
+
+    out: Column<Advice>,
+    q_out: Selector,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrianglePathCloserChip<F: Field + Ord> {
+    cfg: TrianglePathCloserConfig<F>,
+}
+impl<F: Field + Ord> TrianglePathCloserChip<F> {
+    pub fn construct(cfg: TrianglePathCloserConfig<F>) -> Self {
+        Self { cfg }
+    }
+
+    pub fn configure(meta: &mut ConstraintSystem<F>) -> TrianglePathCloserConfig<F> {
+        let instance = meta.instance_column();
+        meta.enable_equality(instance);
+
+        // Views
+        let in_by_dst = IndexedViewChip::<F>::configure(meta);
+        let out_by_src = IndexedViewChip::<F>::configure(meta);
+
+        // Bag1 columns
+        let t12_a = meta.advice_column();
+        let t12_b = meta.advice_column();
+        let t12_c = meta.advice_column();
+        let t12_i_r1 = meta.advice_column();
+        let t12_j_r2 = meta.advice_column();
+        let t12_r1_eid = meta.advice_column();
+        let t12_r2_eid = meta.advice_column();
+        let t12_real = meta.advice_column();
+        for c in [
+            t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid, t12_real,
+        ] {
+            meta.enable_equality(c);
+        }
+        let q_t12_lookup = meta.complex_selector();
+        let q_t12_key = meta.selector();
+
+        // Bag2 columns (r3: C->A)
+        let t3_c = meta.advice_column();
+        let t3_a = meta.advice_column();
+        let t3_j_r3 = meta.advice_column();
+        let t3_r3_eid = meta.advice_column();
+        let t3_real = meta.advice_column();
+        for c in [t3_c, t3_a, t3_j_r3, t3_r3_eid, t3_real] {
+            meta.enable_equality(c);
+        }
+        let q_t3_lookup = meta.complex_selector();
+        let q_t3_msg_in = meta.selector();
+
+        // Bag1 lookups:
+        // r1 via InByDst: key=B, idx=i_r1 -> val=A, eid=r1_eid
+        meta.lookup_any("bag1 r1 from in_by_dst", |m| {
+            let q = m.query_selector(q_t12_lookup);
             vec![
-                q * (m.query_advice(run_sum, Rotation::cur())
-                    - m.query_advice(looked_val, Rotation::cur())),
+                (
+                    q.clone() * m.query_advice(t12_b, Rotation::cur()),
+                    m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
+                ),
+                (
+                    q.clone() * m.query_advice(t12_i_r1, Rotation::cur()),
+                    m.query_advice(in_by_dst.idx, Rotation::cur()),
+                ),
+                (
+                    q.clone() * m.query_advice(t12_a, Rotation::cur()),
+                    m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
+                ),
+                (
+                    q * m.query_advice(t12_r1_eid, Rotation::cur()),
+                    m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
+                ),
             ]
         });
-        meta.create_gate("sum_accu", |m| {
-            let q = m.query_selector(q_sum_accu);
+        // r2 via OutBySrc: key=B, idx=j_r2 -> val=C, eid=r2_eid
+        meta.lookup_any("bag1 r2 from out_by_src", |m| {
+            let q = m.query_selector(q_t12_lookup);
+            vec![
+                (
+                    q.clone() * m.query_advice(t12_b, Rotation::cur()),
+                    m.query_advice(out_by_src.sorted_key, Rotation::cur()),
+                ),
+                (
+                    q.clone() * m.query_advice(t12_j_r2, Rotation::cur()),
+                    m.query_advice(out_by_src.idx, Rotation::cur()),
+                ),
+                (
+                    q.clone() * m.query_advice(t12_c, Rotation::cur()),
+                    m.query_advice(out_by_src.sorted_val, Rotation::cur()),
+                ),
+                (
+                    q * m.query_advice(t12_r2_eid, Rotation::cur()),
+                    m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
+                ),
+            ]
+        });
+
+        // Bag2 lookup (r3) via OutBySrc: key=C, idx=j_r3 -> val=A, eid=r3_eid
+        meta.lookup_any("bag2 r3 from out_by_src", |m| {
+            let q = m.query_selector(q_t3_lookup);
+            vec![
+                (
+                    q.clone() * m.query_advice(t3_c, Rotation::cur()),
+                    m.query_advice(out_by_src.sorted_key, Rotation::cur()),
+                ),
+                (
+                    q.clone() * m.query_advice(t3_j_r3, Rotation::cur()),
+                    m.query_advice(out_by_src.idx, Rotation::cur()),
+                ),
+                (
+                    q.clone() * m.query_advice(t3_a, Rotation::cur()),
+                    m.query_advice(out_by_src.sorted_val, Rotation::cur()),
+                ),
+                (
+                    q * m.query_advice(t3_r3_eid, Rotation::cur()),
+                    m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
+                ),
+            ]
+        });
+
+        // Message aggregator
+        let agg_msg = AggSumByKeyChip::<F>::configure(meta);
+
+        // Tie agg_msg inputs to Bag2 rows:
+        // keep = t3_real
+        // in_key = keep ? pack2(A,C) : PAD
+        // in_val = keep
+        meta.create_gate("msg input from bag2 edges", |m| {
+            let q = m.query_selector(q_t3_msg_in);
+
+            let a = m.query_advice(t3_a, Rotation::cur());
+            let c = m.query_advice(t3_c, Rotation::cur());
+            let key_expr = a * Expression::Constant(F::from(PACK_SHIFT)) + c;
+
+            let keep = m.query_advice(t3_real, Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+            let pad = Expression::Constant(F::from(PAD_U64));
+            let selected_key = keep.clone() * key_expr + (one - keep.clone()) * pad;
+
+            vec![
+                q.clone() * (m.query_advice(agg_msg.in_key, Rotation::cur()) - selected_key),
+                q * (m.query_advice(agg_msg.in_val, Rotation::cur()) - keep),
+            ]
+        });
+
+        // Message lookup per Bag1 row
+        let msg_lookup = MapLookupChip::<F>::configure(
+            meta,
+            agg_msg.map_key,
+            agg_msg.map_val,
+            agg_msg.map_key_next,
+            agg_msg.q_map_tbl,
+        );
+
+        // Bag1 key: msg_lookup.key = pack2(A,C); Bag1 real boolean
+        meta.create_gate("bag1 real + key", |m| {
+            let q = m.query_selector(q_t12_key);
+
+            let a = m.query_advice(t12_a, Rotation::cur());
+            let c = m.query_advice(t12_c, Rotation::cur());
+            let key_expr = a * Expression::Constant(F::from(PACK_SHIFT)) + c;
+
+            let real = m.query_advice(t12_real, Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+
+            vec![
+                q.clone() * real.clone() * (one.clone() - real.clone()),
+                q * (m.query_advice(msg_lookup.key, Rotation::cur()) - key_expr),
+            ]
+        });
+
+        // ordering checks for Bag1: A<B and B<C, enabled only if real=1
+        let q_order = meta.selector();
+        let lt_ab = LtChip::<F, NUM_BYTES>::configure(
+            meta,
+            |m| m.query_selector(q_order) * m.query_advice(t12_real, Rotation::cur()),
+            |m| m.query_advice(t12_a, Rotation::cur()),
+            |m| m.query_advice(t12_b, Rotation::cur()),
+        );
+        let lt_bc = LtChip::<F, NUM_BYTES>::configure(
+            meta,
+            |m| m.query_selector(q_order) * m.query_advice(t12_real, Rotation::cur()),
+            |m| m.query_advice(t12_b, Rotation::cur()),
+            |m| m.query_advice(t12_c, Rotation::cur()),
+        );
+
+        // contrib = t12_real * msg_val * lt_ab * lt_bc
+        let contrib = meta.advice_column();
+        meta.enable_equality(contrib);
+        let q_contrib = meta.selector();
+        meta.create_gate("contrib gate", |m| {
+            let q = m.query_selector(q_contrib);
+
+            let real = m.query_advice(t12_real, Rotation::cur());
+            let msgv = m.query_advice(msg_lookup.val, Rotation::cur());
+            let ab = lt_ab.is_lt(m, None);
+            let bc = lt_bc.is_lt(m, None);
+
+            let outc = m.query_advice(contrib, Rotation::cur());
+            vec![q * (outc - real * msgv * ab * bc)]
+        });
+
+        // prefix sum of contrib
+        let run_sum = meta.advice_column();
+        meta.enable_equality(run_sum);
+        let q_sum0 = meta.selector();
+        let q_sum = meta.selector();
+
+        meta.create_gate("sum0", |m| {
+            let q = m.query_selector(q_sum0);
+            vec![
+                q * (m.query_advice(run_sum, Rotation::cur())
+                    - m.query_advice(contrib, Rotation::cur())),
+            ]
+        });
+        meta.create_gate("sum", |m| {
+            let q = m.query_selector(q_sum);
             vec![
                 q * (m.query_advice(run_sum, Rotation::cur())
                     - (m.query_advice(run_sum, Rotation::prev())
-                        + m.query_advice(looked_val, Rotation::cur()))),
+                        + m.query_advice(contrib, Rotation::cur()))),
             ]
         });
 
-        let out = mk2(meta);
+        // out equals run_sum at q_out row
+        let out = meta.advice_column();
         meta.enable_equality(out);
         let q_out = meta.selector();
-        meta.create_gate("out = sum", |m| {
+        meta.create_gate("out = run_sum", |m| {
             let q = m.query_selector(q_out);
             vec![
                 q * (m.query_advice(out, Rotation::cur())
@@ -1131,46 +1269,37 @@ impl<F: Field + Ord> Cycle5Chip<F> {
             ]
         });
 
-        Cycle5Config {
+        TrianglePathCloserConfig {
             instance,
-            r1_src,
-            r1_dst,
-            r2_src,
-            r2_dst,
-            r3_src,
-            r3_dst,
-            r4_src,
-            r4_dst,
-            r5_src,
-            r5_dst,
-            t1_x1,
-            t1_x2,
-            t1_x3,
-            t3_x1,
-            t3_x4,
-            t3_x5,
-            agg_m13,
-            agg_m14,
-            u_x1,
-            u_x3,
-            u_x4,
-            u_m13,
-            u_key14,
-            semi_u_by_m14,
-            dp_key13,
-            dp_val,
-            agg_msg13,
-            q_lookup,
-            q_lookup_complex,
-            in_set,
-            low,
-            high,
-            looked_val,
-            lt_low,
-            lt_high,
-            q_sum_first,
-            q_sum_accu,
+            in_by_dst,
+            out_by_src,
+            t12_a,
+            t12_b,
+            t12_c,
+            t12_i_r1,
+            t12_j_r2,
+            t12_r1_eid,
+            t12_r2_eid,
+            t12_real,
+            q_t12_lookup,
+            q_t12_key,
+            t3_c,
+            t3_a,
+            t3_j_r3,
+            t3_r3_eid,
+            t3_real,
+            q_t3_lookup,
+            q_t3_msg_in,
+            agg_msg,
+            msg_lookup,
+            q_order,
+            lt_ab,
+            lt_bc,
+            contrib,
+            q_contrib,
             run_sum,
+            q_sum0,
+            q_sum,
             out,
             q_out,
         }
@@ -1179,410 +1308,337 @@ impl<F: Field + Ord> Cycle5Chip<F> {
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
-        r1: Vec<Edge>,
-        r2: Vec<Edge>,
-        r3: Vec<Edge>,
-        r4: Vec<Edge>,
-        r5: Vec<Edge>,
+        edges: Vec<Edge>,
+        bag1_pad_extra: usize,
+        bag2_pad_extra: usize,
     ) -> Result<AssignedCell<F, F>, Error> {
-        // load lt tables used by agg + lookups
-        let agg_m13_chip = AggSumByKeyChip::<F>::construct(self.cfg.agg_m13.clone());
-        let agg_m14_chip = AggSumByKeyChip::<F>::construct(self.cfg.agg_m14.clone());
-        let agg_msg13_chip = AggSumByKeyChip::<F>::construct(self.cfg.agg_msg13.clone());
-
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.agg_m13.lt_key.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.agg_m13.lt_out_key.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.agg_m14.lt_key.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.agg_m14.lt_out_key.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.agg_msg13.lt_key.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.agg_msg13.lt_out_key.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.lt_low.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.lt_high.clone()).load(layouter)?;
-        //  missing these two; without them LOOKUP_u8 lookups fail
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.semi_u_by_m14.lt_low.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(self.cfg.semi_u_by_m14.lt_high.clone()).load(layouter)?;
-
-        // ----- host-side computation for witnesses (ONLY from base tables) -----
-        // shift edges
-        let r1s: Vec<(u64, u64)> = r1
-            .iter()
-            .map(|e| (e.src + SHIFT_ID, e.dst + SHIFT_ID))
-            .collect();
-        let r2s: Vec<(u64, u64)> = r2
-            .iter()
-            .map(|e| (e.src + SHIFT_ID, e.dst + SHIFT_ID))
-            .collect();
-        let r3s: Vec<(u64, u64)> = r3
-            .iter()
-            .map(|e| (e.src + SHIFT_ID, e.dst + SHIFT_ID))
-            .collect();
-        let r4s: Vec<(u64, u64)> = r4
-            .iter()
-            .map(|e| (e.src + SHIFT_ID, e.dst + SHIFT_ID))
-            .collect();
-        let r5s: Vec<(u64, u64)> = r5
-            .iter()
-            .map(|e| (e.src + SHIFT_ID, e.dst + SHIFT_ID))
-            .collect();
-
-        // T1 = R1 ⋈ R2 on x2 (r1.dst == r2.src) -> (x1,x2,x3)
-        // T3 = R4 ⋈ R5 on x5 (r4.dst == r5.src) -> (x1,x4,x5) where x1=r5.dst
-        // U  = M13 ⋈ R3 on x3 (key in M13 is (x1,x3)) -> tuples (x1,x3,x4,m13)
-
-        // We compute the join results here. In-circuit, you must assign them via your Join2To3 gadget.
-        let mut r2_by_src: HashMap<u64, Vec<u64>> = HashMap::new();
-        for (s, d) in r2s.iter() {
-            r2_by_src.entry(*s).or_default().push(*d);
-        }
-
-        let mut t1: Vec<(u64, u64, u64)> = vec![];
-        for (x1, x2) in r1s.iter() {
-            if let Some(xs3) = r2_by_src.get(x2) {
-                for &x3 in xs3.iter() {
-                    t1.push((*x1, *x2, x3));
-                }
-            }
-        }
-
-        let mut r5_by_src: HashMap<u64, Vec<u64>> = HashMap::new(); // x5 -> list x1
-        for (x5, x1) in r5s.iter() {
-            r5_by_src.entry(*x5).or_default().push(*x1);
-        }
-
-        let mut t3: Vec<(u64, u64, u64)> = vec![]; // (x1,x4,x5)
-        for (x4, x5) in r4s.iter() {
-            if let Some(xs1) = r5_by_src.get(x5) {
-                for &x1 in xs1.iter() {
-                    t3.push((x1, *x4, *x5));
-                }
-            }
-        }
-
-        // M13 multiplicity (#x2) per (x1,x3)
-        let mut m13: BTreeMap<u64, u64> = BTreeMap::new(); // key13 -> cnt
-        for (x1, _x2, x3) in t1.iter() {
-            *m13.entry(pack2(*x1, *x3)).or_default() += 1;
-        }
-
-        // M14 multiplicity (#x5) per (x1,x4)
-        let mut m14: BTreeMap<u64, u64> = BTreeMap::new(); // key14 -> cnt
-        for (x1, x4, _x5) in t3.iter() {
-            *m14.entry(pack2(*x1, *x4)).or_default() += 1;
-        }
-
-        // U = (x1,x3,m13) join R3(x3,x4)
-        let mut r3_by_src: HashMap<u64, Vec<u64>> = HashMap::new();
-        for (x3, x4) in r3s.iter() {
-            r3_by_src.entry(*x3).or_default().push(*x4);
-        }
-
-        let mut u_rows: Vec<(u64, u64, u64, u64)> = vec![]; // (x1,x3,x4,m13)
-        for (&k13, &cnt13) in m13.iter() {
-            let x1 = k13 / PACK_SHIFT;
-            let x3 = k13 % PACK_SHIFT;
-            if let Some(xs4) = r3_by_src.get(&x3) {
-                for &x4 in xs4.iter() {
-                    u_rows.push((x1, x3, x4, cnt13));
-                }
-            }
-        }
-
-        // Semijoin filter U by M14 on key14 = pack(x1,x4)
-        let mut u_kept: Vec<(u64, u64, u64, u64)> = vec![];
-        let mut u_dropped: Vec<(u64, u64, u64, u64)> = vec![];
-        for r in u_rows.iter() {
-            let key14 = pack2(r.0, r.2);
-            if m14.contains_key(&key14) {
-                u_kept.push(*r);
-            } else {
-                u_dropped.push(*r);
-            }
-        }
-
-        // DP weights: per kept row weight = m13 * m14(key14)
-        let mut msg13: BTreeMap<u64, u128> = BTreeMap::new(); // key13 -> sum weight
-        for (x1, x3, x4, cnt13) in u_kept.iter() {
-            let key14 = pack2(*x1, *x4);
-            let cnt14 = *m14.get(&key14).unwrap_or(&0) as u128;
-            let w = (*cnt13 as u128) * cnt14;
-            let key13 = pack2(*x1, *x3);
-            *msg13.entry(key13).or_default() += w;
-        }
-
-        // Final answer: sum over T1 rows (each corresponds to a distinct x2 choice)
-        let mut ans: u128 = 0;
-        for (x1, _x2, x3) in t1.iter() {
-            let key13 = pack2(*x1, *x3);
-            ans += *msg13.get(&key13).unwrap_or(&0);
-        }
-
-        // ----- assign all witness tables -----
         let cfg = self.cfg.clone();
 
+        // Load all LT tables used
+        LtChip::<F, NUM_BYTES>::construct(cfg.in_by_dst.lt_key.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.out_by_src.lt_key.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.agg_msg.lt_key.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.agg_msg.lt_out_key.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_low.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_high.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone()).load(layouter)?;
+
+        let in_view_chip = IndexedViewChip::<F>::construct(cfg.in_by_dst.clone());
+        let out_view_chip = IndexedViewChip::<F>::construct(cfg.out_by_src.clone());
+        let agg_msg_chip = AggSumByKeyChip::<F>::construct(cfg.agg_msg.clone());
+
         layouter.assign_region(
-            || "cycle5 witness",
+            || "triangle_path_closer witness",
             |mut region| {
-                // assign base tables (pad to max base length)
-                let nbase = *[r1.len(), r2.len(), r3.len(), r4.len(), r5.len()]
-                    .iter()
-                    .max()
-                    .unwrap_or(&0);
-
-                for i in 0..nbase {
-                    let (a, b) = if i < r1.len() {
-                        (r1[i].src + SHIFT_ID, r1[i].dst + SHIFT_ID)
-                    } else {
-                        (PAD_U64, PAD_U64)
-                    };
-                    region.assign_advice(
-                        || "r1_src",
-                        cfg.r1_src,
-                        i,
-                        || Value::known(F::from(a)),
-                    )?;
-                    region.assign_advice(
-                        || "r1_dst",
-                        cfg.r1_dst,
-                        i,
-                        || Value::known(F::from(b)),
-                    )?;
-
-                    let (a, b) = if i < r2.len() {
-                        (r2[i].src + SHIFT_ID, r2[i].dst + SHIFT_ID)
-                    } else {
-                        (PAD_U64, PAD_U64)
-                    };
-                    region.assign_advice(
-                        || "r2_src",
-                        cfg.r2_src,
-                        i,
-                        || Value::known(F::from(a)),
-                    )?;
-                    region.assign_advice(
-                        || "r2_dst",
-                        cfg.r2_dst,
-                        i,
-                        || Value::known(F::from(b)),
-                    )?;
-
-                    let (a, b) = if i < r3.len() {
-                        (r3[i].src + SHIFT_ID, r3[i].dst + SHIFT_ID)
-                    } else {
-                        (PAD_U64, PAD_U64)
-                    };
-                    region.assign_advice(
-                        || "r3_src",
-                        cfg.r3_src,
-                        i,
-                        || Value::known(F::from(a)),
-                    )?;
-                    region.assign_advice(
-                        || "r3_dst",
-                        cfg.r3_dst,
-                        i,
-                        || Value::known(F::from(b)),
-                    )?;
-
-                    let (a, b) = if i < r4.len() {
-                        (r4[i].src + SHIFT_ID, r4[i].dst + SHIFT_ID)
-                    } else {
-                        (PAD_U64, PAD_U64)
-                    };
-                    region.assign_advice(
-                        || "r4_src",
-                        cfg.r4_src,
-                        i,
-                        || Value::known(F::from(a)),
-                    )?;
-                    region.assign_advice(
-                        || "r4_dst",
-                        cfg.r4_dst,
-                        i,
-                        || Value::known(F::from(b)),
-                    )?;
-
-                    let (a, b) = if i < r5.len() {
-                        (r5[i].src + SHIFT_ID, r5[i].dst + SHIFT_ID)
-                    } else {
-                        (PAD_U64, PAD_U64)
-                    };
-                    region.assign_advice(
-                        || "r5_src",
-                        cfg.r5_src,
-                        i,
-                        || Value::known(F::from(a)),
-                    )?;
-                    region.assign_advice(
-                        || "r5_dst",
-                        cfg.r5_dst,
-                        i,
-                        || Value::known(F::from(b)),
-                    )?;
+                // -------------------
+                // Build (eid,src,dst) with dummy row0
+                // -------------------
+                let n_base = edges.len() + 1;
+                let mut base: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base); // (eid,src,dst)
+                base.push((0, 0, 0));
+                for (i, e) in edges.iter().enumerate() {
+                    let eid = (i + 1) as u64;
+                    base.push((eid, (e.src as u64) + SHIFT_ID, (e.dst as u64) + SHIFT_ID));
                 }
 
-                // ---- Assign T1 and T3 join outputs ----
-                // IMPORTANT: You must replace this with your Join2To3 gadget assignments + constraints.
-                // For now we just assign the computed rows.
-                for (i, (x1, x2, x3)) in t1.iter().enumerate() {
-                    region.assign_advice(
-                        || "t1_x1",
-                        cfg.t1_x1,
-                        i,
-                        || Value::known(F::from(*x1)),
-                    )?;
-                    region.assign_advice(
-                        || "t1_x2",
-                        cfg.t1_x2,
-                        i,
-                        || Value::known(F::from(*x2)),
-                    )?;
-                    region.assign_advice(
-                        || "t1_x3",
-                        cfg.t1_x3,
-                        i,
-                        || Value::known(F::from(*x3)),
-                    )?;
-                }
-                for (i, (x1, x4, x5)) in t3.iter().enumerate() {
-                    region.assign_advice(
-                        || "t3_x1",
-                        cfg.t3_x1,
-                        i,
-                        || Value::known(F::from(*x1)),
-                    )?;
-                    region.assign_advice(
-                        || "t3_x4",
-                        cfg.t3_x4,
-                        i,
-                        || Value::known(F::from(*x4)),
-                    )?;
-                    region.assign_advice(
-                        || "t3_x5",
-                        cfg.t3_x5,
-                        i,
-                        || Value::known(F::from(*x5)),
-                    )?;
+                // -------------------
+                // Build view inputs
+                // InByDst: key=dst, val=src
+                // OutBySrc: key=src, val=dst
+                // -------------------
+                let mut in_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
+                let mut out_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
+                for (eid, src, dst) in base.iter().copied() {
+                    in_rows.push((dst, src, eid));
+                    out_rows.push((src, dst, eid));
                 }
 
-                // ---- Build Agg inputs for M13 and M14 ----
-                let m13_in: Vec<(u64, u64)> = m13.iter().map(|(&k, &v)| (k, v)).collect();
-                let m14_in: Vec<(u64, u64)> = m14.iter().map(|(&k, &v)| (k, v)).collect();
+                in_view_chip.assign(&mut region, n_base, &in_rows)?;
+                out_view_chip.assign(&mut region, n_base, &out_rows)?;
 
-                // For AggSumByKey we need fixed length n; easiest: use n = max(size,1) and pad with (PAD,0).
-                // so membership lookups for PAD (when you pad upstream) cannot fail.
-                let n13 = std::cmp::max(m13_in.len() + 1, 1);
-                let n14 = std::cmp::max(m14_in.len() + 1, 1);
+                // -------------------
+                // Host-side grouping by key with eid-sorted order (to match IndexedView sorting)
+                // -------------------
+                let mut in_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*src*/)>> = HashMap::new();
+                let mut out_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*dst*/)>> = HashMap::new();
 
-                let mut m13_rows = vec![(PAD_U64, 0); n13];
-                let mut m14_rows = vec![(PAD_U64, 0); n14];
-                for i in 0..m13_in.len() {
-                    m13_rows[i] = m13_in[i];
-                }
-                for i in 0..m14_in.len() {
-                    m14_rows[i] = m14_in[i];
-                }
-
-                // Assign M13 agg+map at region offsets 0..n13
-                let _m13_emitted = agg_m13_chip.assign(&mut region, n13, &m13_rows)?;
-
-                // Assign M14 agg+map at region offsets 0..n14
-                let _m14_emitted = agg_m14_chip.assign(&mut region, n14, &m14_rows)?;
-
-                // ---- Assign U rows and semijoin filter witness ----
-                // We build semijoin input rows (key14,x1,x3,x4,m13)
-                let u_in_n = std::cmp::max(u_rows.len(), 1);
-                let mut semi_in: Vec<[u64; 5]> = vec![[PAD_U64; 5]; u_in_n];
-                for i in 0..u_rows.len() {
-                    let (x1, x3, x4, c13) = u_rows[i];
-                    semi_in[i] = [pack2(x1, x4), x1, x3, x4, c13];
-                }
-
-                for i in 0..u_in_n {
-                    // fill semijoin in_cols
-                    for j in 0..5 {
-                        region.assign_advice(
-                            || "semi_in",
-                            cfg.semi_u_by_m14.in_cols[j],
-                            i,
-                            || Value::known(F::from(semi_in[i][j])),
-                        )?;
+                for (eid, src, dst) in base.iter().copied() {
+                    if eid == 0 {
+                        continue;
                     }
-                    // packed key column
-                    region.assign_advice(
-                        || "u_key14",
-                        cfg.u_key14,
-                        i,
-                        || Value::known(F::from(semi_in[i][0])),
-                    )?;
+                    in_groups.entry(dst).or_default().push((eid, src));
+                    out_groups.entry(src).or_default().push((eid, dst));
+                }
+                for v in in_groups.values_mut() {
+                    v.sort_by_key(|(eid, _)| *eid);
+                }
+                for v in out_groups.values_mut() {
+                    v.sort_by_key(|(eid, _)| *eid);
                 }
 
-                // For membership flags we compute exact membership using m14 map
-                let mut m14_keys: Vec<u64> = m14.keys().copied().collect();
-                m14_keys.push(0);
-                m14_keys.push(PAD_U64);
-                m14_keys.sort();
-                m14_keys.dedup();
+                // -------------------
+                // Bag1: wedges A->B->C from join on B
+                // row = (A,B,C,i_r1,j_r2,r1_eid,r2_eid)
+                // ✅ Filter early: only keep wedges with A < B  (i.e., r1.src < r2.src)
+                // -------------------
+                let mut t12: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
+                for (&b, incoming) in in_groups.iter() {
+                    if let Some(outgoing) = out_groups.get(&b) {
+                        for (i, (r1_eid, a)) in incoming.iter().enumerate() {
+                            // EARLY FILTER: r1.src < r2.src  (A < B)
+                            // Note: a and b are already SHIFT_ID-shifted, inequality is preserved.
+                            if *a >= b {
+                                continue;
+                            }
+                            for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
+                                t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
+                            }
+                        }
+                    }
+                }
 
-                let lt_low_chip =
-                    LtChip::<F, NUM_BYTES>::construct(cfg.semi_u_by_m14.lt_low.clone());
+                // -------------------
+                // Bag2: edges C->A (r3) from OutBySrc grouped by C
+                // row = (C,A,j_r3,r3_eid)
+                // -------------------
+                let mut t3: Vec<(u64, u64, u64, u64)> = vec![];
+                for (&c, outs) in out_groups.iter() {
+                    for (j, (r3_eid, a)) in outs.iter().enumerate() {
+                        // edge is c -> a
+                        t3.push((c, *a, j as u64, *r3_eid));
+                    }
+                }
+
+                // -------------------
+                // Message map: msg_key = pack2(A,C), msg_val = count of edges C->A
+                // -------------------
+                let mut msg_map: BTreeMap<u64, u64> = BTreeMap::new();
+                for (c, a, _j, _eid) in t3.iter().copied() {
+                    let key = pack2(a, c);
+                    *msg_map.entry(key).or_default() += 1;
+                }
+
+                // -------------------
+                // Assign Bag2 + build agg inputs
+                // -------------------
+                let real3 = t3.len();
+                let n3 = std::cmp::max(real3 + bag2_pad_extra, 1);
+
+                let mut agg_in: Vec<(u64, u64)> = vec![(PAD_U64, 0); n3];
+
+                for i in 0..n3 {
+                    cfg.q_t3_lookup.enable(&mut region, i)?;
+                    cfg.q_t3_msg_in.enable(&mut region, i)?;
+
+                    if i < real3 {
+                        let (c, a, j_r3, r3_eid) = t3[i];
+
+                        region.assign_advice(
+                            || "t3_c",
+                            cfg.t3_c,
+                            i,
+                            || Value::known(F::from(c)),
+                        )?;
+                        region.assign_advice(
+                            || "t3_a",
+                            cfg.t3_a,
+                            i,
+                            || Value::known(F::from(a)),
+                        )?;
+                        region.assign_advice(
+                            || "t3_j_r3",
+                            cfg.t3_j_r3,
+                            i,
+                            || Value::known(F::from(j_r3)),
+                        )?;
+                        region.assign_advice(
+                            || "t3_r3_eid",
+                            cfg.t3_r3_eid,
+                            i,
+                            || Value::known(F::from(r3_eid)),
+                        )?;
+                        region.assign_advice(
+                            || "t3_real",
+                            cfg.t3_real,
+                            i,
+                            || Value::known(F::ONE),
+                        )?;
+
+                        agg_in[i] = (pack2(a, c), 1);
+                    } else {
+                        // padding
+                        region.assign_advice(|| "t3_c0", cfg.t3_c, i, || Value::known(F::ZERO))?;
+                        region.assign_advice(|| "t3_a0", cfg.t3_a, i, || Value::known(F::ZERO))?;
+                        region.assign_advice(
+                            || "t3_j0",
+                            cfg.t3_j_r3,
+                            i,
+                            || Value::known(F::ZERO),
+                        )?;
+                        region.assign_advice(
+                            || "t3_eid0",
+                            cfg.t3_r3_eid,
+                            i,
+                            || Value::known(F::ZERO),
+                        )?;
+                        region.assign_advice(
+                            || "t3_real0",
+                            cfg.t3_real,
+                            i,
+                            || Value::known(F::ZERO),
+                        )?;
+
+                        agg_in[i] = (PAD_U64, 0);
+                    }
+                }
+
+                // Aggregate msg table inside circuit
+                let _emitted = agg_msg_chip.assign(&mut region, n3, &agg_in)?;
+
+                // -------------------
+                // Assign Bag1 + message lookup + ordering + sum
+                // -------------------
+                let real12 = t12.len();
+                let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
+
+                println!("The length of n12 is: {}", t12.len());
+
+                // key list for gap witnesses
+                let mut keys: Vec<u64> = msg_map.keys().copied().collect();
+                keys.push(0);
+                keys.push(PAD_U64);
+                keys.sort();
+                keys.dedup();
+
+                let lt_ab_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone());
+                let lt_bc_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone());
+                let lt_low_chip = LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_low.clone());
                 let lt_high_chip =
-                    LtChip::<F, NUM_BYTES>::construct(cfg.semi_u_by_m14.lt_high.clone());
-                // NOTE: these LTs should be loaded already if you use them elsewhere; safe to call load once globally.
+                    LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_high.clone());
 
-                // Enable semijoin selectors and assign in_set/low/high/keep/out
-                for i in 0..u_in_n {
-                    cfg.semi_u_by_m14.q_flag.enable(&mut region, i)?;
-                    cfg.semi_u_by_m14.q_complex.enable(&mut region, i)?;
-                    cfg.semi_u_by_m14.q_copy_key.enable(&mut region, i)?;
-                    cfg.semi_u_by_m14.q_filter.enable(&mut region, i)?;
+                let mut running: u64 = 0;
 
-                    // membership in m14_keys
-                    let key = semi_in[i][0];
-                    let bs = m14_keys.binary_search(&key);
-                    let (inside, low, high) = match bs {
-                        Ok(_) => (1u64, 0u64, PAD_U64),
-                        Err(idx) => (0u64, m14_keys[idx - 1], m14_keys[idx]),
+                for i in 0..n12 {
+                    cfg.q_t12_lookup.enable(&mut region, i)?;
+                    cfg.q_t12_key.enable(&mut region, i)?;
+                    cfg.msg_lookup.q_flag.enable(&mut region, i)?;
+                    cfg.msg_lookup.q_complex.enable(&mut region, i)?;
+                    cfg.q_order.enable(&mut region, i)?;
+                    cfg.q_contrib.enable(&mut region, i)?;
+
+                    let (a, b, c, i_r1, j_r2, r1_eid, r2_eid, real) = if i < real12 {
+                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
+                        (a, b, c, i_r1, j_r2, r1_eid, r2_eid, 1u64)
+                    } else {
+                        (0, 0, 0, 0, 0, 0, 0, 0u64)
+                    };
+
+                    region.assign_advice(|| "t12_a", cfg.t12_a, i, || Value::known(F::from(a)))?;
+                    region.assign_advice(|| "t12_b", cfg.t12_b, i, || Value::known(F::from(b)))?;
+                    region.assign_advice(|| "t12_c", cfg.t12_c, i, || Value::known(F::from(c)))?;
+                    region.assign_advice(
+                        || "t12_i_r1",
+                        cfg.t12_i_r1,
+                        i,
+                        || Value::known(F::from(i_r1)),
+                    )?;
+                    region.assign_advice(
+                        || "t12_j_r2",
+                        cfg.t12_j_r2,
+                        i,
+                        || Value::known(F::from(j_r2)),
+                    )?;
+                    region.assign_advice(
+                        || "t12_r1_eid",
+                        cfg.t12_r1_eid,
+                        i,
+                        || Value::known(F::from(r1_eid)),
+                    )?;
+                    region.assign_advice(
+                        || "t12_r2_eid",
+                        cfg.t12_r2_eid,
+                        i,
+                        || Value::known(F::from(r2_eid)),
+                    )?;
+                    region.assign_advice(
+                        || "t12_real",
+                        cfg.t12_real,
+                        i,
+                        || Value::known(F::from(real)),
+                    )?;
+
+                    // LT witnesses (constraints disabled when real=0)
+                    lt_ab_chip.assign(
+                        &mut region,
+                        i,
+                        Value::known(F::from(a)),
+                        Value::known(F::from(b)),
+                    )?;
+                    lt_bc_chip.assign(
+                        &mut region,
+                        i,
+                        Value::known(F::from(b)),
+                        Value::known(F::from(c)),
+                    )?;
+
+                    // message lookup witness
+                    let key = if real == 1 { pack2(a, c) } else { 0 };
+                    let inside = if key == 0 || msg_map.contains_key(&key) {
+                        1u64
+                    } else {
+                        0u64
+                    };
+                    let val = if inside == 1 {
+                        *msg_map.get(&key).unwrap_or(&0)
+                    } else {
+                        0u64
+                    };
+
+                    let (low, high) = if inside == 0 {
+                        match keys.binary_search(&key) {
+                            Ok(_) => (0u64, PAD_U64),
+                            Err(pos) => {
+                                let lo = keys[pos.saturating_sub(1)];
+                                let hi = keys[pos];
+                                (lo, hi)
+                            }
+                        }
+                    } else {
+                        (0u64, PAD_U64)
                     };
 
                     region.assign_advice(
-                        || "in_set",
-                        cfg.semi_u_by_m14.in_set,
+                        || "msg_key",
+                        cfg.msg_lookup.key,
+                        i,
+                        || Value::known(F::from(key)),
+                    )?;
+                    region.assign_advice(
+                        || "msg_in_set",
+                        cfg.msg_lookup.in_set,
                         i,
                         || Value::known(F::from(inside)),
                     )?;
                     region.assign_advice(
-                        || "low",
-                        cfg.semi_u_by_m14.low,
+                        || "msg_low",
+                        cfg.msg_lookup.low,
                         i,
                         || Value::known(F::from(low)),
                     )?;
                     region.assign_advice(
-                        || "high",
-                        cfg.semi_u_by_m14.high,
+                        || "msg_high",
+                        cfg.msg_lookup.high,
                         i,
                         || Value::known(F::from(high)),
                     )?;
-
-                    // keep == inside
                     region.assign_advice(
-                        || "keep",
-                        cfg.semi_u_by_m14.keep,
+                        || "msg_val",
+                        cfg.msg_lookup.val,
                         i,
-                        || Value::known(F::from(inside)),
+                        || Value::known(F::from(val)),
                     )?;
 
-                    // out = keep?in:PAD
-                    for j in 0..5 {
-                        let outv = if inside == 1 { semi_in[i][j] } else { PAD_U64 };
-                        region.assign_advice(
-                            || "semi_out",
-                            cfg.semi_u_by_m14.out_cols[j],
-                            i,
-                            || Value::known(F::from(outv)),
-                        )?;
-                    }
-
-                    // lt gap proofs for missing rows
                     lt_low_chip.assign(
                         &mut region,
                         i,
@@ -1595,121 +1651,24 @@ impl<F: Field + Ord> Cycle5Chip<F> {
                         Value::known(F::from(key)),
                         Value::known(F::from(high)),
                     )?;
-                }
 
-                // perm selectors for semijoin compact (out_cols -> out_cols)
-                for i in 0..u_in_n {
-                    cfg.semi_u_by_m14.perm.q_perm1.enable(&mut region, i)?;
-                    cfg.semi_u_by_m14.perm.q_perm2.enable(&mut region, i)?;
-                }
-
-                // ---- DP rows from kept U ----
-                let kept_n = std::cmp::max(u_kept.len() + 1, 1);
-
-                let mut dp_rows: Vec<(u64, u64)> = vec![(PAD_U64, 0); kept_n]; // (key13, weight)
-                for i in 0..u_kept.len() {
-                    let (x1, x3, x4, c13) = u_kept[i];
-                    let key13 = pack2(x1, x3);
-                    let key14 = pack2(x1, x4);
-                    let c14 = *m14.get(&key14).unwrap_or(&0);
-                    dp_rows[i] = (key13, (c13 as u128 * c14 as u128) as u64); // assuming fits u64
-                }
-
-                for i in 0..kept_n {
-                    region.assign_advice(
-                        || "dp_key13",
-                        cfg.dp_key13,
-                        i,
-                        || Value::known(F::from(dp_rows[i].0)),
-                    )?;
-                    region.assign_advice(
-                        || "dp_val",
-                        cfg.dp_val,
-                        i,
-                        || Value::known(F::from(dp_rows[i].1)),
-                    )?;
-                }
-
-                // aggregate msg13 = group-by dp_key13 sum dp_val
-                let _msg13_emitted = agg_msg13_chip.assign(&mut region, kept_n, &dp_rows)?;
-
-                // ---- Final sum over each T1 row: lookup msg13(key13) and accumulate ----
-                let t1n = std::cmp::max(t1.len(), 1);
-                let mut keys13_for_t1: Vec<u64> = vec![PAD_U64; t1n];
-                for i in 0..t1.len() {
-                    keys13_for_t1[i] = pack2(t1[i].0, t1[i].2);
-                }
-
-                // msg13 keys for membership test
-                let mut msg_keys: Vec<u64> = msg13.keys().copied().collect();
-                msg_keys.push(0);
-                msg_keys.push(PAD_U64);
-                msg_keys.sort();
-                msg_keys.dedup();
-
-                let lt_low2 = LtChip::<F, NUM_BYTES>::construct(cfg.lt_low.clone());
-                let lt_high2 = LtChip::<F, NUM_BYTES>::construct(cfg.lt_high.clone());
-
-                let mut running: u64 = 0;
-                for i in 0..t1n {
-                    cfg.q_lookup.enable(&mut region, i)?;
-                    cfg.q_lookup_complex.enable(&mut region, i)?;
-
-                    let key = keys13_for_t1[i];
-                    // put key in dp_key13 column as lookup key carrier
-                    region.assign_advice(
-                        || "lookup_key",
-                        cfg.dp_key13,
-                        i,
-                        || Value::known(F::from(key)),
-                    )?;
-
-                    let bs = msg_keys.binary_search(&key);
-                    let (inside, low, high, val) = match bs {
-                        Ok(_) => (1u64, 0u64, PAD_U64, *msg13.get(&key).unwrap_or(&0) as u64),
-                        Err(idx) => (0u64, msg_keys[idx - 1], msg_keys[idx], 0u64),
-                    };
+                    let ab = if a < b { 1u64 } else { 0u64 };
+                    let bc = if b < c { 1u64 } else { 0u64 };
+                    let contrib_u64 = real * val * ab * bc;
 
                     region.assign_advice(
-                        || "in_set2",
-                        cfg.in_set,
+                        || "contrib",
+                        cfg.contrib,
                         i,
-                        || Value::known(F::from(inside)),
-                    )?;
-                    region.assign_advice(|| "low2", cfg.low, i, || Value::known(F::from(low)))?;
-                    region.assign_advice(
-                        || "high2",
-                        cfg.high,
-                        i,
-                        || Value::known(F::from(high)),
-                    )?;
-                    region.assign_advice(
-                        || "looked_val",
-                        cfg.looked_val,
-                        i,
-                        || Value::known(F::from(val)),
+                        || Value::known(F::from(contrib_u64)),
                     )?;
 
-                    lt_low2.assign(
-                        &mut region,
-                        i,
-                        Value::known(F::from(low)),
-                        Value::known(F::from(key)),
-                    )?;
-                    lt_high2.assign(
-                        &mut region,
-                        i,
-                        Value::known(F::from(key)),
-                        Value::known(F::from(high)),
-                    )?;
-
-                    // sum
                     if i == 0 {
-                        cfg.q_sum_first.enable(&mut region, i)?;
-                        running = val;
+                        cfg.q_sum0.enable(&mut region, i)?;
+                        running = contrib_u64;
                     } else {
-                        cfg.q_sum_accu.enable(&mut region, i)?;
-                        running += val;
+                        cfg.q_sum.enable(&mut region, i)?;
+                        running = running.wrapping_add(contrib_u64);
                     }
                     region.assign_advice(
                         || "run_sum",
@@ -1719,11 +1678,12 @@ impl<F: Field + Ord> Cycle5Chip<F> {
                     )?;
                 }
 
-                cfg.q_out.enable(&mut region, 0)?;
+                let out_row = n12 - 1;
+                cfg.q_out.enable(&mut region, out_row)?;
                 let out_cell = region.assign_advice(
                     || "out",
                     cfg.out,
-                    0,
+                    out_row,
                     || Value::known(F::from(running)),
                 )?;
                 Ok(out_cell)
@@ -1741,30 +1701,26 @@ impl<F: Field + Ord> Cycle5Chip<F> {
     }
 }
 
-/// Circuit wrapper
+/// Wrapper circuit
 pub struct MyCircuit<F: Field + Ord> {
-    pub r1: Vec<Edge>,
-    pub r2: Vec<Edge>,
-    pub r3: Vec<Edge>,
-    pub r4: Vec<Edge>,
-    pub r5: Vec<Edge>,
-    pub _m: PhantomData<F>,
+    pub edges: Vec<Edge>,
+    pub bag1_pad_extra: usize,
+    pub bag2_pad_extra: usize,
+    pub _marker: PhantomData<F>,
 }
 impl<F: Field + Ord> Default for MyCircuit<F> {
     fn default() -> Self {
         Self {
-            r1: vec![],
-            r2: vec![],
-            r3: vec![],
-            r4: vec![],
-            r5: vec![],
-            _m: PhantomData,
+            edges: vec![],
+            bag1_pad_extra: 0,
+            bag2_pad_extra: 0,
+            _marker: PhantomData,
         }
     }
 }
 
 impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
-    type Config = Cycle5Config<F>;
+    type Config = TrianglePathCloserConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
@@ -1772,108 +1728,147 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        Cycle5Chip::<F>::configure(meta)
+        TrianglePathCloserChip::<F>::configure(meta)
     }
 
     fn synthesize(&self, cfg: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
-        let chip = Cycle5Chip::construct(cfg);
+        let chip = TrianglePathCloserChip::<F>::construct(cfg);
         let out = chip.assign(
             &mut layouter,
-            self.r1.clone(),
-            self.r2.clone(),
-            self.r3.clone(),
-            self.r4.clone(),
-            self.r5.clone(),
+            self.edges.clone(),
+            self.bag1_pad_extra,
+            self.bag2_pad_extra,
         )?;
         chip.expose_public(&mut layouter, out, 0)?;
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::data::graph_data_processing::read_edges;
+    use crate::data::graph_data_processing::read_edges_csv;
     use halo2_proofs::dev::MockProver;
-    use halo2curves::pasta::Fp;
 
-    use std::collections::{HashMap, HashSet};
-    use std::marker::PhantomData;
+    use halo2_proofs::{
+        plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
+        poly::{
+            commitment::{Params, ParamsProver},
+            ipa::{
+                commitment::{IPACommitmentScheme, ParamsIPA},
+                multiopen::ProverIPA,
+                strategy::SingleStrategy,
+            },
+            VerificationStrategy,
+        },
+        transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+        },
+    };
+    use halo2curves::pasta::{vesta, EqAffine, Fp};
+    use rand::rngs::OsRng;
+    use std::time::Instant;
+    use std::{fs::File, io::Write, path::Path};
 
-    // If you have a loader in your repo, keep this and delete the fallback below.
-    // use crate::data::graph_data_processing::read_edges_tsv;
+    fn generate_para(k: u32) {
+        // Time to generate parameters
+        // let params_time_start = Instant::now();
 
-    /// Fallback loader (remove if you already have read_edges_tsv).
-    #[allow(dead_code)]
-    fn read_edges_tsv_fallback(path: &str) -> std::io::Result<Vec<Edge>> {
-        use std::io::{BufRead, BufReader};
-        let f = std::fs::File::open(path)?;
-        let mut out = Vec::new();
-        for line in BufReader::new(f).lines() {
-            let s = line?;
-            if s.trim().is_empty() || s.starts_with('#') {
-                continue;
-            }
-            // expects: "src<tab>dst" (or space). Adjust if needed.
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            let src: u64 = parts[0].parse().unwrap();
-            let dst: u64 = parts[1].parse().unwrap();
-            out.push(Edge { src, dst });
-        }
-        Ok(out)
+        // Note: Ensure `use halo2_proofs::poly::commitment::ParamsProver;` is in your imports for .new()
+        let params: ParamsIPA<vesta::Affine> = ParamsIPA::new(k);
+
+        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param22";
+        let mut fd = std::fs::File::create(params_path).unwrap();
+        params.write(&mut fd).unwrap();
+
+        // println!("Time to generate params {:?}", params_time);
     }
 
-    /// Host-side expected COUNT(*) for:
-    /// R1(x1,x2) ⋈ R2(x2,x3) ⋈ R3(x3,x4) ⋈ R4(x4,x5) ⋈ R5(x5,x1)
-    fn expected_cycle5_count(
-        r1: &[Edge],
-        r2: &[Edge],
-        r3: &[Edge],
-        r4: &[Edge],
-        r5: &[Edge],
-    ) -> u64 {
-        // R4 adjacency: x4 -> [x5]
-        let mut r4_by_src: HashMap<u64, Vec<u64>> = HashMap::new();
-        for e in r4 {
-            r4_by_src.entry(e.src).or_default().push(e.dst);
+    fn generate_and_verify_proof<C: Circuit<Fp>>(
+        circuit: C,
+        public_input: &[Fp],
+        proof_path: &str,
+    ) {
+        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param18";
+        let mut fd = std::fs::File::open(&params_path).unwrap();
+        let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
+
+        let t0 = Instant::now();
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
+        println!("Time to generate vk {:?}", t0.elapsed());
+
+        let t1 = Instant::now();
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk should not fail");
+        println!("Time to generate pk {:?}", t1.elapsed());
+
+        let mut rng = OsRng;
+        let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<IPACommitmentScheme<_>, ProverIPA<_>, _, _, _, _>(
+            &params,
+            &pk,
+            &[circuit],
+            &[&[public_input]],
+            &mut rng,
+            &mut transcript,
+        )
+        .expect("proof generation should not fail");
+        let proof = transcript.finalize();
+
+        File::create(Path::new(proof_path))
+            .expect("Failed to create proof file")
+            .write_all(&proof)
+            .expect("Failed to write proof");
+        println!("Proof written to: {}", proof_path);
+
+        let strategy = SingleStrategy::new(&params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        assert!(
+            verify_proof(
+                &params,
+                pk.get_vk(),
+                strategy,
+                &[&[public_input]],
+                &mut transcript
+            )
+            .is_ok(),
+            "Proof verification failed"
+        );
+    }
+
+    fn expected_cnt(edges: &[Edge]) -> u64 {
+        use std::collections::HashMap;
+
+        // multiplicity of each directed edge
+        let mut cnt: HashMap<(u64, u64), u64> = HashMap::new();
+        for e in edges {
+            let s = e.src as u64;
+            let d = e.dst as u64;
+            *cnt.entry((s, d)).or_default() += 1;
         }
 
-        // M35: x3 -> (x5 -> #paths x3->x4->x5)
-        // from R3(x3,x4) ⋈ R4(x4,x5)
-        let mut m35: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
-        for e3 in r3 {
-            if let Some(xs5) = r4_by_src.get(&e3.dst) {
-                let row = m35.entry(e3.src).or_default();
-                for &x5 in xs5 {
-                    *row.entry(x5).or_insert(0) += 1;
-                }
-            }
+        // adjacency by src: src -> [(dst, mult)]
+        let mut out: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        for (&(s, d), &c) in cnt.iter() {
+            out.entry(s).or_default().push((d, c));
         }
 
-        // M25: x2 -> (x5 -> #paths x2->x3->x4->x5)
-        // from R2(x2,x3) ⋈ M35(x3, x5)
-        let mut m25: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
-        for e2 in r2 {
-            if let Some(map35) = m35.get(&e2.dst) {
-                let row = m25.entry(e2.src).or_default();
-                for (&x5, &c) in map35.iter() {
-                    *row.entry(x5).or_insert(0) += c;
-                }
-            }
-        }
-
-        // R5 membership: x5 -> {x1}
-        let mut r5_by_src: HashMap<u64, HashSet<u64>> = HashMap::new();
-        for e5 in r5 {
-            r5_by_src.entry(e5.src).or_default().insert(e5.dst);
-        }
-
-        // Sum over R1(x1,x2): paths from x2 to x5 * indicator(R5 has (x5,x1))
         let mut total: u128 = 0;
-        for e1 in r1 {
-            if let Some(map25) = m25.get(&e1.dst) {
-                for (&x5, &c) in map25.iter() {
-                    if r5_by_src.get(&x5).map_or(false, |s| s.contains(&e1.src)) {
-                        total += c as u128;
+
+        // Enumerate A->B, B->C, C->A with A<B<C
+        for (&a, outs_ab) in out.iter() {
+            for &(b, cab) in outs_ab.iter() {
+                if !(a < b) {
+                    continue;
+                }
+                if let Some(outs_bc) = out.get(&b) {
+                    for &(c, cbc) in outs_bc.iter() {
+                        if !(b < c) {
+                            continue;
+                        }
+                        if let Some(&cca) = cnt.get(&(c, a)) {
+                            total += (cab as u128) * (cbc as u128) * (cca as u128);
+                        }
                     }
                 }
             }
@@ -1883,42 +1878,48 @@ mod tests {
     }
 
     #[test]
-    fn test_1() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data/facebook";
+    fn test() {
+        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
 
-        // Use whichever loader you actually have:
-        // let r1 = read_edges_tsv(&format!("{}/R1.tsv", base_path)).unwrap();
-        // ...
-        let mut r1 = read_edges_tsv_fallback(&format!("{}/R1.tsv", base_path)).unwrap();
-        let mut r2 = read_edges_tsv_fallback(&format!("{}/R2.tsv", base_path)).unwrap();
-        let mut r3 = read_edges_tsv_fallback(&format!("{}/R3.tsv", base_path)).unwrap();
-        let mut r4 = read_edges_tsv_fallback(&format!("{}/R4.tsv", base_path)).unwrap();
-        let mut r5 = read_edges_tsv_fallback(&format!("{}/R5.tsv", base_path)).unwrap();
+        // let mut edges =
+        //     read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
 
-        // Optional while debugging:
-        r1.truncate(100);
-        r2.truncate(100);
-        r3.truncate(100);
-        r4.truncate(100);
-        r5.truncate(100);
+        // let mut edges =
+        //     read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
+        // The length of n12 is: 2690019
 
-        let cnt = expected_cycle5_count(&r1, &r2, &r3, &r4, &r5);
+        let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
+        // The length of n12 is: 2255867
 
-        // ✅ THIS is the correct circuit type name in your pasted file:
+        // edges.truncate(200);
+
+        let cnt = expected_cnt(&edges);
+
         let circuit = MyCircuit::<Fp> {
-            r1,
-            r2,
-            r3,
-            r4,
-            r5,
-            _m: PhantomData,
+            edges,
+            bag1_pad_extra: 0,
+            bag2_pad_extra: 0,
+            _marker: PhantomData,
         };
-
-        // public output: COUNT(*)
         let public_input = vec![Fp::from(cnt)];
-
         let k = 16;
-        let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
-        prover.assert_satisfied();
+
+        let test = true;
+        // let test = false;
+
+        if test {
+            let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+            prover.assert_satisfied();
+        } else {
+            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/facebook_proof_q3";
+            generate_and_verify_proof(circuit, &public_input, proof_path);
+        }
+    }
+
+    #[test]
+    fn test1() {
+        let k = 22;
+
+        generate_para(k);
     }
 }

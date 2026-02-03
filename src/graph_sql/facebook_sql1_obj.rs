@@ -1,3 +1,41 @@
+//! 3-way path COUNT(*) with ordering (a<b<c) in ONE table Edge (self-join).
+//!
+//! Query:
+//!   SELECT COUNT(*) AS cnt
+//!   FROM Edge r1
+//!   JOIN Edge r2 ON r1.dst = r2.src
+//!   JOIN Edge r3 ON r2.dst = r3.src
+//!   WHERE r1.src < r2.src AND r2.src < r3.src;
+//!
+//! Variables:
+//!   a = r1.src
+//!   b = r2.src = r1.dst
+//!   c = r3.src = r2.dst
+//!
+//! Ordering becomes local constraints:
+//!   a < b  <=>  r1.src < r1.dst
+//!   b < c  <=>  r2.src < r2.dst
+//!
+//! DP plan (acyclic, like 5-way path):
+//!   T3[c] = outdegree(c)  (count edges in r3 grouped by src=c)
+//!   T2[b] = Σ_{(b->c) in r2} [b<c] * T3[c]
+//!   ans   = Σ_{(a->b) in r1} [a<b] * T2[b]
+//!
+//! Join is proven with membership+gap proof pattern using:
+//!   - map table with dummy row (0,0)
+//!   - lookup_any for (gap low/high) and (map key/val)
+//!
+//! NOTE (real dataset safety):
+//! - We shift all node IDs by +1 (SHIFT_ID) inside the circuit so that key=0
+//!   is reserved for the dummy map row (0,0). This prevents collisions when
+//!   real datasets contain node id 0.
+//! - Shifting preserves equality joins and < ordering.
+//!
+//! Depends on your existing chips:
+//!   crate::chips::is_zero::{IsZeroChip, IsZeroConfig}
+//!   crate::chips::less_than::{LtChip, LtConfig, LtInstruction}
+//!   crate::chips::permutation_any::{PermAnyChip, PermAnyConfig}
+
 use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -6,22 +44,29 @@ use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 
+// IMPORTANT: use the real dataset Edge type
 use crate::data::graph_data_processing::Edge;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-const NUM_BYTES: usize = 5;
-const MAX_SENTINEL: u64 = (1u64 << (8 * NUM_BYTES)) - 1; // 2^40-1
-const PAD_KEY: u64 = MAX_SENTINEL; // pad key goes last in ASC
+// Use 8 bytes for robustness on real datasets; adjust if you know your ID width.
+const NUM_BYTES: usize = 8;
+
+// Reserve key=0 for the dummy map row
+const SHIFT_ID: u64 = 1;
+
+// Sentinel/pad key goes last in ASC order
+const PAD_KEY: u64 = u64::MAX;
 const PAD_VAL: u64 = 0;
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
+/// ---------- Aggregator config (same pattern as GraphJoin5) ----------
 #[derive(Clone, Debug)]
 struct AggConfig<F: Field + Ord> {
-    // Input triple: (src, dst, val)  -- src/dst are existing base columns, val is separate col
+    // Input triple: (src, dst, val)
     val_in: Column<Advice>,
 
     // Sorted triple columns
@@ -59,17 +104,18 @@ struct AggConfig<F: Field + Ord> {
     q_tbl_shift: Selector, // enforce tbl_key_next[i] == tbl_key[i+1]
     q_tbl_last: Selector,  // enforce tbl_key_next[last] == PAD_KEY
 
-    // === NEW: map table used by joins (has dummy row 0) ===
-    map_pair: [Column<Advice>; 2], // (key,val) with row0 = (0,0), rows 1.. = tbl_pair shifted
+    // map table used by joins (has dummy row 0)
+    map_pair: [Column<Advice>; 2], // (key,val) with row0=(0,0), rows 1..=n copy tbl_pair
     map_key_next: Column<Advice>,  // next(key) for map_pair[0]
 
-    q_map_tbl: Selector,   // gate table rows 0..=L
+    q_map_tbl: Selector,   // enable table rows 0..=n (for lookup gating)
     q_map_first: Selector, // enforce map_pair[0] == (0,0)
     q_map_link: Selector,  // enforce map_pair[i+1] == tbl_pair[i]
     q_map_shift: Selector, // enforce map_key_next[i] == map_key[i+1]
     q_map_last: Selector,  // enforce map_key_next[last] == PAD_KEY
 }
 
+/// ---------- Join config (same pattern as GraphJoin5) ----------
 #[derive(Clone, Debug)]
 struct JoinConfig<F: Field + Ord> {
     // per-row membership flag: dst exists in next table?
@@ -77,11 +123,10 @@ struct JoinConfig<F: Field + Ord> {
     // gap witnesses if in_next == 0
     low: Column<Advice>,
     high: Column<Advice>,
-
     // attached value from next table (if in_next==1 else 0)
     val: Column<Advice>,
 
-    // selectors for lookups / logic
+    // selectors
     q_lookup: Selector,
     q_lookup_complex: Selector,
 
@@ -90,76 +135,154 @@ struct JoinConfig<F: Field + Ord> {
     lt_high: LtConfig<F, NUM_BYTES>,
 }
 
+/// ---------- Main circuit config ----------
 #[derive(Clone, Debug)]
-pub struct GraphJoin5Config<F: Field + Ord> {
+pub struct Path3OrdConfig<F: Field + Ord> {
     instance: Column<Instance>,
 
-    // base edges R1..R5: [src, dst]
-    r: [[Column<Advice>; 2]; 5],
+    // base edges r1,r2,r3: [src, dst] (all equal to Edge table)
+    r: [[Column<Advice>; 2]; 3],
 
-    // join steps for R1..R4 (R5 has no join-to-next)
-    join: [JoinConfig<F>; 4],
+    // join steps: r1->T2, r2->T3
+    join: [JoinConfig<F>; 2],
 
-    // aggregators producing T5, T4, T3, T2  (4 tables total)
-    // agg[0]=for R5 -> T5, agg[1]=R4->T4, agg[2]=R3->T3, agg[3]=R2->T2
-    agg: [AggConfig<F>; 4],
+    // aggregators: agg[0]=r3->T3, agg[1]=r2->T2
+    agg: [AggConfig<F>; 2],
 
-    // final sum over R1 values
+    // ordering checks
+    q_ord1: Selector,              // enable lt_ab on r1 rows
+    q_ord2: Selector,              // enable lt_bc on r2 rows
+    lt_ab: LtConfig<F, NUM_BYTES>, // r1.src < r1.dst
+    lt_bc: LtConfig<F, NUM_BYTES>, // r2.src < r2.dst
+
+    // glue gates (soundness) + filtered values
+    q_r3_one: Selector,    // enforce agg0.val_in = 1
+    q_r2_filter: Selector, // enforce agg1.val_in = join1.val * lt_bc
+    q_r1_filter: Selector, // enforce fval_r1 = join0.val * lt_ab
+
+    fval_r1: Column<Advice>, // filtered contribution per r1 row
+
+    // final sum
     q_sum_first: Selector,
     q_sum_accu: Selector,
     sum: Column<Advice>,
 
+    // output constrained to equal sum at chosen row
     out: Column<Advice>,
+    q_out: Selector,
 }
 
 #[derive(Clone)]
-pub struct GraphJoin5Circuit<F: Field + Ord> {
-    pub r1: Vec<Edge>,
-    pub r2: Vec<Edge>,
-    pub r3: Vec<Edge>,
-    pub r4: Vec<Edge>,
-    pub r5: Vec<Edge>,
+pub struct Path3OrdCircuit<F: Field + Ord> {
+    pub edges: Vec<Edge>,
     pub _marker: PhantomData<F>,
 }
 
-impl<F: Field + Ord> Default for GraphJoin5Circuit<F> {
+impl<F: Field + Ord> Default for Path3OrdCircuit<F> {
     fn default() -> Self {
         Self {
-            r1: vec![],
-            r2: vec![],
-            r3: vec![],
-            r4: vec![],
-            r5: vec![],
+            edges: vec![],
             _marker: PhantomData,
         }
     }
 }
 
-pub struct GraphJoin5Chip<F: Field + Ord> {
-    cfg: GraphJoin5Config<F>,
+pub struct Path3OrdChip<F: Field + Ord> {
+    cfg: Path3OrdConfig<F>,
 }
 
-impl<F: Field + Ord> GraphJoin5Chip<F> {
-    pub fn construct(cfg: GraphJoin5Config<F>) -> Self {
+impl<F: Field + Ord> Path3OrdChip<F> {
+    pub fn construct(cfg: Path3OrdConfig<F>) -> Self {
         Self { cfg }
     }
 
-    // ---------- helpers ----------
-    fn mk_perm(
-        meta: &mut ConstraintSystem<F>,
-        width: usize,
-    ) -> (Vec<Column<Advice>>, Vec<Column<Advice>>, PermAnyConfig) {
-        let q1 = meta.complex_selector();
-        let q2 = meta.complex_selector();
-        let mut a = vec![];
-        let mut b = vec![];
-        for _ in 0..width {
-            a.push(meta.advice_column());
-            b.push(meta.advice_column());
-        }
-        let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
-        (a, b, perm)
+    // ---------------- helpers (host-side) ----------------
+
+    fn sort_by_src(mut rows: Vec<[u64; 3]>) -> Vec<[u64; 3]> {
+        // stable tie-breaking doesn't matter for correctness; (src, dst, val) just needs to be a permutation
+        rows.sort_by_key(|r| r[0]);
+        rows
     }
+
+    fn run_sum_by_src(sorted: &[[u64; 3]]) -> Vec<u64> {
+        let mut out = vec![0u64; sorted.len()];
+        let mut acc: u128 = 0;
+        let mut prev: Option<u64> = None;
+        for (i, r) in sorted.iter().enumerate() {
+            let src = r[0];
+            let v = r[2] as u128;
+            if prev == Some(src) {
+                acc += v;
+            } else {
+                acc = v;
+            }
+            out[i] = acc as u64;
+            prev = Some(src);
+        }
+        out
+    }
+
+    fn emit_pairs(sorted: &[[u64; 3]], run: &[u64]) -> Vec<[u64; 2]> {
+        let n = sorted.len();
+        let mut out = vec![[PAD_KEY, PAD_VAL]; n];
+        for i in 0..n {
+            let cur = sorted[i][0];
+            let next = if i + 1 < n { sorted[i + 1][0] } else { PAD_KEY };
+            let is_last = next != cur;
+            if is_last {
+                out[i] = [cur, run[i]];
+            }
+        }
+        out
+    }
+
+    fn build_tbl_from_emit(emit: &[[u64; 2]], n: usize) -> Vec<[u64; 2]> {
+        let mut pairs: Vec<[u64; 2]> = emit.iter().copied().filter(|p| p[0] != PAD_KEY).collect();
+        pairs.sort_by_key(|p| p[0]);
+        while pairs.len() < n {
+            pairs.push([PAD_KEY, PAD_VAL]);
+        }
+        pairs.truncate(n);
+        pairs
+    }
+
+    fn key_next_from_tbl(tbl: &[[u64; 2]]) -> Vec<u64> {
+        let n = tbl.len();
+        let mut out = vec![PAD_KEY; n];
+        for i in 0..n {
+            out[i] = if i + 1 < n { tbl[i + 1][0] } else { PAD_KEY };
+        }
+        out
+    }
+
+    fn map_from_tbl(tbl: &[[u64; 2]]) -> HashMap<u64, u64> {
+        let mut m = HashMap::new();
+        for [k, v] in tbl.iter().copied() {
+            if k == PAD_KEY {
+                continue;
+            }
+            m.insert(k, v);
+        }
+        m
+    }
+
+    fn gap_witness(keys_sorted_with_pad: &[u64], x: u64) -> (u64, u64, u64) {
+        // returns (in, low, high)
+        match keys_sorted_with_pad.binary_search(&x) {
+            Ok(_) => (1, 0, PAD_KEY),
+            Err(idx) => {
+                let high = keys_sorted_with_pad[idx];
+                let low = if idx == 0 {
+                    0
+                } else {
+                    keys_sorted_with_pad[idx - 1]
+                };
+                (0, low, high)
+            }
+        }
+    }
+
+    // ---------------- configure gadgets ----------------
 
     fn configure_agg(
         meta: &mut ConstraintSystem<F>,
@@ -191,7 +314,7 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
             sorted.to_vec(),
         );
 
-        // sortedness on sorted[0] <= sorted[0]_next
+        // sortedness on sorted[0] <= sorted[0]_next (uses sentinel row at n)
         let q_sort = meta.selector();
         let aux_src_eq = meta.advice_column();
         let iz_src_eq = IsZeroChip::configure(
@@ -307,7 +430,7 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
             tbl_pair.to_vec(),
         );
 
-        // prove tbl_pair[0] sorted
+        // prove tbl_pair[0] sorted (only 0..n-2 are enabled in assignment)
         let q_tbl_sort = meta.selector();
         let aux_tbl_eq = meta.advice_column();
         let iz_tbl_key_eq = IsZeroChip::configure(
@@ -347,7 +470,7 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
             vec![q * (kn - Expression::Constant(F::from(PAD_KEY)))]
         });
 
-        // ---- NEW map table (dummy row 0) ----
+        // ---- map table (dummy row 0) ----
         let map_pair = [meta.advice_column(), meta.advice_column()];
         let map_key_next = meta.advice_column();
         for c in map_pair {
@@ -361,7 +484,6 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
         let q_map_shift = meta.selector();
         let q_map_last = meta.selector();
 
-        // row0: (0,0)
         meta.create_gate("map_first_is_zero", |m| {
             let q = m.query_selector(q_map_first);
             let k0 = m.query_advice(map_pair[0], Rotation::cur());
@@ -442,7 +564,7 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
         let q_lookup = meta.selector();
         let q_lookup_complex = meta.complex_selector();
 
-        // lt_low: low < dst, lt_high: dst < high
+        // lt_low: low < dst, lt_high: dst < high (enabled only when not in_next)
         let lt_low = LtChip::<F, NUM_BYTES>::configure(
             meta,
             |m| {
@@ -464,7 +586,6 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
             |m| m.query_advice(high, Rotation::cur()),
         );
 
-        // Booleanize in_next and enforce if not in_next then lt's are true; also force val=0 when not in_next
         meta.create_gate("join membership/gap basic logic", |m| {
             let q = m.query_selector(q_lookup);
             let inx = m.query_advice(in_next, Rotation::cur());
@@ -499,36 +620,81 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
         }
     }
 
-    pub fn configure(meta: &mut ConstraintSystem<F>) -> GraphJoin5Config<F> {
+    pub fn configure(meta: &mut ConstraintSystem<F>) -> Path3OrdConfig<F> {
         let instance = meta.instance_column();
         meta.enable_equality(instance);
 
-        let out = meta.advice_column();
-        meta.enable_equality(out);
-
-        // ✅ allocate DISTINCT columns for each Ri
-        let r: [[Column<Advice>; 2]; 5] =
+        let r: [[Column<Advice>; 2]; 3] =
             std::array::from_fn(|_| [meta.advice_column(), meta.advice_column()]);
-
-        for i in 0..5 {
+        for i in 0..3 {
             meta.enable_equality(r[i][0]);
             meta.enable_equality(r[i][1]);
         }
 
+        // join[0]: r1.dst joins to T2; join[1]: r2.dst joins to T3
         let join = [
             Self::configure_join(meta, r[0][1]),
             Self::configure_join(meta, r[1][1]),
-            Self::configure_join(meta, r[2][1]),
-            Self::configure_join(meta, r[3][1]),
         ];
 
+        // agg[0]=r3->T3 ; agg[1]=r2->T2
         let agg = [
-            Self::configure_agg(meta, r[4][0], r[4][1]),
-            Self::configure_agg(meta, r[3][0], r[3][1]),
             Self::configure_agg(meta, r[2][0], r[2][1]),
             Self::configure_agg(meta, r[1][0], r[1][1]),
         ];
 
+        // Ordering checks
+        let q_ord1 = meta.selector();
+        let q_ord2 = meta.selector();
+
+        let lt_ab = LtChip::<F, NUM_BYTES>::configure(
+            meta,
+            |m| m.query_selector(q_ord1),
+            |m| m.query_advice(r[0][0], Rotation::cur()),
+            |m| m.query_advice(r[0][1], Rotation::cur()),
+        );
+        let lt_bc = LtChip::<F, NUM_BYTES>::configure(
+            meta,
+            |m| m.query_selector(q_ord2),
+            |m| m.query_advice(r[1][0], Rotation::cur()),
+            |m| m.query_advice(r[1][1], Rotation::cur()),
+        );
+
+        // filtered contribution per r1 row
+        let fval_r1 = meta.advice_column();
+        meta.enable_equality(fval_r1);
+
+        // soundness glue
+        let q_r3_one = meta.selector();
+        let q_r2_filter = meta.selector();
+        let q_r1_filter = meta.selector();
+
+        // r3: val_in == 1
+        meta.create_gate("r3 val_in is 1", |m| {
+            let q = m.query_selector(q_r3_one);
+            let v = m.query_advice(agg[0].val_in, Rotation::cur());
+            vec![q * (v - Expression::Constant(F::ONE))]
+        });
+
+        // r2: agg[1].val_in == join[1].val * lt_bc
+        meta.create_gate("r2 val_in filtered by b<c", |m| {
+            let q = m.query_selector(q_r2_filter);
+            let raw = m.query_advice(join[1].val, Rotation::cur());
+            let bc = lt_bc.is_lt(m, None);
+            let vin = m.query_advice(agg[1].val_in, Rotation::cur());
+            vec![q * (vin - raw * bc)]
+        });
+
+        // r1: fval_r1 == join[0].val * lt_ab
+        meta.create_gate("r1 filtered contribution", |m| {
+            let q = m.query_selector(q_r1_filter);
+            let raw = m.query_advice(join[0].val, Rotation::cur());
+            let ab = lt_ab.is_lt(m, None);
+            let fv = m.query_advice(fval_r1, Rotation::cur());
+            vec![q * (fv - raw * ab)]
+        });
+
+        // sum fval_r1
         let q_sum_first = meta.selector();
         let q_sum_accu = meta.selector();
         let sum = meta.advice_column();
@@ -537,26 +703,47 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
         meta.create_gate("sum_first", |m| {
             let q = m.query_selector(q_sum_first);
             let s = m.query_advice(sum, Rotation::cur());
-            let v = m.query_advice(join[0].val, Rotation::cur());
+            let v = m.query_advice(fval_r1, Rotation::cur());
             vec![q * (s - v)]
         });
+
         meta.create_gate("sum_accu", |m| {
             let q = m.query_selector(q_sum_accu);
             let s_cur = m.query_advice(sum, Rotation::cur());
             let s_prev = m.query_advice(sum, Rotation::prev());
-            let v = m.query_advice(join[0].val, Rotation::cur());
+            let v = m.query_advice(fval_r1, Rotation::cur());
             vec![q * (s_cur - (s_prev + v))]
         });
 
-        GraphJoin5Config {
+        // output constrained equal to sum (enable q_out at the chosen row)
+        let out = meta.advice_column();
+        meta.enable_equality(out);
+        let q_out = meta.selector();
+        meta.create_gate("out equals sum", |m| {
+            let q = m.query_selector(q_out);
+            let o = m.query_advice(out, Rotation::cur());
+            let s = m.query_advice(sum, Rotation::cur());
+            vec![q * (o - s)]
+        });
+
+        Path3OrdConfig {
             instance,
             r,
             join,
             agg,
+            q_ord1,
+            q_ord2,
+            lt_ab,
+            lt_bc,
+            q_r3_one,
+            q_r2_filter,
+            q_r1_filter,
+            fval_r1,
             q_sum_first,
             q_sum_accu,
             sum,
             out,
+            q_out,
         }
     }
 
@@ -570,803 +757,615 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
         layouter.constrain_instance(cell.cell(), self.cfg.instance, row)
     }
 
-    // ---------------- witness builder (host-side) ----------------
+    // ---------------- assignment helpers ----------------
 
-    fn sort_by_src(mut rows: Vec<[u64; 3]>) -> Vec<[u64; 3]> {
-        rows.sort_by_key(|r| r[0]);
-        rows
-    }
+    fn assign_agg_stage(
+        region: &mut Region<'_, F>,
+        a: &AggConfig<F>,
+        n: usize,
+        sorted_rows: &Vec<[u64; 3]>,
+        run: &Vec<u64>,
+        emit: &Vec<[u64; 2]>,
+        tbl: &Vec<[u64; 2]>,
+        key_next: &Vec<u64>,
+        val_in_vec: &Vec<u64>,
+    ) -> Result<(), Error> {
+        // val_in
+        for i in 0..n {
+            region.assign_advice(
+                || "val_in",
+                a.val_in,
+                i,
+                || Value::known(F::from(val_in_vec[i])),
+            )?;
+        }
 
-    fn run_sum_by_src(sorted: &[[u64; 3]]) -> Vec<u64> {
-        let mut out = vec![0u64; sorted.len()];
-        let mut acc: u128 = 0;
-        let mut prev: Option<u64> = None;
-        for (i, r) in sorted.iter().enumerate() {
-            let src = r[0];
-            let v = r[2] as u128;
-            if prev == Some(src) {
-                acc += v;
+        // sorted triple + sentinel row at n
+        for i in 0..n {
+            region.assign_advice(
+                || "sorted_src",
+                a.sorted[0],
+                i,
+                || Value::known(F::from(sorted_rows[i][0])),
+            )?;
+            region.assign_advice(
+                || "sorted_dst",
+                a.sorted[1],
+                i,
+                || Value::known(F::from(sorted_rows[i][1])),
+            )?;
+            region.assign_advice(
+                || "sorted_val",
+                a.sorted[2],
+                i,
+                || Value::known(F::from(sorted_rows[i][2])),
+            )?;
+        }
+        region.assign_advice(
+            || "sorted_src_s",
+            a.sorted[0],
+            n,
+            || Value::known(F::from(PAD_KEY)),
+        )?;
+        region.assign_advice(
+            || "sorted_dst_s",
+            a.sorted[1],
+            n,
+            || Value::known(F::from(PAD_KEY)),
+        )?;
+        region.assign_advice(|| "sorted_val_s", a.sorted[2], n, || Value::known(F::ZERO))?;
+
+        // run_sum
+        for i in 0..n {
+            region.assign_advice(|| "run_sum", a.run_sum, i, || Value::known(F::from(run[i])))?;
+        }
+
+        // emit pairs
+        for i in 0..n {
+            region.assign_advice(
+                || "emit_k",
+                a.emit_pair[0],
+                i,
+                || Value::known(F::from(emit[i][0])),
+            )?;
+            region.assign_advice(
+                || "emit_v",
+                a.emit_pair[1],
+                i,
+                || Value::known(F::from(emit[i][1])),
+            )?;
+        }
+
+        // tbl pairs + key_next
+        for i in 0..n {
+            region.assign_advice(
+                || "tbl_k",
+                a.tbl_pair[0],
+                i,
+                || Value::known(F::from(tbl[i][0])),
+            )?;
+            region.assign_advice(
+                || "tbl_v",
+                a.tbl_pair[1],
+                i,
+                || Value::known(F::from(tbl[i][1])),
+            )?;
+            region.assign_advice(
+                || "tbl_kn",
+                a.tbl_key_next,
+                i,
+                || Value::known(F::from(key_next[i])),
+            )?;
+        }
+
+        // ---- map table: rows 0..=n ----
+        // row0 = (0,0)
+        region.assign_advice(|| "map_k0", a.map_pair[0], 0, || Value::known(F::ZERO))?;
+        region.assign_advice(|| "map_v0", a.map_pair[1], 0, || Value::known(F::ZERO))?;
+
+        // rows 1..=n copy tbl[0..n-1]
+        for i in 0..n {
+            region.assign_advice(
+                || "map_k",
+                a.map_pair[0],
+                i + 1,
+                || Value::known(F::from(tbl[i][0])),
+            )?;
+            region.assign_advice(
+                || "map_v",
+                a.map_pair[1],
+                i + 1,
+                || Value::known(F::from(tbl[i][1])),
+            )?;
+        }
+
+        // map_key_next[r] = map_key[r+1]
+        // => for r=0..n-1: map_key_next[r] = tbl[r].key ; for r=n: PAD
+        for r in 0..n {
+            region.assign_advice(
+                || "map_kn",
+                a.map_key_next,
+                r,
+                || Value::known(F::from(tbl[r][0])),
+            )?;
+        }
+        region.assign_advice(
+            || "map_kn_last",
+            a.map_key_next,
+            n,
+            || Value::known(F::from(PAD_KEY)),
+        )?;
+
+        // enable map selectors (table rows 0..=n)
+        for i in 0..=n {
+            a.q_map_tbl.enable(region, i)?;
+        }
+        a.q_map_first.enable(region, 0)?;
+        for i in 0..n {
+            a.q_map_link.enable(region, i)?;
+            a.q_map_shift.enable(region, i)?;
+        }
+        a.q_map_last.enable(region, n)?;
+
+        // enable perms
+        for i in 0..n {
+            a.perm_sort.q_perm1.enable(region, i)?;
+            a.perm_sort.q_perm2.enable(region, i)?;
+            a.perm_tbl.q_perm1.enable(region, i)?;
+            a.perm_tbl.q_perm2.enable(region, i)?;
+        }
+
+        // sortedness on sorted src uses sentinel row -> enable 0..n-1
+        for i in 0..n {
+            a.q_sort.enable(region, i)?;
+        }
+
+        // tbl sortedness is only meaningful for 0..n-2
+        for i in 0..n.saturating_sub(1) {
+            if i + 1 < n {
+                a.q_tbl_sort.enable(region, i)?;
+                a.q_tbl_shift.enable(region, i)?;
+            }
+        }
+        if n > 0 {
+            a.q_tbl_last.enable(region, n - 1)?;
+        }
+
+        // group gates
+        if n > 0 {
+            a.q_first.enable(region, 0)?;
+        }
+        for i in 1..n {
+            a.q_accu.enable(region, i)?;
+        }
+        for i in 0..n {
+            a.q_emit.enable(region, i)?;
+        }
+
+        // assign helper chips
+        let iz_same_prev_chip = IsZeroChip::construct(a.iz_same_prev.clone());
+        let iz_same_next_chip = IsZeroChip::construct(a.iz_same_next.clone());
+        let iz_src_eq_chip = IsZeroChip::construct(a.iz_src_eq.clone());
+        let iz_tbl_eq_chip = IsZeroChip::construct(a.iz_tbl_key_eq.clone());
+
+        let lt_src_chip = LtChip::<F, NUM_BYTES>::construct(a.lt_src_cur_next.clone());
+        let lt_tbl_chip = LtChip::<F, NUM_BYTES>::construct(a.lt_tbl_key_cur_next.clone());
+
+        // For sorted src: compare row i with row i+1; last compares to PAD sentinel
+        for i in 0..n {
+            let cur = sorted_rows[i][0];
+            let next = if i + 1 < n {
+                sorted_rows[i + 1][0]
             } else {
-                acc = v;
-            }
-            out[i] = acc as u64;
-            prev = Some(src);
-        }
-        out
-    }
+                PAD_KEY
+            };
 
-    fn emit_pairs(sorted: &[[u64; 3]], run: &[u64]) -> Vec<[u64; 2]> {
-        let n = sorted.len();
-        let mut out = vec![[PAD_KEY, PAD_VAL]; n];
+            lt_src_chip.assign(
+                region,
+                i,
+                Value::known(F::from(cur)),
+                Value::known(F::from(next)),
+            )?;
+            let diff_src = F::from(next) - F::from(cur);
+            iz_src_eq_chip.assign(region, i, Value::known(diff_src))?;
+        }
+
+        // For tbl sortedness: only 0..n-2
+        for i in 0..n.saturating_sub(1) {
+            if i + 1 < n {
+                lt_tbl_chip.assign(
+                    region,
+                    i,
+                    Value::known(F::from(tbl[i][0])),
+                    Value::known(F::from(tbl[i + 1][0])),
+                )?;
+                let diff_tbl = F::from(tbl[i + 1][0]) - F::from(tbl[i][0]);
+                iz_tbl_eq_chip.assign(region, i, Value::known(diff_tbl))?;
+            }
+        }
+
+        // same_prev (1..n-1)
+        for i in 1..n {
+            let diff = F::from(sorted_rows[i][0]) - F::from(sorted_rows[i - 1][0]);
+            iz_same_prev_chip.assign(region, i, Value::known(diff))?;
+        }
+        // same_next (0..n-1), uses sentinel row at n
         for i in 0..n {
-            let cur = sorted[i][0];
-            let next = if i + 1 < n { sorted[i + 1][0] } else { PAD_KEY };
-            let is_last = next != cur;
-            if is_last {
-                out[i] = [cur, run[i]];
-            }
+            let next_src = if i + 1 < n {
+                sorted_rows[i + 1][0]
+            } else {
+                PAD_KEY
+            };
+            let diff = F::from(next_src) - F::from(sorted_rows[i][0]);
+            iz_same_next_chip.assign(region, i, Value::known(diff))?;
         }
-        out
-    }
 
-    fn build_tbl_from_emit(emit: &[[u64; 2]], n: usize) -> Vec<[u64; 2]> {
-        // take all non-pad pairs (already in nondecreasing key order due to sorting+emit),
-        // pack them to the top, then pad.
-        let mut pairs: Vec<[u64; 2]> = emit.iter().copied().filter(|p| p[0] != PAD_KEY).collect();
-        // already sorted by construction; but keep safe:
-        pairs.sort_by_key(|p| p[0]);
-        while pairs.len() < n {
-            pairs.push([PAD_KEY, PAD_VAL]);
-        }
-        pairs.truncate(n);
-        pairs
+        Ok(())
     }
-
-    fn key_next_from_tbl(tbl: &[[u64; 2]]) -> Vec<u64> {
-        let n = tbl.len();
-        let mut out = vec![PAD_KEY; n];
-        for i in 0..n {
-            out[i] = if i + 1 < n { tbl[i + 1][0] } else { PAD_KEY };
-        }
-        out
-    }
-
-    fn map_from_tbl(tbl: &[[u64; 2]]) -> HashMap<u64, u64> {
-        let mut m = HashMap::new();
-        for [k, v] in tbl.iter().copied() {
-            if k == PAD_KEY {
-                continue;
-            }
-            m.insert(k, v);
-        }
-        m
-    }
-
-    fn gap_witness(keys_sorted_with_pad: &[u64], x: u64) -> (u64, u64, u64) {
-        // returns (in, low, high)
-        // keys_sorted_with_pad must include PAD_KEY at end, and also include 0 if you want that boundary.
-        match keys_sorted_with_pad.binary_search(&x) {
-            Ok(_) => (1, 0, PAD_KEY),
-            Err(idx) => {
-                // idx is first key > x
-                let high = keys_sorted_with_pad[idx];
-                let low = if idx == 0 {
-                    0
-                } else {
-                    keys_sorted_with_pad[idx - 1]
-                };
-                (0, low, high)
-            }
-        }
-    }
-
-    // ---------------- assign ----------------
 
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
-        r1: &[Edge],
-        r2: &[Edge],
-        r3: &[Edge],
-        r4: &[Edge],
-        r5: &[Edge],
+        edges_in: &[Edge],
     ) -> Result<AssignedCell<F, F>, Error> {
-        // Load Lt chips used in config (IMPORTANT)
-        // sort lt and table sort lt and join gap lts
-        for a in self.cfg.agg.iter() {
+        let cfg = &self.cfg;
+        let n = edges_in.len();
+
+        // load LT tables
+        // agg LTs
+        for a in cfg.agg.iter() {
             LtChip::<F, NUM_BYTES>::construct(a.lt_src_cur_next.clone()).load(layouter)?;
             LtChip::<F, NUM_BYTES>::construct(a.lt_tbl_key_cur_next.clone()).load(layouter)?;
         }
-        for j in self.cfg.join.iter() {
+        // join LTs
+        for j in cfg.join.iter() {
             LtChip::<F, NUM_BYTES>::construct(j.lt_low.clone()).load(layouter)?;
             LtChip::<F, NUM_BYTES>::construct(j.lt_high.clone()).load(layouter)?;
         }
+        // ordering LTs
+        LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone()).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone()).load(layouter)?;
 
-        // ---------- build host witnesses ----------
-        let r: [&[Edge]; 5] = [r1, r2, r3, r4, r5];
-        let n = r.iter().map(|x| x.len()).max().unwrap_or(0);
         if n == 0 {
-            // trivial: output 0
+            // trivial output 0
             let cell = layouter.assign_region(
                 || "out0",
                 |mut region| {
-                    let c = region.assign_advice(
-                        || "out",
-                        self.cfg.out,
-                        0,
-                        || Value::known(F::from(0)),
-                    )?;
+                    let c = region.assign_advice(|| "out", cfg.out, 0, || Value::known(F::ZERO))?;
                     Ok(c)
                 },
             )?;
             return Ok(cell);
         }
 
-        // Build stage 5 (R5 -> T5): val = 1 per edge
-        let r5_rows: Vec<[u64; 3]> = r5.iter().map(|e| [e.src, e.dst, 1u64]).collect();
-        let r5_sorted = Self::sort_by_src(r5_rows.clone());
-        let r5_run = Self::run_sum_by_src(&r5_sorted);
-        let r5_emit = Self::emit_pairs(&r5_sorted, &r5_run);
-        let t5_tbl = Self::build_tbl_from_emit(&r5_emit, r5.len());
-        let t5_next = Self::key_next_from_tbl(&t5_tbl);
-        let t5_map = Self::map_from_tbl(&t5_tbl);
+        // Shift IDs inside the circuit to reserve key=0 for dummy map row.
+        // (Works whether Edge fields are u32/u64/etc.)
+        let edges: Vec<(u64, u64)> = edges_in
+            .iter()
+            .map(|e| {
+                let s = e.src as u64;
+                let d = e.dst as u64;
+                (s + SHIFT_ID, d + SHIFT_ID)
+            })
+            .collect();
 
-        // helper: keys for gap proof (include 0 boundary and PAD)
-        let mut t5_keys: Vec<u64> = t5_tbl
+        // ---------------- host DP witnesses ----------------
+
+        // Stage T3 from r3 (same edges): val=1 per edge, group by src
+        let r3_rows: Vec<[u64; 3]> = edges.iter().map(|(s, d)| [*s, *d, 1u64]).collect();
+        let r3_sorted = Self::sort_by_src(r3_rows.clone());
+        let r3_run = Self::run_sum_by_src(&r3_sorted);
+        let r3_emit = Self::emit_pairs(&r3_sorted, &r3_run);
+        let t3_tbl = Self::build_tbl_from_emit(&r3_emit, n);
+        let t3_next = Self::key_next_from_tbl(&t3_tbl);
+        let t3_map = Self::map_from_tbl(&t3_tbl);
+
+        let mut t3_keys: Vec<u64> = t3_tbl
             .iter()
             .map(|p| p[0])
             .filter(|&k| k != PAD_KEY)
             .collect();
-        t5_keys.push(0);
-        t5_keys.push(PAD_KEY);
-        t5_keys.sort();
-        t5_keys.dedup();
+        t3_keys.push(0);
+        t3_keys.push(PAD_KEY);
+        t3_keys.sort();
+        t3_keys.dedup();
 
-        // Stage 4 join to T5, then aggregate -> T4
-        let (
-            r4_in,
-            r4_low,
-            r4_high,
-            r4_val,
-            r4_sorted,
-            r4_run,
-            r4_emit,
-            t4_tbl,
-            t4_next,
-            t4_map,
-            t4_keys,
-        ) = {
-            let mut rows = Vec::with_capacity(r4.len());
-            let mut inx = vec![0u64; r4.len()];
-            let mut low = vec![0u64; r4.len()];
-            let mut high = vec![PAD_KEY; r4.len()];
-            let mut val = vec![0u64; r4.len()];
+        // Join r2.dst into T3, then filter by (r2.src<r2.dst) to form val_in for T2
+        let mut r2_in = vec![0u64; n];
+        let mut r2_low = vec![0u64; n];
+        let mut r2_high = vec![PAD_KEY; n];
+        let mut r2_join_val = vec![0u64; n];
+        let mut r2_val_in = vec![0u64; n];
 
-            for (i, e) in r4.iter().enumerate() {
-                let dst = e.dst;
-                let (b, lo, hi) = Self::gap_witness(&t5_keys, dst);
-                inx[i] = b;
-                low[i] = lo;
-                high[i] = hi;
-                if b == 1 {
-                    val[i] = *t5_map.get(&dst).unwrap_or(&0);
-                } else {
-                    val[i] = 0;
-                }
-                rows.push([e.src, e.dst, val[i]]);
-            }
+        for (i, (s, d)) in edges.iter().enumerate() {
+            let dst_c = *d;
+            let (b, lo, hi) = Self::gap_witness(&t3_keys, dst_c);
+            r2_in[i] = b;
+            r2_low[i] = lo;
+            r2_high[i] = hi;
 
-            let sorted = Self::sort_by_src(rows.clone());
-            let run = Self::run_sum_by_src(&sorted);
-            let emit = Self::emit_pairs(&sorted, &run);
-            let tbl = Self::build_tbl_from_emit(&emit, r4.len());
-            let kn = Self::key_next_from_tbl(&tbl);
-            let mp = Self::map_from_tbl(&tbl);
+            let raw = if b == 1 {
+                *t3_map.get(&dst_c).unwrap_or(&0)
+            } else {
+                0
+            };
+            r2_join_val[i] = raw;
 
-            let mut keys: Vec<u64> = tbl.iter().map(|p| p[0]).filter(|&k| k != PAD_KEY).collect();
-            keys.push(0);
-            keys.push(PAD_KEY);
-            keys.sort();
-            keys.dedup();
+            let bc = if s < d { 1u64 } else { 0u64 };
+            r2_val_in[i] = raw.saturating_mul(bc);
+        }
 
-            (inx, low, high, val, sorted, run, emit, tbl, kn, mp, keys)
-        };
+        // Build T2 by aggregating rows (src, dst, val_in) grouped by src
+        let r2_rows: Vec<[u64; 3]> = edges
+            .iter()
+            .enumerate()
+            .map(|(i, (s, d))| [*s, *d, r2_val_in[i]])
+            .collect();
+        let r2_sorted = Self::sort_by_src(r2_rows.clone());
+        let r2_run = Self::run_sum_by_src(&r2_sorted);
+        let r2_emit = Self::emit_pairs(&r2_sorted, &r2_run);
+        let t2_tbl = Self::build_tbl_from_emit(&r2_emit, n);
+        let t2_next = Self::key_next_from_tbl(&t2_tbl);
+        let t2_map = Self::map_from_tbl(&t2_tbl);
 
-        // Stage 3 join to T4, aggregate -> T3
-        let (
-            r3_in,
-            r3_low,
-            r3_high,
-            r3_val,
-            r3_sorted,
-            r3_run,
-            r3_emit,
-            t3_tbl,
-            t3_next,
-            t3_map,
-            t3_keys,
-        ) = {
-            let mut rows = Vec::with_capacity(r3.len());
-            let mut inx = vec![0u64; r3.len()];
-            let mut low = vec![0u64; r3.len()];
-            let mut high = vec![PAD_KEY; r3.len()];
-            let mut val = vec![0u64; r3.len()];
+        let mut t2_keys: Vec<u64> = t2_tbl
+            .iter()
+            .map(|p| p[0])
+            .filter(|&k| k != PAD_KEY)
+            .collect();
+        t2_keys.push(0);
+        t2_keys.push(PAD_KEY);
+        t2_keys.sort();
+        t2_keys.dedup();
 
-            for (i, e) in r3.iter().enumerate() {
-                let dst = e.dst;
-                let (b, lo, hi) = Self::gap_witness(&t4_keys, dst);
-                inx[i] = b;
-                low[i] = lo;
-                high[i] = hi;
-                if b == 1 {
-                    val[i] = *t4_map.get(&dst).unwrap_or(&0);
-                } else {
-                    val[i] = 0;
-                }
-                rows.push([e.src, e.dst, val[i]]);
-            }
+        // Join r1.dst into T2
+        let mut r1_in = vec![0u64; n];
+        let mut r1_low = vec![0u64; n];
+        let mut r1_high = vec![PAD_KEY; n];
+        let mut r1_join_val = vec![0u64; n];
+        let mut r1_fval = vec![0u64; n];
 
-            let sorted = Self::sort_by_src(rows.clone());
-            let run = Self::run_sum_by_src(&sorted);
-            let emit = Self::emit_pairs(&sorted, &run);
-            let tbl = Self::build_tbl_from_emit(&emit, r3.len());
-            let kn = Self::key_next_from_tbl(&tbl);
-            let mp = Self::map_from_tbl(&tbl);
+        for (i, (s, d)) in edges.iter().enumerate() {
+            let b = *d;
+            let (inn, lo, hi) = Self::gap_witness(&t2_keys, b);
+            r1_in[i] = inn;
+            r1_low[i] = lo;
+            r1_high[i] = hi;
 
-            let mut keys: Vec<u64> = tbl.iter().map(|p| p[0]).filter(|&k| k != PAD_KEY).collect();
-            keys.push(0);
-            keys.push(PAD_KEY);
-            keys.sort();
-            keys.dedup();
+            let raw = if inn == 1 {
+                *t2_map.get(&b).unwrap_or(&0)
+            } else {
+                0
+            };
+            r1_join_val[i] = raw;
 
-            (inx, low, high, val, sorted, run, emit, tbl, kn, mp, keys)
-        };
+            let ab = if s < d { 1u64 } else { 0u64 };
+            r1_fval[i] = raw.saturating_mul(ab);
+        }
 
-        // Stage 2 join to T3, aggregate -> T2
-        let (
-            r2_in,
-            r2_low,
-            r2_high,
-            r2_val,
-            r2_sorted,
-            r2_run,
-            r2_emit,
-            t2_tbl,
-            t2_next,
-            t2_map,
-            t2_keys,
-        ) = {
-            let mut rows = Vec::with_capacity(r2.len());
-            let mut inx = vec![0u64; r2.len()];
-            let mut low = vec![0u64; r2.len()];
-            let mut high = vec![PAD_KEY; r2.len()];
-            let mut val = vec![0u64; r2.len()];
-
-            for (i, e) in r2.iter().enumerate() {
-                let dst = e.dst;
-                let (b, lo, hi) = Self::gap_witness(&t3_keys, dst);
-                inx[i] = b;
-                low[i] = lo;
-                high[i] = hi;
-                if b == 1 {
-                    val[i] = *t3_map.get(&dst).unwrap_or(&0);
-                } else {
-                    val[i] = 0;
-                }
-                rows.push([e.src, e.dst, val[i]]);
-            }
-
-            let sorted = Self::sort_by_src(rows.clone());
-            let run = Self::run_sum_by_src(&sorted);
-            let emit = Self::emit_pairs(&sorted, &run);
-            let tbl = Self::build_tbl_from_emit(&emit, r2.len());
-            let kn = Self::key_next_from_tbl(&tbl);
-            let mp = Self::map_from_tbl(&tbl);
-
-            let mut keys: Vec<u64> = tbl.iter().map(|p| p[0]).filter(|&k| k != PAD_KEY).collect();
-            keys.push(0);
-            keys.push(PAD_KEY);
-            keys.sort();
-            keys.dedup();
-
-            (inx, low, high, val, sorted, run, emit, tbl, kn, mp, keys)
-        };
-
-        // Stage 1 join to T2, final sum
-        let (r1_in, r1_low, r1_high, r1_val, answer) = {
-            let mut inx = vec![0u64; r1.len()];
-            let mut low = vec![0u64; r1.len()];
-            let mut high = vec![PAD_KEY; r1.len()];
-            let mut val = vec![0u64; r1.len()];
-
-            let mut total: u128 = 0;
-            for (i, e) in r1.iter().enumerate() {
-                let dst = e.dst;
-                let (b, lo, hi) = Self::gap_witness(&t2_keys, dst);
-                inx[i] = b;
-                low[i] = lo;
-                high[i] = hi;
-                if b == 1 {
-                    val[i] = *t2_map.get(&dst).unwrap_or(&0);
-                } else {
-                    val[i] = 0;
-                }
-                total += val[i] as u128;
-            }
-            (inx, low, high, val, total as u64)
-        };
-
-        // ---------- circuit assignment (single big region) ----------
-        let cfg = &self.cfg;
+        // ---------------- circuit assignment ----------------
 
         let out_cell = layouter.assign_region(
-            || "graph_join5_witness",
+            || "path3_ordered",
             |mut region| {
-                // assign base R1..R5
-                let all_edges = [&r1, &r2, &r3, &r4, &r5];
-                for (k, rel) in all_edges.iter().enumerate() {
-                    for (i, e) in rel.iter().enumerate() {
-                        region.assign_advice(
-                            || "src",
-                            cfg.r[k][0],
-                            i,
-                            || Value::known(F::from(e.src)),
-                        )?;
-                        region.assign_advice(
-                            || "dst",
-                            cfg.r[k][1],
-                            i,
-                            || Value::known(F::from(e.dst)),
-                        )?;
-                    }
-                    // optional: pad unused rows up to n to keep things defined (not strictly needed if you never query them)
+                // base tables r1,r2,r3 all equal to edges (self-join)
+                for (i, (s, d)) in edges.iter().enumerate() {
+                    // r1
+                    region.assign_advice(
+                        || "r1_src",
+                        cfg.r[0][0],
+                        i,
+                        || Value::known(F::from(*s)),
+                    )?;
+                    region.assign_advice(
+                        || "r1_dst",
+                        cfg.r[0][1],
+                        i,
+                        || Value::known(F::from(*d)),
+                    )?;
+                    // r2
+                    region.assign_advice(
+                        || "r2_src",
+                        cfg.r[1][0],
+                        i,
+                        || Value::known(F::from(*s)),
+                    )?;
+                    region.assign_advice(
+                        || "r2_dst",
+                        cfg.r[1][1],
+                        i,
+                        || Value::known(F::from(*d)),
+                    )?;
+                    // r3
+                    region.assign_advice(
+                        || "r3_src",
+                        cfg.r[2][0],
+                        i,
+                        || Value::known(F::from(*s)),
+                    )?;
+                    region.assign_advice(
+                        || "r3_dst",
+                        cfg.r[2][1],
+                        i,
+                        || Value::known(F::from(*d)),
+                    )?;
                 }
 
-                // assign join witnesses (R1..R4)
-                let join_w = [
-                    (&r1_in, &r1_low, &r1_high, &r1_val, r1.len()),
-                    (&r2_in, &r2_low, &r2_high, &r2_val, r2.len()),
-                    (&r3_in, &r3_low, &r3_high, &r3_val, r3.len()),
-                    (&r4_in, &r4_low, &r4_high, &r4_val, r4.len()),
-                ];
-
-                for k in 0..4 {
-                    let (inx, low, high, val, len) = join_w[k];
-                    let jc = &cfg.join[k];
-
+                // join[1] for r2 -> T3
+                {
+                    let jc = &cfg.join[1];
                     let lt_low_chip = LtChip::<F, NUM_BYTES>::construct(jc.lt_low.clone());
                     let lt_high_chip = LtChip::<F, NUM_BYTES>::construct(jc.lt_high.clone());
 
-                    for i in 0..len {
+                    for i in 0..n {
                         jc.q_lookup.enable(&mut region, i)?;
                         jc.q_lookup_complex.enable(&mut region, i)?;
 
                         region.assign_advice(
-                            || "in_next",
+                            || "r2_in",
                             jc.in_next,
                             i,
-                            || Value::known(F::from(inx[i])),
+                            || Value::known(F::from(r2_in[i])),
                         )?;
                         region.assign_advice(
-                            || "low",
+                            || "r2_low",
                             jc.low,
                             i,
-                            || Value::known(F::from(low[i])),
+                            || Value::known(F::from(r2_low[i])),
                         )?;
                         region.assign_advice(
-                            || "high",
+                            || "r2_high",
                             jc.high,
                             i,
-                            || Value::known(F::from(high[i])),
+                            || Value::known(F::from(r2_high[i])),
                         )?;
                         region.assign_advice(
-                            || "val",
+                            || "r2_val",
                             jc.val,
                             i,
-                            || Value::known(F::from(val[i])),
+                            || Value::known(F::from(r2_join_val[i])),
                         )?;
 
-                        // these are only enforced when (1-in_next) by the gate expression inside lt config
+                        let dst = edges[i].1;
                         lt_low_chip.assign(
                             &mut region,
                             i,
-                            Value::known(F::from(low[i])),
-                            Value::known(F::from(all_edges[k][i].dst)),
+                            Value::known(F::from(r2_low[i])),
+                            Value::known(F::from(dst)),
                         )?;
                         lt_high_chip.assign(
                             &mut region,
                             i,
-                            Value::known(F::from(all_edges[k][i].dst)),
-                            Value::known(F::from(high[i])),
+                            Value::known(F::from(dst)),
+                            Value::known(F::from(r2_high[i])),
                         )?;
                     }
                 }
 
-                // function to assign an agg stage (sorted+run_sum+emit+tbl)
-                let mut assign_agg_stage = |a: &AggConfig<F>,
-                                            base_src: Column<Advice>,
-                                            base_dst: Column<Advice>,
-                                            base_len: usize,
-                                            sorted_rows: &Vec<[u64; 3]>,
-                                            run: &Vec<u64>,
-                                            emit: &Vec<[u64; 2]>,
-                                            tbl: &Vec<[u64; 2]>,
-                                            key_next: &Vec<u64>,
-                                            val_in_vec: Option<&Vec<u64>>|
-                 -> Result<(), Error> {
-                    // val_in
-                    if let Some(vals) = val_in_vec {
-                        for i in 0..base_len {
-                            region.assign_advice(
-                                || "val_in",
-                                a.val_in,
-                                i,
-                                || Value::known(F::from(vals[i])),
-                            )?;
-                        }
-                    }
+                // join[0] for r1 -> T2
+                {
+                    let jc = &cfg.join[0];
+                    let lt_low_chip = LtChip::<F, NUM_BYTES>::construct(jc.lt_low.clone());
+                    let lt_high_chip = LtChip::<F, NUM_BYTES>::construct(jc.lt_high.clone());
 
-                    // sorted triple + sentinel row (for same_next)
-                    for i in 0..base_len {
+                    for i in 0..n {
+                        jc.q_lookup.enable(&mut region, i)?;
+                        jc.q_lookup_complex.enable(&mut region, i)?;
+
                         region.assign_advice(
-                            || "sorted_src",
-                            a.sorted[0],
+                            || "r1_in",
+                            jc.in_next,
                             i,
-                            || Value::known(F::from(sorted_rows[i][0])),
+                            || Value::known(F::from(r1_in[i])),
                         )?;
                         region.assign_advice(
-                            || "sorted_dst",
-                            a.sorted[1],
+                            || "r1_low",
+                            jc.low,
                             i,
-                            || Value::known(F::from(sorted_rows[i][1])),
+                            || Value::known(F::from(r1_low[i])),
                         )?;
                         region.assign_advice(
-                            || "sorted_val",
-                            a.sorted[2],
+                            || "r1_high",
+                            jc.high,
                             i,
-                            || Value::known(F::from(sorted_rows[i][2])),
+                            || Value::known(F::from(r1_high[i])),
                         )?;
-                    }
-                    // sentinel at row=base_len
-                    region.assign_advice(
-                        || "sorted_src_s",
-                        a.sorted[0],
-                        base_len,
-                        || Value::known(F::from(PAD_KEY)),
-                    )?;
-                    region.assign_advice(
-                        || "sorted_dst_s",
-                        a.sorted[1],
-                        base_len,
-                        || Value::known(F::from(PAD_KEY)),
-                    )?;
-                    region.assign_advice(
-                        || "sorted_val_s",
-                        a.sorted[2],
-                        base_len,
-                        || Value::known(F::from(0u64)),
-                    )?;
-
-                    // run_sum
-                    for i in 0..base_len {
                         region.assign_advice(
-                            || "run_sum",
-                            a.run_sum,
+                            || "r1_val",
+                            jc.val,
                             i,
-                            || Value::known(F::from(run[i])),
-                        )?;
-                    }
-
-                    // emit pairs
-                    for i in 0..base_len {
-                        region.assign_advice(
-                            || "emit_k",
-                            a.emit_pair[0],
-                            i,
-                            || Value::known(F::from(emit[i][0])),
-                        )?;
-                        region.assign_advice(
-                            || "emit_v",
-                            a.emit_pair[1],
-                            i,
-                            || Value::known(F::from(emit[i][1])),
-                        )?;
-                    }
-
-                    // tbl pairs + key_next
-                    for i in 0..base_len {
-                        region.assign_advice(
-                            || "tbl_k",
-                            a.tbl_pair[0],
-                            i,
-                            || Value::known(F::from(tbl[i][0])),
-                        )?;
-                        region.assign_advice(
-                            || "tbl_v",
-                            a.tbl_pair[1],
-                            i,
-                            || Value::known(F::from(tbl[i][1])),
-                        )?;
-                        region.assign_advice(
-                            || "tbl_kn",
-                            a.tbl_key_next,
-                            i,
-                            || Value::known(F::from(key_next[i])),
-                        )?;
-                    }
-
-                    // map_pair has length base_len + 1 (we already use row=base_len as sentinel elsewhere)
-                    if base_len > 0 {
-                        // row 0 = (0,0)
-                        region.assign_advice(
-                            || "map_k0",
-                            a.map_pair[0],
-                            0,
-                            || Value::known(F::from(0u64)),
-                        )?;
-                        region.assign_advice(
-                            || "map_v0",
-                            a.map_pair[1],
-                            0,
-                            || Value::known(F::from(0u64)),
+                            || Value::known(F::from(r1_join_val[i])),
                         )?;
 
-                        // rows 1..=base_len : copy tbl_pair[0..base_len-1]
-                        for i in 0..base_len {
-                            region.assign_advice(
-                                || "map_k",
-                                a.map_pair[0],
-                                i + 1,
-                                || Value::known(F::from(tbl[i][0])),
-                            )?;
-                            region.assign_advice(
-                                || "map_v",
-                                a.map_pair[1],
-                                i + 1,
-                                || Value::known(F::from(tbl[i][1])),
-                            )?;
-                        }
-
-                        // map_key_next[0..base_len-1] = map_key[i+1], map_key_next[base_len] = PAD_KEY
-                        for i in 0..base_len {
-                            let nextk = if i + 1 <= base_len {
-                                // always true here
-                                if i + 1 == base_len {
-                                    PAD_KEY
-                                } else {
-                                    tbl[i][0]
-                                } // careful: map_key[i+1] is tbl[i][0]
-                            } else {
-                                PAD_KEY
-                            };
-                            // Easier: define directly by map_key shift:
-                            // map_key_next[i] = map_key[i+1]
-                            let v = if i == 0 { tbl[0][0] } else { tbl[i][0] };
-                            region.assign_advice(
-                                || "map_kn",
-                                a.map_key_next,
-                                i,
-                                || Value::known(F::from(v)),
-                            )?;
-                        }
-                        region.assign_advice(
-                            || "map_kn_last",
-                            a.map_key_next,
-                            base_len,
-                            || Value::known(F::from(PAD_KEY)),
-                        )?;
-                    } else {
-                        // base_len == 0: just one row
-                        region.assign_advice(
-                            || "map_k0",
-                            a.map_pair[0],
-                            0,
-                            || Value::known(F::from(0u64)),
-                        )?;
-                        region.assign_advice(
-                            || "map_v0",
-                            a.map_pair[1],
-                            0,
-                            || Value::known(F::from(0u64)),
-                        )?;
-                        region.assign_advice(
-                            || "map_kn0",
-                            a.map_key_next,
-                            0,
-                            || Value::known(F::from(PAD_KEY)),
-                        )?;
-                    }
-
-                    // table rows 0..=base_len
-                    for i in 0..=base_len {
-                        a.q_map_tbl.enable(&mut region, i)?;
-                    }
-                    a.q_map_first.enable(&mut region, 0)?;
-                    for i in 0..base_len {
-                        a.q_map_link.enable(&mut region, i)?;
-                        a.q_map_shift.enable(&mut region, i)?;
-                    }
-                    a.q_map_last.enable(&mut region, base_len)?;
-
-                    // enable perms
-                    for i in 0..base_len {
-                        a.perm_sort.q_perm1.enable(&mut region, i)?;
-                        a.perm_sort.q_perm2.enable(&mut region, i)?;
-
-                        a.perm_tbl.q_perm1.enable(&mut region, i)?;
-                        a.perm_tbl.q_perm2.enable(&mut region, i)?;
-                    }
-
-                    // sortedness gates: sorted triple and tbl keys
-                    for i in 0..base_len.saturating_sub(1) {
-                        a.q_sort.enable(&mut region, i)?;
-                        a.q_tbl_sort.enable(&mut region, i)?;
-                        a.q_tbl_shift.enable(&mut region, i)?;
-                    }
-                    if base_len > 0 {
-                        a.q_tbl_last.enable(&mut region, base_len - 1)?;
-                    }
-
-                    // group run_sum gates
-                    if base_len > 0 {
-                        a.q_first.enable(&mut region, 0)?;
-                        a.q_emit.enable(&mut region, 0)?;
-                    }
-                    for i in 1..base_len {
-                        a.q_accu.enable(&mut region, i)?;
-                        a.q_emit.enable(&mut region, i)?;
-                    }
-
-                    // assign IsZero helpers (same_prev, same_next, eqs)
-                    let iz_same_prev_chip = IsZeroChip::construct(a.iz_same_prev.clone());
-                    let iz_same_next_chip = IsZeroChip::construct(a.iz_same_next.clone());
-                    let iz_src_eq_chip = IsZeroChip::construct(a.iz_src_eq.clone());
-                    let iz_tbl_eq_chip = IsZeroChip::construct(a.iz_tbl_key_eq.clone());
-
-                    // assign LtChip for sortedness checks
-                    let lt_src_chip = LtChip::<F, NUM_BYTES>::construct(a.lt_src_cur_next.clone());
-                    let lt_tbl_chip =
-                        LtChip::<F, NUM_BYTES>::construct(a.lt_tbl_key_cur_next.clone());
-
-                    for i in 0..base_len.saturating_sub(1) {
-                        lt_src_chip.assign(
+                        let dst = edges[i].1;
+                        lt_low_chip.assign(
                             &mut region,
                             i,
-                            Value::known(F::from(sorted_rows[i][0])),
-                            Value::known(F::from(sorted_rows[i + 1][0])),
+                            Value::known(F::from(r1_low[i])),
+                            Value::known(F::from(dst)),
                         )?;
-                        lt_tbl_chip.assign(
+                        lt_high_chip.assign(
                             &mut region,
                             i,
-                            Value::known(F::from(tbl[i][0])),
-                            Value::known(F::from(tbl[i + 1][0])),
+                            Value::known(F::from(dst)),
+                            Value::known(F::from(r1_high[i])),
                         )?;
                     }
+                }
 
-                    // same_prev: i>=1
-                    for i in 1..base_len {
-                        let diff = F::from(sorted_rows[i][0]) - F::from(sorted_rows[i - 1][0]);
-                        iz_same_prev_chip.assign(&mut region, i, Value::known(diff))?;
-                    }
-                    // same_next: i=0..base_len-1 (needs sentinel)
-                    for i in 0..base_len {
-                        let next_src = if i + 1 < base_len {
-                            sorted_rows[i + 1][0]
-                        } else {
-                            PAD_KEY
-                        };
-                        let diff = F::from(next_src) - F::from(sorted_rows[i][0]);
-                        iz_same_next_chip.assign(&mut region, i, Value::known(diff))?;
-                    }
+                // ordering selectors + LT witnesses
+                {
+                    let lt_ab_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone());
+                    let lt_bc_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone());
 
-                    // src_eq for sortedness check: uses next-cur on rows 0..base_len-2
-                    for i in 0..base_len.saturating_sub(1) {
-                        let diff = F::from(sorted_rows[i + 1][0]) - F::from(sorted_rows[i][0]);
-                        iz_src_eq_chip.assign(&mut region, i, Value::known(diff))?;
-                    }
-                    // tbl_eq similarly
-                    for i in 0..base_len.saturating_sub(1) {
-                        let diff = F::from(tbl[i + 1][0]) - F::from(tbl[i][0]);
-                        iz_tbl_eq_chip.assign(&mut region, i, Value::known(diff))?;
-                    }
+                    for i in 0..n {
+                        cfg.q_ord1.enable(&mut region, i)?;
+                        cfg.q_ord2.enable(&mut region, i)?;
 
-                    Ok(())
-                };
+                        let (s, d) = edges[i];
 
-                // Stage5 agg[0] uses R5 columns, val_in must be 1 vector
-                let r5_vals = vec![1u64; r5.len()];
-                assign_agg_stage(
+                        // r1.src < r1.dst
+                        lt_ab_chip.assign(
+                            &mut region,
+                            i,
+                            Value::known(F::from(s)),
+                            Value::known(F::from(d)),
+                        )?;
+                        // r2.src < r2.dst
+                        lt_bc_chip.assign(
+                            &mut region,
+                            i,
+                            Value::known(F::from(s)),
+                            Value::known(F::from(d)),
+                        )?;
+                    }
+                }
+
+                // glue selectors + filtered values
+                for i in 0..n {
+                    cfg.q_r3_one.enable(&mut region, i)?;
+                    cfg.q_r2_filter.enable(&mut region, i)?;
+                    cfg.q_r1_filter.enable(&mut region, i)?;
+
+                    region.assign_advice(
+                        || "fval_r1",
+                        cfg.fval_r1,
+                        i,
+                        || Value::known(F::from(r1_fval[i])),
+                    )?;
+                }
+
+                // agg stage 0: r3 -> T3 (val_in all ones)
+                let r3_val_in = vec![1u64; n];
+                Self::assign_agg_stage(
+                    &mut region,
                     &cfg.agg[0],
-                    cfg.r[4][0],
-                    cfg.r[4][1],
-                    r5.len(),
-                    &r5_sorted,
-                    &r5_run,
-                    &r5_emit,
-                    &t5_tbl,
-                    &t5_next,
-                    Some(&r5_vals),
-                )?;
-
-                // Stage4 agg[1] uses R4 columns and join[3].val as val_in
-                assign_agg_stage(
-                    &cfg.agg[1],
-                    cfg.r[3][0],
-                    cfg.r[3][1],
-                    r4.len(),
-                    &r4_sorted,
-                    &r4_run,
-                    &r4_emit,
-                    &t4_tbl,
-                    &t4_next,
-                    Some(&r4_val),
-                )?;
-
-                // Stage3 agg[2]
-                assign_agg_stage(
-                    &cfg.agg[2],
-                    cfg.r[2][0],
-                    cfg.r[2][1],
-                    r3.len(),
+                    n,
                     &r3_sorted,
                     &r3_run,
                     &r3_emit,
                     &t3_tbl,
                     &t3_next,
-                    Some(&r3_val),
+                    &r3_val_in,
                 )?;
 
-                // Stage2 agg[3]
-                assign_agg_stage(
-                    &cfg.agg[3],
-                    cfg.r[1][0],
-                    cfg.r[1][1],
-                    r2.len(),
+                // agg stage 1: r2 -> T2 (val_in = join_val * (b<c))
+                Self::assign_agg_stage(
+                    &mut region,
+                    &cfg.agg[1],
+                    n,
                     &r2_sorted,
                     &r2_run,
                     &r2_emit,
                     &t2_tbl,
                     &t2_next,
-                    Some(&r2_val),
+                    &r2_val_in,
                 )?;
 
-                // ---------- lookups for membership + gap + mapping ----------
-                // We implement them exactly like your Q3 pattern:
-                // - membership: (in_next * dst) in tbl_key
-                // - gap pair: (1-in_next)*low in tbl_key AND (1-in_next)*high in tbl_key_next
-                // - mapping: (in_next*dst, in_next*val) exists in (tbl_key, tbl_val)
-
-                // helper to add lookups per join step against a given agg table
-                let mut add_join_lookups =
-                    |step_idx: usize, table: &AggConfig<F>, rel_idx: usize, rel_len: usize| {
-                        let j = cfg.join[step_idx].clone();
-
-                        // membership
-                        meta::lookup_any_placeholder::<F>(); // (no-op, just to keep structure clear)
-                        Ok::<(), Error>(())
-                    };
-
-                // NOTE: Halo2 lookup definitions must be in `configure`, not here.
-                // So we only *enable selectors* here (the lookups are already wired in configure below).
-                //
-                // Therefore: we enable q_lookup_complex on all rows of each join relation.
-                for i in 0..r1.len() {
-                    cfg.join[0].q_lookup_complex.enable(&mut region, i)?;
-                }
-                for i in 0..r2.len() {
-                    cfg.join[1].q_lookup_complex.enable(&mut region, i)?;
-                }
-                for i in 0..r3.len() {
-                    cfg.join[2].q_lookup_complex.enable(&mut region, i)?;
-                }
-                for i in 0..r4.len() {
-                    cfg.join[3].q_lookup_complex.enable(&mut region, i)?;
-                }
-
-                // Final sum over R1: sum[i]=sum[i-1]+val[i]
+                // final sum over fval_r1
                 let mut running: u128 = 0;
-                for i in 0..r1.len() {
-                    running += r1_val[i] as u128;
+                for i in 0..n {
+                    running += r1_fval[i] as u128;
                     region.assign_advice(
                         || "sum",
                         cfg.sum,
@@ -1374,22 +1373,20 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
                         || Value::known(F::from(running as u64)),
                     )?;
                 }
-                if r1.len() > 0 {
-                    cfg.q_sum_first.enable(&mut region, 0)?;
-                }
-                for i in 1..r1.len() {
+                cfg.q_sum_first.enable(&mut region, 0)?;
+                for i in 1..n {
                     cfg.q_sum_accu.enable(&mut region, i)?;
                 }
 
-                // output cell = sum[last]
-                let out_row = r1.len() - 1;
+                // output at last row, constrained equal to sum via q_out
+                let out_row = n - 1;
+                cfg.q_out.enable(&mut region, out_row)?;
                 let out_cell = region.assign_advice(
                     || "out",
                     cfg.out,
                     out_row,
-                    || Value::known(F::from(answer)),
+                    || Value::known(F::from((running as u64))),
                 )?;
-
                 Ok(out_cell)
             },
         )?;
@@ -1398,11 +1395,10 @@ impl<F: Field + Ord> GraphJoin5Chip<F> {
     }
 }
 
-// ---------------- IMPORTANT: lookups must be defined in configure ----------------
-// We attach them by implementing Circuit::configure below using meta.lookup_any.
+// ---------------- IMPORTANT: join lookups are defined in Circuit::configure ----------------
 
-impl<F: Field + Ord> Circuit<F> for GraphJoin5Circuit<F> {
-    type Config = GraphJoin5Config<F>;
+impl<F: Field + Ord> Circuit<F> for Path3OrdCircuit<F> {
+    type Config = Path3OrdConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
@@ -1410,67 +1406,98 @@ impl<F: Field + Ord> Circuit<F> for GraphJoin5Circuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let mut cfg = GraphJoin5Chip::<F>::configure(meta);
+        let cfg = Path3OrdChip::<F>::configure(meta);
 
-        // Convenience aliases:
-        // tables: agg[0]=T5 from R5, agg[1]=T4, agg[2]=T3, agg[3]=T2
-        let t5 = cfg.agg[0].clone();
-        let t4 = cfg.agg[1].clone();
-        let t3 = cfg.agg[2].clone();
-        let t2 = cfg.agg[3].clone();
+        // convenience
+        let t3 = cfg.agg[0].clone(); // table from r3
+        let t2 = cfg.agg[1].clone(); // table from r2
 
-        // For each join step k, join[k] references next table (k=0 uses T2, k=1 uses T3, k=2 uses T4, k=3 uses T5)
+        // r1 joins to T2
+        {
+            let j = cfg.join[0].clone();
+            let rel_dst = cfg.r[0][1];
+            let t = t2.clone();
 
-        // Helper to add membership+gap+mapping lookups:
-        let mut add_join =
-            |k: usize, rel_dst: Column<Advice>, j: JoinConfig<F>, t: AggConfig<F>| {
-                // gap pair: (1-in)*low in key  AND  (1-in)*high in key_next
-                meta.lookup_any(format!("gap pair step {}", k), move |m| {
-                    let q_in = m.query_selector(j.q_lookup_complex);
-                    let inx = m.query_advice(j.in_next, Rotation::cur());
-                    let gate = q_in * (Expression::Constant(F::ONE) - inx);
+            // gap lookup: (1-in)*low in key AND (1-in)*high in key_next
+            meta.lookup_any("gap r1->t2", move |m| {
+                let q_in = m.query_selector(j.q_lookup_complex);
+                let inx = m.query_advice(j.in_next, Rotation::cur());
+                let gate = q_in * (Expression::Constant(F::ONE) - inx);
 
-                    let low = m.query_advice(j.low, Rotation::cur());
-                    let high = m.query_advice(j.high, Rotation::cur());
+                let low = m.query_advice(j.low, Rotation::cur());
+                let high = m.query_advice(j.high, Rotation::cur());
 
-                    let q_tbl = m.query_selector(t.q_map_tbl);
-                    let key = m.query_advice(t.map_pair[0], Rotation::cur());
-                    let keyn = m.query_advice(t.map_key_next, Rotation::cur());
+                let q_tbl = m.query_selector(t.q_map_tbl);
+                let key = m.query_advice(t.map_pair[0], Rotation::cur());
+                let keyn = m.query_advice(t.map_key_next, Rotation::cur());
 
-                    vec![
-                        (gate.clone() * low, q_tbl.clone() * key),
-                        (gate * high, q_tbl * keyn),
-                    ]
-                });
+                vec![
+                    (gate.clone() * low, q_tbl.clone() * key),
+                    (gate * high, q_tbl * keyn),
+                ]
+            });
 
-                // mapping: (in*dst, val) exists in (map_key, map_val)
-                // when in=0, val is forced 0 by your join gate, so tuple becomes (0,0) which exists at row0
-                meta.lookup_any(format!("map step {}", k), move |m| {
-                    let q_in = m.query_selector(j.q_lookup_complex);
-                    let inx = m.query_advice(j.in_next, Rotation::cur());
+            // map lookup: (in*dst, val) exists in (map_key, map_val)
+            // when in=0, join-gate forces val=0 so tuple is (0,0) which exists at map row0
+            meta.lookup_any("map r1->t2", move |m| {
+                let q_in = m.query_selector(j.q_lookup_complex);
+                let inx = m.query_advice(j.in_next, Rotation::cur());
 
-                    let dst = m.query_advice(rel_dst, Rotation::cur());
-                    let v = m.query_advice(j.val, Rotation::cur());
+                let dst = m.query_advice(rel_dst, Rotation::cur());
+                let v = m.query_advice(j.val, Rotation::cur());
 
-                    let q_tbl = m.query_selector(t.q_map_tbl);
-                    let tk = m.query_advice(t.map_pair[0], Rotation::cur());
-                    let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+                let q_tbl = m.query_selector(t.q_map_tbl);
+                let tk = m.query_advice(t.map_pair[0], Rotation::cur());
+                let tv = m.query_advice(t.map_pair[1], Rotation::cur());
 
-                    vec![
-                        (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
-                        (q_in * v, q_tbl * tv),
-                    ]
-                });
-            };
+                vec![
+                    (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
+                    (q_in * v, q_tbl * tv),
+                ]
+            });
+        }
 
-        // R1 joins to T2
-        add_join(0, cfg.r[0][1], cfg.join[0].clone(), t2);
-        // R2 joins to T3
-        add_join(1, cfg.r[1][1], cfg.join[1].clone(), t3);
-        // R3 joins to T4
-        add_join(2, cfg.r[2][1], cfg.join[2].clone(), t4);
-        // R4 joins to T5
-        add_join(3, cfg.r[3][1], cfg.join[3].clone(), t5);
+        // r2 joins to T3
+        {
+            let j = cfg.join[1].clone();
+            let rel_dst = cfg.r[1][1];
+            let t = t3.clone();
+
+            meta.lookup_any("gap r2->t3", move |m| {
+                let q_in = m.query_selector(j.q_lookup_complex);
+                let inx = m.query_advice(j.in_next, Rotation::cur());
+                let gate = q_in * (Expression::Constant(F::ONE) - inx);
+
+                let low = m.query_advice(j.low, Rotation::cur());
+                let high = m.query_advice(j.high, Rotation::cur());
+
+                let q_tbl = m.query_selector(t.q_map_tbl);
+                let key = m.query_advice(t.map_pair[0], Rotation::cur());
+                let keyn = m.query_advice(t.map_key_next, Rotation::cur());
+
+                vec![
+                    (gate.clone() * low, q_tbl.clone() * key),
+                    (gate * high, q_tbl * keyn),
+                ]
+            });
+
+            meta.lookup_any("map r2->t3", move |m| {
+                let q_in = m.query_selector(j.q_lookup_complex);
+                let inx = m.query_advice(j.in_next, Rotation::cur());
+
+                let dst = m.query_advice(rel_dst, Rotation::cur());
+                let v = m.query_advice(j.val, Rotation::cur());
+
+                let q_tbl = m.query_selector(t.q_map_tbl);
+                let tk = m.query_advice(t.map_pair[0], Rotation::cur());
+                let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+
+                vec![
+                    (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
+                    (q_in * v, q_tbl * tv),
+                ]
+            });
+        }
 
         cfg
     }
@@ -1480,106 +1507,154 @@ impl<F: Field + Ord> Circuit<F> for GraphJoin5Circuit<F> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let chip = GraphJoin5Chip::construct(config);
-        let out_cell = chip.assign(
-            &mut layouter,
-            &self.r1,
-            &self.r2,
-            &self.r3,
-            &self.r4,
-            &self.r5,
-        )?;
+        let chip = Path3OrdChip::construct(config);
+        let out_cell = chip.assign(&mut layouter, &self.edges)?;
         chip.expose_public(&mut layouter, out_cell, 0)?;
         Ok(())
     }
 }
 
-// dummy helper only to keep the file compiling if you copy blocks around
-mod meta {
-    #[allow(dead_code)]
-    pub fn lookup_any_placeholder<F>() {}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::graph_data_processing::read_edges_tsv;
-
+    use crate::data::graph_data_processing::read_edges;
+    use crate::data::graph_data_processing::read_edges_csv;
     use halo2_proofs::dev::MockProver;
-    use halo2curves::pasta::Fp;
+
+    use halo2_proofs::{
+        plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
+        poly::{
+            commitment::Params,
+            ipa::{
+                commitment::{IPACommitmentScheme, ParamsIPA},
+                multiopen::ProverIPA,
+                strategy::SingleStrategy,
+            },
+            VerificationStrategy,
+        },
+        transcript::{
+            Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+        },
+    };
+    use halo2curves::pasta::{vesta, EqAffine, Fp};
+    use rand::rngs::OsRng;
+    use std::time::Instant;
+    use std::{fs::File, io::Write, path::Path};
+
+    fn generate_and_verify_proof<C: Circuit<Fp>>(
+        circuit: C,
+        public_input: &[Fp],
+        proof_path: &str,
+    ) {
+        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param17";
+        let mut fd = std::fs::File::open(&params_path).unwrap();
+        let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
+
+        let t0 = Instant::now();
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
+        println!("Time to generate vk {:?}", t0.elapsed());
+
+        let t1 = Instant::now();
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk should not fail");
+        println!("Time to generate pk {:?}", t1.elapsed());
+
+        let mut rng = OsRng;
+        let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
+        create_proof::<IPACommitmentScheme<_>, ProverIPA<_>, _, _, _, _>(
+            &params,
+            &pk,
+            &[circuit],
+            &[&[public_input]],
+            &mut rng,
+            &mut transcript,
+        )
+        .expect("proof generation should not fail");
+        let proof = transcript.finalize();
+
+        File::create(Path::new(proof_path))
+            .expect("Failed to create proof file")
+            .write_all(&proof)
+            .expect("Failed to write proof");
+        println!("Proof written to: {}", proof_path);
+
+        let strategy = SingleStrategy::new(&params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        assert!(
+            verify_proof(
+                &params,
+                pk.get_vk(),
+                strategy,
+                &[&[public_input]],
+                &mut transcript
+            )
+            .is_ok(),
+            "Proof verification failed"
+        );
+    }
+
+    fn dp_expected(edges: &[Edge]) -> u64 {
+        // multiplicity-aware DP:
+        // T3[c] = outdegree(c)
+        // T2[b] = Σ_{(b->c)} [b<c] * T3[c]
+        // ans   = Σ_{(a->b)} [a<b] * T2[b]
+        let mut outdeg: HashMap<u64, u64> = HashMap::new();
+        for e in edges {
+            let s = e.src as u64;
+            *outdeg.entry(s).or_insert(0) += 1;
+        }
+
+        let mut t2: HashMap<u64, u128> = HashMap::new();
+        for e in edges {
+            let b = e.src as u64;
+            let c = e.dst as u64;
+            if b < c {
+                let v = *outdeg.get(&c).unwrap_or(&0) as u128;
+                *t2.entry(b).or_insert(0) += v;
+            }
+        }
+
+        let mut ans: u128 = 0;
+        for e in edges {
+            let a = e.src as u64;
+            let b = e.dst as u64;
+            if a < b {
+                ans += *t2.get(&b).unwrap_or(&0);
+            }
+        }
+        ans as u64
+    }
 
     #[test]
-    fn test_1() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data/facebook";
+    fn test() {
+        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
 
-        let mut r1 = read_edges_tsv(&format!("{}/R1.tsv", base_path)).unwrap();
-        let mut r2 = read_edges_tsv(&format!("{}/R2.tsv", base_path)).unwrap();
-        let mut r3 = read_edges_tsv(&format!("{}/R3.tsv", base_path)).unwrap();
-        let mut r4 = read_edges_tsv(&format!("{}/R4.tsv", base_path)).unwrap();
-        let mut r5 = read_edges_tsv(&format!("{}/R5.tsv", base_path)).unwrap();
+        let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
+        // let mut edges =
+        //     read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
+        // let mut edges =
+        //     read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
 
-        // // take first 1000
-        // r1.truncate(1000);
-        // r2.truncate(1000);
-        // r3.truncate(1000);
-        // r4.truncate(1000);
-        // r5.truncate(1000);
+        // edges.truncate(100);
 
-        // public input = COUNT(*). We compute it with the same DP as the circuit witness uses.
-        // (You can also compute by brute force for small sizes.)
-        let cnt = dp_count(&r1, &r2, &r3, &r4, &r5);
+        let cnt = dp_expected(&edges);
 
-        let circuit = GraphJoin5Circuit::<Fp> {
-            r1,
-            r2,
-            r3,
-            r4,
-            r5,
+        let circuit = Path3OrdCircuit::<Fp> {
+            edges,
             _marker: PhantomData,
         };
 
         let public_input = vec![Fp::from(cnt)];
-        let k = 16;
+        let k = 17;
 
-        let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
-        prover.assert_satisfied();
-    }
+        // let test = true;
+        let test = false;
 
-    fn dp_count(r1: &[Edge], r2: &[Edge], r3: &[Edge], r4: &[Edge], r5: &[Edge]) -> u64 {
-        use std::collections::HashMap;
-
-        // T5
-        let mut t5 = HashMap::<u64, u64>::new();
-        for e in r5 {
-            *t5.entry(e.src).or_insert(0) += 1;
+        if test {
+            let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+            prover.assert_satisfied();
+        } else {
+            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/wiki_proof_q1";
+            generate_and_verify_proof(circuit, &public_input, proof_path);
         }
-
-        // T4
-        let mut t4 = HashMap::<u64, u64>::new();
-        for e in r4 {
-            let v = *t5.get(&e.dst).unwrap_or(&0);
-            *t4.entry(e.src).or_insert(0) += v;
-        }
-
-        // T3
-        let mut t3m = HashMap::<u64, u64>::new();
-        for e in r3 {
-            let v = *t4.get(&e.dst).unwrap_or(&0);
-            *t3m.entry(e.src).or_insert(0) += v;
-        }
-
-        // T2
-        let mut t2m = HashMap::<u64, u64>::new();
-        for e in r2 {
-            let v = *t3m.get(&e.dst).unwrap_or(&0);
-            *t2m.entry(e.src).or_insert(0) += v;
-        }
-
-        // answer
-        let mut ans: u128 = 0;
-        for e in r1 {
-            ans += *t2m.get(&e.dst).unwrap_or(&0) as u128;
-        }
-        ans as u64
     }
 }

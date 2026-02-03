@@ -20,7 +20,7 @@ use std::{fs::File, io::Write, path::Path};
 pub fn full_prover<C: Circuit<Fp>>(circuit: C, k: u32, public_input: &[Fp], proof_path: &str) {
     let params_time_start = Instant::now();
     let params = ParamsKZG::<Bn256>::setup(k, OsRng);
-    let params_path = "/home/cc/halo2-TPCH/src/sql/kzg_param18";
+    let params_path = "/home2/binbin/PoneglyphDB/src/sql/kzg_param18";
     let mut fd = std::fs::File::create(&params_path).unwrap();
     params.write(&mut fd).unwrap();
     let params_time = params_time_start.elapsed();
