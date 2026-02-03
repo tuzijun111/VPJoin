@@ -1877,6 +1877,13 @@ mod tests {
         total as u64
     }
 
+    // #[test]
+    // fn test1() {
+    //     let k = 22;
+
+    //     generate_para(k);
+    // }
+
     #[test]
     fn test() {
         let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
@@ -1884,11 +1891,11 @@ mod tests {
         // let mut edges =
         //     read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
 
-        // let mut edges =
-        //     read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
+        let mut edges =
+            read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
         // The length of n12 is: 2690019
 
-        let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
+        // let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
         // The length of n12 is: 2255867
 
         // edges.truncate(200);
@@ -1902,10 +1909,10 @@ mod tests {
             _marker: PhantomData,
         };
         let public_input = vec![Fp::from(cnt)];
-        let k = 16;
+        let k = 22;
 
-        let test = true;
-        // let test = false;
+        // let test = true;
+        let test = false;
 
         if test {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
@@ -1914,12 +1921,5 @@ mod tests {
             let proof_path = "/home2/binbin/PoneglyphDB/src/proof/facebook_proof_q3";
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
-    }
-
-    #[test]
-    fn test1() {
-        let k = 22;
-
-        generate_para(k);
     }
 }
