@@ -1889,6 +1889,178 @@ mod tests {
     }
 
     #[test]
+    fn test_2() {
+        use crate::data::data_processing;
+        use std::collections::HashMap;
+
+        // ---------------- paths ----------------
+        let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
+        let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
+        let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
+        let supplier_file_path = "/home2/binbin/PoneglyphDB/src/data/supplier.tbl";
+
+        // ---------------- load records ----------------
+        let customers = data_processing::customer_read_records_from_file(customer_file_path)
+            .expect("failed to read customer.tbl");
+        let orders = data_processing::orders_read_records_from_file(orders_file_path)
+            .expect("failed to read orders.tbl");
+        let lineitems = data_processing::lineitem_read_records_from_file(lineitem_file_path)
+            .expect("failed to read lineitem.tbl");
+        let suppliers = data_processing::supplier_read_records_from_file(supplier_file_path)
+            .expect("failed to read supplier.tbl");
+
+        // ---------------- helpers ----------------
+        fn max_freq(counts: &HashMap<u64, u64>) -> (u64, u64) {
+            counts
+                .iter()
+                .max_by_key(|(_, &c)| c)
+                .map(|(&k, &c)| (k, c))
+                .unwrap_or((0u64, 0u64))
+        }
+
+        // ---------------- suppkey frequencies ----------------
+        let mut supp_in_lineitem: HashMap<u64, u64> = HashMap::new();
+        for r in lineitems.iter() {
+            *supp_in_lineitem.entry(r.l_suppkey).or_default() += 1;
+        }
+        let (max_supp_li, max_cnt_li) = max_freq(&supp_in_lineitem);
+
+        let mut supp_in_supplier: HashMap<u64, u64> = HashMap::new();
+        for r in suppliers.iter() {
+            *supp_in_supplier.entry(r.s_suppkey).or_default() += 1;
+        }
+        let (max_supp_s, max_cnt_s) = max_freq(&supp_in_supplier);
+
+        // ---------------- custkey frequencies ----------------
+        let mut cust_in_customer: HashMap<u64, u64> = HashMap::new();
+        for r in customers.iter() {
+            *cust_in_customer.entry(r.c_custkey).or_default() += 1;
+        }
+        let (max_cust_c, max_cnt_c) = max_freq(&cust_in_customer);
+
+        let mut cust_in_orders: HashMap<u64, u64> = HashMap::new();
+        for r in orders.iter() {
+            *cust_in_orders.entry(r.o_custkey).or_default() += 1;
+        }
+        let (max_cust_o, max_cnt_o) = max_freq(&cust_in_orders);
+
+        // ---------------- print results ----------------
+        println!(
+            "[suppkey] lineitem: max frequency = {} (suppkey={}) over {} rows",
+            max_cnt_li,
+            max_supp_li,
+            lineitems.len()
+        );
+        println!(
+            "[suppkey] supplier : max frequency = {} (suppkey={}) over {} rows",
+            max_cnt_s,
+            max_supp_s,
+            suppliers.len()
+        );
+
+        println!(
+            "[custkey] customer: max frequency = {} (custkey={}) over {} rows",
+            max_cnt_c,
+            max_cust_c,
+            customers.len()
+        );
+        println!(
+            "[custkey] orders  : max frequency = {} (custkey={}) over {} rows",
+            max_cnt_o,
+            max_cust_o,
+            orders.len()
+        );
+
+        #[test]
+        fn test_2() {
+            use crate::data::data_processing;
+            use std::collections::HashMap;
+
+            // ---------------- paths ----------------
+            let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
+            let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
+            let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
+            let supplier_file_path = "/home2/binbin/PoneglyphDB/src/data/supplier.tbl";
+
+            // ---------------- load records ----------------
+            let customers = data_processing::customer_read_records_from_file(customer_file_path)
+                .expect("failed to read customer.tbl");
+            let orders = data_processing::orders_read_records_from_file(orders_file_path)
+                .expect("failed to read orders.tbl");
+            let lineitems = data_processing::lineitem_read_records_from_file(lineitem_file_path)
+                .expect("failed to read lineitem.tbl");
+            let suppliers = data_processing::supplier_read_records_from_file(supplier_file_path)
+                .expect("failed to read supplier.tbl");
+
+            // ---------------- helpers ----------------
+            fn max_freq(counts: &HashMap<u64, u64>) -> (u64, u64) {
+                counts
+                    .iter()
+                    .max_by_key(|(_, &c)| c)
+                    .map(|(&k, &c)| (k, c))
+                    .unwrap_or((0u64, 0u64))
+            }
+
+            // ---------------- suppkey frequencies ----------------
+            let mut supp_in_lineitem: HashMap<u64, u64> = HashMap::new();
+            for r in lineitems.iter() {
+                *supp_in_lineitem.entry(r.l_suppkey).or_default() += 1;
+            }
+            let (max_supp_li, max_cnt_li) = max_freq(&supp_in_lineitem);
+
+            let mut supp_in_supplier: HashMap<u64, u64> = HashMap::new();
+            for r in suppliers.iter() {
+                *supp_in_supplier.entry(r.s_suppkey).or_default() += 1;
+            }
+            let (max_supp_s, max_cnt_s) = max_freq(&supp_in_supplier);
+
+            // ---------------- custkey frequencies ----------------
+            let mut cust_in_customer: HashMap<u64, u64> = HashMap::new();
+            for r in customers.iter() {
+                *cust_in_customer.entry(r.c_custkey).or_default() += 1;
+            }
+            let (max_cust_c, max_cnt_c) = max_freq(&cust_in_customer);
+
+            let mut cust_in_orders: HashMap<u64, u64> = HashMap::new();
+            for r in orders.iter() {
+                *cust_in_orders.entry(r.o_custkey).or_default() += 1;
+            }
+            let (max_cust_o, max_cnt_o) = max_freq(&cust_in_orders);
+
+            // ---------------- print results ----------------
+            println!(
+                "[suppkey] lineitem: max frequency = {} (suppkey={}) over {} rows",
+                max_cnt_li,
+                max_supp_li,
+                lineitems.len()
+            );
+            println!(
+                "[suppkey] supplier : max frequency = {} (suppkey={}) over {} rows",
+                max_cnt_s,
+                max_supp_s,
+                suppliers.len()
+            );
+
+            println!(
+                "[custkey] customer: max frequency = {} (custkey={}) over {} rows",
+                max_cnt_c,
+                max_cust_c,
+                customers.len()
+            );
+            println!(
+                "[custkey] orders  : max frequency = {} (custkey={}) over {} rows",
+                max_cnt_o,
+                max_cust_o,
+                orders.len()
+            );
+            // [suppkey] lineitem: max frequency = 668 (suppkey=38) over 60175 rows
+            // [suppkey] supplier : max frequency = 1 (suppkey=48) over 100 rows
+            // [custkey] customer: max frequency = 1 (custkey=1202) over 1500 rows
+            // [custkey] orders  : max frequency = 32 (custkey=643) over 15000 rows
+        }
+    }
+
+    #[test]
     fn test_1() {
         let k = 16;
 
