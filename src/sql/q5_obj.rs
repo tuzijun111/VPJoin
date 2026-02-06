@@ -10,6 +10,14 @@
 //! 7) ORDER BY revenue DESC
 //!
 //! IMPORTANT: we shift nationkey and regionkey by +1 in preprocessing to keep 0 as sentinel.
+//!
+//! UPDATE (padding extras):
+//! - You can now pass padding extras for NR and CO materialized bags, and for the LS-join aggregation tail:
+//!   * nr_pad_extra: extends NR permutation length by extra dummy PAD rows
+//!   * co_pad_extra: extends CO permutation length by extra dummy PAD rows
+//!   * ls_pad_extra: extends the LS-join aggregation/sort length by extra dummy PAD rows
+//!
+//! This is analogous to the triangle example where Bag sizes can be padded beyond the true witness size.
 
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
@@ -65,7 +73,7 @@ pub struct Q5Config<F: Field + Ord> {
     nr_keep: Column<Advice>,          // boolean
     nr_pair: Vec<Column<Advice>>,     // [nk_shift, n_name_hash] per nation row
     nr_filt_pad: Vec<Column<Advice>>, // keep? nr_pair : PAD
-    nr_out_pad: Vec<Column<Advice>>,  // filtered rows padded to nation.len()
+    nr_out_pad: Vec<Column<Advice>>,  // filtered rows padded (and can be extended by extra padding)
     perm_nr: PermAnyConfig,
     iz_nr: IsZeroConfig<F>,
 
@@ -641,7 +649,7 @@ impl<F: Field + Ord> Q5Chip<F> {
             vec![
                 q.clone() * in_co.clone() * (one.clone() - in_co.clone()),
                 q.clone() * in_nr.clone() * (one.clone() - in_nr.clone()),
-                q.clone() * in_co.clone() * in_nr.clone(), // <-- this was your failing constraint earlier (fixed by key-shift)
+                q.clone() * in_co.clone() * in_nr.clone(), // can't be both in
                 q.clone() * (one.clone() - in_co.clone()) * (one.clone() - co_low_ok),
                 q.clone() * (one.clone() - in_co.clone()) * (one.clone() - co_high_ok),
                 q.clone() * (one.clone() - in_nr.clone()) * (one.clone() - nr_low_ok),
@@ -673,6 +681,8 @@ impl<F: Field + Ord> Q5Chip<F> {
         let perm_lsort = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
+            // NOTE: still permute ls_join <-> ls_sorted, but you may enable more rows in witness
+            // if you pass ls_pad_extra; those additional rows must be padded consistently on both sides.
             PermAnyChip::configure(meta, q1, q2, ls_join.clone(), ls_sorted.clone())
         };
 
@@ -903,6 +913,10 @@ impl<F: Field + Ord> Q5Chip<F> {
         europe_hash: u64,
         start_ts: u64,
         end_ts: u64,
+        // NEW: padding knobs
+        nr_pad_extra: usize,
+        co_pad_extra: usize,
+        ls_pad_extra: usize,
     ) -> Result<AssignedCell<F, F>, Error> {
         // chips
         let iz_nr_chip = IsZeroChip::construct(self.config.iz_nr.clone());
@@ -964,12 +978,6 @@ impl<F: Field + Ord> Q5Chip<F> {
             }
             out
         }
-        fn uniq_keys(mut v: Vec<u64>) -> Vec<u64> {
-            v.push(0);
-            v.sort();
-            v.dedup();
-            v
-        }
 
         // ---------- build shifted maps ----------
         // shift nationkey+1, regionkey+1 to keep 0 as sentinel
@@ -1010,7 +1018,14 @@ impl<F: Field + Ord> Q5Chip<F> {
 
         let pad2 = vec![PAD_U64; 2];
         let nr_filt_pad_u64 = pad_filter_u64(&nr_pair_u64, &nr_keep_b, &pad2);
-        let nr_out_pad_u64 = pad_out_u64(&nr_filtered, nation.len(), &pad2);
+
+        // NEW: allow NR to be padded beyond nation.len()
+        let nr_total = nation.len().saturating_add(nr_pad_extra).max(1);
+        let mut nr_filt_pad_u64_ext = nr_filt_pad_u64.clone();
+        while nr_filt_pad_u64_ext.len() < nr_total {
+            nr_filt_pad_u64_ext.push(pad2.clone());
+        }
+        let nr_out_pad_u64 = pad_out_u64(&nr_filtered, nr_total, &pad2);
 
         // map nk_shift -> name_hash for filtered NR
         let mut nk_to_name: HashMap<u64, u64> = HashMap::new();
@@ -1049,7 +1064,14 @@ impl<F: Field + Ord> Q5Chip<F> {
             .collect();
 
         let co_filt_pad_u64 = pad_filter_u64(&co_pair_u64, &co_keep_b, &pad2);
-        let co_out_pad_u64 = pad_out_u64(&co_filtered, orders.len(), &pad2);
+
+        // NEW: allow CO to be padded beyond orders.len()
+        let co_total = orders.len().saturating_add(co_pad_extra).max(1);
+        let mut co_filt_pad_u64_ext = co_filt_pad_u64.clone();
+        while co_filt_pad_u64_ext.len() < co_total {
+            co_filt_pad_u64_ext.push(pad2.clone());
+        }
+        let co_out_pad_u64 = pad_out_u64(&co_filtered, co_total, &pad2);
 
         // build key sets for join
         let co_set: HashSet<u64> = co_filtered
@@ -1103,10 +1125,19 @@ impl<F: Field + Ord> Q5Chip<F> {
         let ls_part_pad_u64 = pad_partition_u64(&ls_join_u64, &ls_dis_u64, lineitem.len(), &pad4);
         let ls_part_pad_f: Vec<Vec<F>> = to_field_rows::<F>(&ls_part_pad_u64);
 
-        // ---------- aggregation over ls_join ----------
-        let mut ls_sorted_u64 = ls_join_u64.clone();
-        ls_sorted_u64.sort_by_key(|r| r[1]); // by nationkey_shift
-        let n = ls_sorted_u64.len();
+        // ---------- aggregation over ls_join (with optional extra padding rows) ----------
+        // Use pad rows that sort to the end by nk=PAD_U64 and have ext=disc=0.
+        let join_len = ls_join_u64.len();
+        let n = join_len.saturating_add(ls_pad_extra).max(1);
+
+        let mut ls_join_ext = ls_join_u64.clone();
+        while ls_join_ext.len() < n {
+            // pad row: [okey=0, nk=PAD_U64, ext=0, disc=0]
+            ls_join_ext.push(vec![0u64, PAD_U64, 0u64, 0u64]);
+        }
+
+        let mut ls_sorted_u64 = ls_join_ext.clone();
+        ls_sorted_u64.sort_by_key(|r| r[1]); // by nationkey_shift (PAD_U64 goes last)
 
         let mut line_rev_u64 = vec![0u64; n];
         let mut run_sum_u64 = vec![0u64; n];
@@ -1133,7 +1164,9 @@ impl<F: Field + Ord> Q5Chip<F> {
             } else {
                 0
             };
-            if next_nk != nk {
+
+            // IMPORTANT: don't emit for PAD_U64 groups; keep res_pad as PAD rows
+            if next_nk != nk && nk != PAD_U64 {
                 let nm = *nk_to_name.get(&nk).unwrap_or(&0);
                 res_pad_u64[i] = [nk, nm, run_sum_u64[i]];
             }
@@ -1257,7 +1290,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     )?;
                 }
 
-                // ---------- NR materialization assignments ----------
+                // ---------- NR materialization assignments (real nation rows) ----------
                 for i in 0..nation.len() {
                     self.config.q_nr_join.enable(&mut region, i)?;
                     self.config.q_nr_pred.enable(&mut region, i)?;
@@ -1301,8 +1334,43 @@ impl<F: Field + Ord> Q5Chip<F> {
                     )?;
                 }
 
-                // enable permutation for NR and assign filt/out
-                for i in 0..nation.len() {
+                // ---------- NR extra padding rows (no join/pred selectors), but must assign cols used by link gate ----------
+                for i in nation.len()..nr_total {
+                    // q_nr_* not enabled
+                    region.assign_advice(
+                        || "cond_europe_pad",
+                        self.config.cond_europe,
+                        i,
+                        || Value::known(F::from(europe_hash)),
+                    )?;
+                    region.assign_advice(
+                        || "nr_rname_pad",
+                        self.config.nr_rname,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "nr_keep_pad",
+                        self.config.nr_keep,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "nr_pair_nk_pad",
+                        self.config.nr_pair[0],
+                        i,
+                        || Value::known(F::from(PAD_U64)),
+                    )?;
+                    region.assign_advice(
+                        || "nr_pair_nm_pad",
+                        self.config.nr_pair[1],
+                        i,
+                        || Value::known(F::from(PAD_U64)),
+                    )?;
+                }
+
+                // enable permutation for NR and assign filt/out (extended)
+                for i in 0..nr_total {
                     self.config.perm_nr.q_perm1.enable(&mut region, i)?;
                     self.config.perm_nr.q_perm2.enable(&mut region, i)?;
                 }
@@ -1310,7 +1378,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     &mut region,
                     "nr_filt_pad",
                     &self.config.nr_filt_pad,
-                    &to_field_rows::<F>(&nr_filt_pad_u64),
+                    &to_field_rows::<F>(&nr_filt_pad_u64_ext),
                 )?;
                 Self::assign_table_f(
                     &mut region,
@@ -1319,7 +1387,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     &to_field_rows::<F>(&nr_out_pad_u64),
                 )?;
 
-                // ---------- CO materialization assignments ----------
+                // ---------- CO materialization assignments (real order rows) ----------
                 for i in 0..orders.len() {
                     self.config.q_oc_join.enable(&mut region, i)?;
                     self.config.q_co_ge.enable(&mut region, i)?;
@@ -1379,7 +1447,48 @@ impl<F: Field + Ord> Q5Chip<F> {
                     )?;
                 }
 
-                for i in 0..orders.len() {
+                // ---------- CO extra padding rows (no join/pred selectors), but must assign cols used by link gate ----------
+                for i in orders.len()..co_total {
+                    // q_co_* not enabled
+                    region.assign_advice(
+                        || "co_nk_pad",
+                        self.config.co_nk,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "co_ge_ok_pad",
+                        self.config.co_ge_ok,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "co_lt_ok_pad",
+                        self.config.co_lt_ok,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "co_keep_pad",
+                        self.config.co_keep,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "co_pair_ok_pad",
+                        self.config.co_pair[0],
+                        i,
+                        || Value::known(F::from(PAD_U64)),
+                    )?;
+                    region.assign_advice(
+                        || "co_pair_nk_pad",
+                        self.config.co_pair[1],
+                        i,
+                        || Value::known(F::from(PAD_U64)),
+                    )?;
+                }
+
+                for i in 0..co_total {
                     self.config.perm_co.q_perm1.enable(&mut region, i)?;
                     self.config.perm_co.q_perm2.enable(&mut region, i)?;
                 }
@@ -1387,7 +1496,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     &mut region,
                     "co_filt_pad",
                     &self.config.co_filt_pad,
-                    &to_field_rows::<F>(&co_filt_pad_u64),
+                    &to_field_rows::<F>(&co_filt_pad_u64_ext),
                 )?;
                 Self::assign_table_f(
                     &mut region,
@@ -1414,7 +1523,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     &mut region,
                     "ls_join",
                     &self.config.ls_join,
-                    &ls_join_u64,
+                    &ls_join_u64, // REAL join rows only (for part_pad linking)
                 )?;
                 let ls_dis_cells = Self::assign_table_u64(
                     &mut region,
@@ -1422,6 +1531,36 @@ impl<F: Field + Ord> Q5Chip<F> {
                     &self.config.ls_disjoin,
                     &ls_dis_u64,
                 )?;
+
+                // NEW: if ls_pad_extra > 0, we also need to assign extra padding rows into ls_join
+                // so that perm_lsort (enabled on n rows) has cells on the LHS.
+                for i in ls_join_u64.len()..n {
+                    // pad row: [okey=0, nk=PAD_U64, ext=0, disc=0]
+                    region.assign_advice(
+                        || "ls_join_pad_okey",
+                        self.config.ls_join[0],
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "ls_join_pad_nk",
+                        self.config.ls_join[1],
+                        i,
+                        || Value::known(F::from(PAD_U64)),
+                    )?;
+                    region.assign_advice(
+                        || "ls_join_pad_ext",
+                        self.config.ls_join[2],
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                    region.assign_advice(
+                        || "ls_join_pad_disc",
+                        self.config.ls_join[3],
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
+                }
 
                 for i in 0..lineitem.len() {
                     self.config.perm_ls.q_perm1.enable(&mut region, i)?;
@@ -1588,7 +1727,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     )?;
                 }
 
-                // join member selector
+                // join member selector (ONLY real join rows)
                 for i in 0..ls_join_u64.len() {
                     self.config.q_join_member.enable(&mut region, i)?;
                 }
@@ -1735,6 +1874,11 @@ pub struct MyCircuit<F> {
     pub start_ts: u64,
     pub end_ts: u64,
 
+    // NEW: padding knobs (analogy to bag1_pad_extra / bag2_pad_extra)
+    pub nr_pad_extra: usize,
+    pub co_pad_extra: usize,
+    pub ls_pad_extra: usize,
+
     pub _marker: PhantomData<F>,
 }
 
@@ -1750,6 +1894,9 @@ impl<F: Copy + Default> Default for MyCircuit<F> {
             europe_hash: 0,
             start_ts: 0,
             end_ts: 0,
+            nr_pad_extra: 0,
+            co_pad_extra: 0,
+            ls_pad_extra: 0,
             _marker: PhantomData,
         }
     }
@@ -1785,6 +1932,9 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
             self.europe_hash,
             self.start_ts,
             self.end_ts,
+            self.nr_pad_extra,
+            self.co_pad_extra,
+            self.ls_pad_extra,
         )?;
 
         chip.expose_public(&mut layouter, out_cell, 0)?;
@@ -1897,8 +2047,6 @@ mod tests {
 
     #[test]
     fn test_1() {
-        let k = 16;
-
         // ---------------- paths ----------------
         let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
         let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
@@ -1973,6 +2121,11 @@ mod tests {
         let start_ts = date_to_timestamp("1997-01-01");
         let end_ts = date_to_timestamp("1998-01-01"); // strict < end
 
+        // NEW: padding knobs (set to 0 if you don't need)
+        let nr_pad_extra = 0usize;
+        let co_pad_extra = (32 * 89) as usize;
+        let ls_pad_extra = (668 * 89) as usize;
+
         let circuit = MyCircuit::<Fp> {
             customer,
             orders,
@@ -1983,10 +2136,15 @@ mod tests {
             europe_hash,
             start_ts,
             end_ts,
+            nr_pad_extra,
+            co_pad_extra,
+            ls_pad_extra,
             _marker: PhantomData,
         };
 
         let public_input: Vec<Fp> = vec![Fp::from(1u64)];
+
+        let k = 16;
 
         // let test = true;
         let test = false;
@@ -1995,7 +2153,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_q5_obj";
+            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_q5_obj_dp";
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

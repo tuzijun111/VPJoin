@@ -1,9 +1,9 @@
-pub mod facebook_sql1_obj;
-pub mod facebook_sql1_obj_old;
-pub mod facebook_sql2_obj;
-pub mod facebook_sql2_obj_old;
-pub mod facebook_sql3_obj;
-pub mod facebook_sql3_obj_old;
-pub mod facebook_sql4_obj;
-pub mod facebook_sql4_obj_old;
+pub mod g_sql1_obj;
+pub mod g_sql1_obj_old;
+pub mod g_sql2_obj;
+pub mod g_sql2_obj_old;
+pub mod g_sql3_obj;
+pub mod g_sql3_obj_old;
+pub mod g_sql4_obj;
+pub mod g_sql4_obj_old;
 pub mod test;
