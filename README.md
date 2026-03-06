@@ -127,6 +127,12 @@ cargo test --package halo2-experiments --lib -- graph_sql::g_sql3_obj::tests::te
 cargo test --package halo2-experiments --lib -- graph_sql::g_sql4_obj::tests::test --exact --nocapture
 ```
 
+### Public Parameter Selection (k)
+
+Select appropriate Halo2 public parameter k depending on dataset size and SQL queries.
+
+Note: The necessary parameters are already persisted as param15 through param22. Please be aware that manually configuring the degree (k) within the source code is only supported when using the MockProver.
+
 
 ## License
 
