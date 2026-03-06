@@ -134,6 +134,3 @@ Select appropriate Halo2 public parameter k depending on dataset size and SQL qu
 Note: The necessary parameters are already persisted as param15 through param22. Please be aware that manually configuring the degree (k) within the source code is only supported when using the MockProver.
 
 
-## License
-
-See [LICENSE](LICENSE) for details.
