@@ -1,0 +1,1436 @@
+\documentclass[sigconf]{acmart}
+% \documentclass[sigconf,anonymous]{acmart}
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+\setcopyright{acmlicensed}
+\copyrightyear{2025}
+\acmYear{2025}
+
+\acmDOI{XXXXXXX.XXXXXXX}
+
+%% These commands are for a PROCEEDINGS abstract or paper.
+% \acmConference[SIGMOD'25]{the International Conference on Management of Data}{June 22-27, 2025}{Berlin, Germany}
+
+% \acmISBN{978-1-4503-XXXX-X/18/06}
+
+\usepackage{ulem} % This package enables the strikethrough feature
+\usepackage{amsmath,amsfonts}
+\usepackage[ruled,linesnumbered]{algorithm2e}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{ragged2e,caption}
+\usepackage{bbding}
+\usepackage{amsmath}
+\usepackage{textcase}
+\usepackage{enumitem}
+\usepackage[subtle]{savetrees}
+\usepackage{booktabs} % For formal tables
+\usepackage{times,epsfig}
+% \usepackage{enumerate}
+\usepackage{subfigure}
+\usepackage{multirow}
+\usepackage{tabularx, subfigure}
+\usepackage{hyperref}
+\usepackage{float} %fix the position of figures and table by adding [H]
+\usepackage{array}
+\usepackage{makecell}
+\usepackage{subcaption}
+% \usepackage{amssymb}
+\newcommand{\centered}[1]{\begin{tabular}{c} #1 \end{tabular}}
+
+\usepackage{color}
+\newtheorem{definition}{Definition}
+\newcommand{\Binbin}[1]{{\color{blue} #1}}
+\newcommand{\Change}[1]{{\bf\color{red} #1}}
+\newcommand{\Problem}[1]{{\it\color{red} #1}}
+\newcommand{\NH}[1]{{\bf\color{blue} #1}}
+\newcommand{\NI}[1]{{\bf #1}}
+\newcommand{\eat}[1]{}
+
+\PassOptionsToPackage{normalem}{ulem}
+\usepackage{ulem}
+
+\renewcommand{\emph}[1]{\textit{#1}}
+
+% \newcommand{\sysname}{PoneglyphDB}
+
+\begin{document}
+
+\title{VPJoin: Verifiable and Privacy-Preserving SQL Query Answering via Zero-Knowledge Proofs
+}
+
+% \author{Binbin Gu}
+% \affiliation{%
+%   \institution{Unversity of California, Irvine}
+%   \streetaddress{}
+%   \city{Irvine}
+%   %\state{CA}
+%   \country{USA}
+%   \postcode{}
+% }
+
+\renewcommand{\shortauthors}{Trovato and Tobin, et al.}
+
+\begin{abstract}
+
+Modern applications increasingly demand both data confidentiality and query integrity. Zero-knowledge (ZK) proofs address this by allowing a prover to demonstrate the correct execution of SQL queries on private data without revealing the data itself. However, efficiently proving multi-way joins remains a critical bottleneck: existing systems decompose a $k$-way join into binary joins, materializing each intermediate inside the proof circuit and padding to worst-case sizes for obliviousness, leading to $O(N^k)$ circuit blowup where $N$ is the input relation size. 
+
+We present \textbf{VPJoin}, which eliminates this bottleneck via witness-guided verification: the prover performs all join work offline and supplies a witness marking which input tuples participate in the result, and the circuit verifies this marking through linear-scan checks. For acyclic queries, the core primitive, the \textbf{Oblivious Join Gate (OBJ)}, achieves the worst-case optimal complexity of $O(\mathit{IN} + \mathit{OUT})$, where $\mathit{IN}$ is the total input size and $\mathit{OUT}$ is the join result size, with obliviousness requiring no padding overhead. For join-aggregate queries, the cost is $O(\mathit{IN} + \mathit{OUT})$ where $\mathit{OUT}$ is the final aggregated output size, since the full join result is never materialized. For cyclic queries, the \textbf{DP-Guided Join Gate (DPJ)} combines tree decomposition with differentially private capacity bounds for a tunable privacy--efficiency trade-off. On TPC-H and graph-pattern benchmarks, VPJoin outperforms the state-of-the-art by $6$--$16$ orders of magnitude in proving time.
+
+\end{abstract}
+
+
+% TODO: replace with correct CCS terms for your paper.
+% \ccsdesc[500]{Security and privacy~Cryptography}
+% \ccsdesc[300]{Information systems~Relational database model}
+
+\keywords{zero-knowledge proofs, verifiable databases, multi-way joins}
+
+\maketitle
+
+
+\section{Introduction}
+
+Organizations increasingly publish analytical results derived from sensitive databases, including regulatory filings, public-health statistics, and cross-organization analytics. A fundamental question arises: how can a data holder convince external parties that a reported query result is correct, computed faithfully over the committed dataset, without revealing the underlying private records? This problem requires two properties: \textit{verifiability} (external parties can confirm the result was computed correctly) and \textit{privacy} (the underlying data records remain hidden from the verifier).
+For example, a government agency may publish unemployment statistics computed from a private census database: external auditors need assurance that the reported figures are accurate, yet must not gain access to any individual record. Verifiable computation~\cite{walfish2015verifying} provides a general framework for delegating computation to untrusted parties with integrity guarantees, but adapting it efficiently to the structured, set-based operations of relational databases requires domain-specific techniques.
+
+Zero-knowledge (ZK) proofs~\cite{DBLP:conf/stoc/GoldwasserMR85} address this challenge: the data owner (prover) generates a succinct proof $\pi$ certifying that a query result $R$ is the correct output of query $Q$ on a committed database $D$. Any party (verifier) can check $\pi$ using only the public commitment and the result, learning nothing else about $D$ or the evaluation process.
+
+Applying ZK proofs to query answering has been widely studied. Recent ZK database systems such as vSQL~\cite{zhang2017vsql,zhang2017zero}, ZKSQL~\cite{li2023zksql}, and PoneglyphDB~\cite{gu2025poneglyphdb} have demonstrated that ZK proofs for single-table operations and binary joins are practical. 
+Among all relational operations, \emph{multi-way joins} arise as a fundamental component and are ubiquitous in analytical workloads: TPC-H~\cite{TPC-H2023} queries join three to eight relations, and graph pattern queries (e.g., cycle counting) are expressed as multi-way self-joins, whose output size can grow polynomially in the input size~\cite{atserias2013size, ngo2018worst}. However, ZK proofs for this operation remain a critical bottleneck.
+
+Existing ZK database systems decompose a $k$-way join into a sequence of $k{-}1$ binary joins, materializing each intermediate result inside the proof circuit. However, this materialization-based approach creates a fundamental efficiency bottleneck. In a ZK proof system, the circuit structure (its dimensions and row counts) is public, so the \emph{sizes} of all materialized intermediates are visible to the verifier. These sizes are data-dependent: for example, the number of rows produced by joining an \textsf{Employees} table with a \textsf{Departments} table reveals how employees are distributed across departments, which is private information that should remain hidden. To prevent this leakage, existing systems pad all intermediates to worst-case sizes. But after $k{-}1$ successive binary joins over $k$ relations each of size $N$, the accumulated intermediate can grow to $O(N^k)$, and worst-case padding forces the circuit to accommodate all $O(N^k)$ entries. Since proving time scales linearly with circuit size, this directly translates into prohibitive cost: for TPC-H Q3, a $3$-way join, PoneglyphDB~\cite{gu2025poneglyphdb} estimates a proving time exceeding $10^{9}$ seconds (${\sim}30$ years); for TPC-H Q8, an $8$-way join, the estimate exceeds $10^{20}$ seconds.
+
+Therefore, a fundamental question arises: can we verify multi-way joins in zero knowledge without materializing intermediate results, so that we hide data-dependent intermediate cardinalities while also avoiding the worst-case circuit blowup?
+
+We answer this question affirmatively by presenting \textbf{VPJoin}, which provides solutions for both acyclic and cyclic queries based on a simple yet powerful insight. Specifically, the prover, who already holds the entire database, can compute the join result locally at negligible cost; the proof circuit does not need to \emph{re-execute} the join at all, but only to \emph{verify} that the prover's claimed result is correct. This paradigm shift, from proving-by-re-execution to proving-by-witness-verification, eliminates intermediate materialization entirely, yielding significant gains in both efficiency and privacy simultaneously.
+
+Building on this insight, we first design the \emph{Oblivious Join Gate (OBJ)} for acyclic join queries, inspired by classical semijoin reductions along a join tree~\cite{yannakakis1981algorithms, beeri1983desirability}. The prover splits each input table into two groups, \emph{clean} tuples (those that participate in the join result) and \emph{residual} tuples (those that do not), and the circuit verifies this split through four lightweight structural checks: (i)~every original tuple appears in exactly one group (\emph{conservation}, enforced via a Permutation Argument); (ii)~the two groups share no tuples (\emph{disjointness}, via a Non-Membership Check); (iii)~clean tuples in neighboring relations agree on their shared join keys (\emph{pairwise consistency}, via bidirectional Lookup Arguments); and (iv)~no valid join result hides among the residuals (\emph{completeness}, via a single bottom-up semijoin pass that confirms the residual join is empty). Each check scans the input tables at most a constant number of times, yielding a total proof cost of $O(\mathit{IN} + \mathit{OUT})$, where $\mathit{IN} = \sum_i |R_i|$ is the total input size and $\mathit{OUT}$ is the join result size, which is \emph{worst-case optimal} for acyclic queries. Even more remarkably, since the circuit never creates intermediate results, its layout depends only on the input table sizes, not on join selectivity or data values, so \textbf{obliviousness is achieved entirely for free}, with zero padding overhead. OBJ also naturally supports projection, predicates, and aggregation---all without materializing the full join result. For join-aggregate queries, rather than first constructing the full join (up to $O(N^k)$ rows) and then aggregating, OBJ \emph{aggregates without expanding}: each clean tuple is tagged with a \emph{multiplicity} counting how many join-result rows it participates in, and the aggregate is computed directly over the compact, input-sized clean relations. This keeps the proof cost at $O(\mathit{IN} + \mathit{OUT})$, where $\mathit{OUT}$ is the size of the final aggregated output.
+
+We then extend OBJ to cyclic queries via the \textbf{DP-Guided Join Gate (DPJ)}, which delivers what is essentially a \emph{free lunch} in privacy. A cyclic $k$-way join cannot be directly handled by OBJ, because its join hypergraph has no acyclic join tree. Tree decomposition~\cite{robertson1986graph, gottlob1999hypertree} resolves this by grouping the $k$ relations into a small number of \emph{clusters}: the joins \emph{within} each cluster (involving at most $w$ relations, where $w$ is the treewidth, typically $w \ll k$) are materialized, while the joins \emph{between} clusters form an acyclic tree to which OBJ applies directly. This confines the intermediate blowup from $O(N^k)$ for the original query to $O(N^w)$ within each cluster. However, in a strictly oblivious circuit, each intra-cluster intermediate must still be padded to its $O(N^w)$ worst-case bound, which can remain expensive. DPJ avoids this by setting circuit capacities using a one-sided differentially private noise mechanism~\cite{wang2024special, dwork2014algorithmic}: the noisy bound is always at least the true size (preserving correctness) while providing formal $(\epsilon, \delta)$-differential privacy for intermediate cardinalities. Our experiments confirm that at a moderate privacy budget of $\epsilon = 0.1$ and $\delta = 10^{-5}$, this adds only $2$--$10\%$ overhead versus the non-private baseline, yet it grants rigorous privacy guarantees that would otherwise require padding to astronomical worst-case sizes.
+
+\vspace{-0.1in}
+\paragraph{Contributions}
+In summary, this paper makes the following contributions:
+\begin{itemize}[leftmargin=1.2em, itemsep=0.3em, topsep=0.2em]
+    \item \textbf{Oblivious Join Gate (OBJ) for acyclic joins.}
+    OBJ verifies multi-way joins via semijoin-based structural checks along a join tree, achieving worst-case optimal $O(\mathit{IN} + \mathit{OUT})$ circuit complexity with obliviousness entirely for free---no padding required.
+
+    \item \textbf{Aggregation without join materialization.}
+    OBJ computes join-aggregates directly over the compact clean relations via tuple multiplicities, keeping proof cost at $O(\mathit{IN} + \mathit{OUT})$ without ever constructing the full $O(N^k)$-sized join.
+    
+    \item \textbf{DP-Guided Join Gate (DPJ) for cyclic joins.}
+    DPJ extends OBJ to cyclic queries via tree decomposition, using one-sided DP noise to set circuit capacities with formal $(\epsilon, \delta)$-differential privacy under the privacy budgets we study. It  adds only $2$--$10\%$ overhead versus the non-private baseline. 
+
+    % \item \textbf{Experimental evaluation.}
+    % On five TPC-H and four graph queries, VPJoin outperforms PoneglyphDB~\cite{gu2025poneglyphdb} by $6$--$16$ orders of magnitude on TPC-H and $4$--$9$ on graph workloads, reducing Q8 proving time from $>10^{19}$\,s to under $200$\,s.
+\end{itemize}
+
+The remainder of this paper is organized as follows. Section~\ref{sec:related_work} surveys related work. Section~\ref{sec:pre} introduces background and preliminaries. Section~\ref{sec:overview} describes the problem setting. Section~\ref{sec:ZKP} presents the ZK proof primitives used throughout. Section~\ref{sec:gates} details the OBJ gate for acyclic joins. Section~\ref{subsec:cyclic_decomposition} extends to cyclic joins via DPJ with DP-guided relaxation of obliviousness. Section~\ref{sec:experiments} reports experimental results, and Section~\ref{sec:conclusion} concludes.
+
+
+
+
+
+\vspace{-0.1in}
+\section{Related Work}
+\label{sec:related_work}
+
+% \paragraph{Verifiable SQL and ZK Database Systems.}
+Verifiable query processing over outsourced databases has been studied via authenticated data structures~\cite{tamassia2003authenticated, yang2009authenticated} and query authentication systems~\cite{zhang2015integridb, bajaj2013correctdb}, though these do not provide zero-knowledge privacy guarantees.
+In the ZK setting, vSQL~\cite{zhang2017vsql,zhang2017zero} compiles relational operators into arithmetic circuits verified via the GKR protocol~\cite{goldwasser2015delegating}, but requires multiple rounds of interaction and couples the circuit to a fixed query plan. ZKSQL~\cite{li2023zksql} decomposes verification into operator-level gadgets, improving modularity, but still materializes every intermediate result. PoneglyphDB~\cite{gu2025poneglyphdb} builds a practical non-interactive system on Halo2~\cite{halo2-protocol,halo2} with PLONKish arithmetization~\cite{gabizon2019plonk}, supporting selections, projections, aggregations, sorting, and equi-joins.
+All of these systems decompose multi-way joins into binary joins, materializing every intermediate inside the circuit. Because circuit dimensions are public, intermediate sizes leak cardinality information; padding them to worst-case sizes leads to $O(N^k)$ blowup. VPJoin eliminates both problems: its witness-guided verification never materializes intermediates, achieving $O(\mathit{IN} + \mathit{OUT})$ for acyclic queries, and DP-bounded costs for cyclic queries.
+
+% \paragraph{ZK Proof Systems.}
+% Modern ZK proof systems broadly fall into two families. Interactive proof frameworks, notably the GKR protocol~\cite{goldwasser2015delegating} and its refinements~\cite{xie2019libra}, achieve efficient prover computation but require multiple rounds of interaction. Non-interactive systems, or SNARKs, include Pinocchio~\cite{parno2016pinocchio}, Groth16~\cite{groth2016size}, and PLONK~\cite{gabizon2019plonk}. Our system builds on the PLONKish arithmetization paradigm as implemented in Halo2~\cite{halo2-protocol,halo2}, which supports custom gates and native lookup arguments~\cite{gabizon2020plookup,setty2024unlocking}. Lookup arguments are critical to our design: the Oblivious Join Gate relies on lookups for membership and non-membership checks and on permutation arguments for conservation verification, all expressed compactly within the PLONKish constraint framework.
+
+% \paragraph{Multi-Way Join Algorithms.}
+% The Yannakakis algorithm~\cite{yannakakis1981algorithms} computes acyclic joins in worst-case optimal time $O(\mathit{IN} + \mathit{OUT})$ by performing semijoin reductions along a join tree. For cyclic queries, hypertree decomposition~\cite{gottlob1999hypertree} converts a cyclic query into an acyclic one over clusters of relations, confining intermediate blowup to within each cluster at a cost bounded by the treewidth. These ideas have been extended to aggregate queries via annotated relations~\cite{joglekar2016ajar}. Our work adapts the Yannakakis framework to the ZK setting through witness-guided verification: instead of executing semijoins inside the circuit, the prover performs all join work offline and supplies the semijoin result as a witness, and the circuit verifies consistency via Oblivious Join Gates.
+
+% \paragraph{Secure Join Processing.}
+Secure Yannakakis~\cite{wang2021secure} and SPECIAL~\cite{wang2024special} adapt semijoin-based join processing to the Multi-Party Computation (MPC) setting, where multiple distrustful parties jointly evaluate queries without revealing their private inputs. Like our work, they leverage semijoin reductions along a join tree to process multi-way joins without materializing intermediate results. However, the MPC setting differs fundamentally from ours: MPC protects privacy \emph{between} data owners using heavy primitives (PSI~\cite{pinkas2019efficient}, garbled circuits~\cite{yao1986generate}) that do not translate efficiently into ZK circuits, whereas our single-prover model produces publicly verifiable ZK proofs with circuit size as the dominant cost.
+
+% \paragraph{Differential Privacy for Query Processing.}
+Differential privacy (DP)~\cite{dwork2006differential,dwork2014algorithmic} provides formal guarantees that query answers do not reveal too much about any individual record. DP mechanisms have been applied to SQL query answering~\cite{mcsherry2009pinq, johnson2018towards} and, more recently, to join queries where sensitivity analysis is challenging due to the multiplicative nature of joins~\cite{dong2021residual,dong2024continual}. Our use of DP is orthogonal to this line of work: we do not add noise to query \emph{results} (which remain fully hidden by the ZK proof) but instead use a one-sided Laplace mechanism to mask the \emph{circuit dimensions}---specifically, the padded capacities of intermediate relations whose true sizes would otherwise reveal data-dependent cardinalities. This DP-guided method provides a principled privacy--efficiency trade-off for cyclic queries in VPJoin.
+
+
+
+
+% \vspace{-0.05in}
+\section{Preliminaries}
+\label{sec:pre}
+
+\subsection{Zero-Knowledge Proofs}
+\label{sec:zkp-background}
+
+Zero-knowledge proofs (ZKPs) enable a prover to convince a verifier of a statement's validity without revealing any information beyond the statement's truth. We employ \emph{zero-knowledge Succinct Non-interactive Arguments of Knowledge} (zk-SNARKs)~\cite{groth2016size,gabizon2019plonk}, in which the prover generates a single, succinct proof $\pi$ that any party can verify in time sublinear in the computation size, without further interaction. 
+% Non-interactivity is achieved via the Fiat-Shamir heuristic~\cite{fiat1986prove}.
+
+\vspace{-0.1in}
+\paragraph{Arithmetic Circuits and Witnesses.}
+In a zk-SNARK, the computation to be verified is encoded as an \emph{arithmetic circuit} over a finite field, i.e., a matrix of constraints that relate input, intermediate, and output values. The prover supplies a \emph{witness}: private inputs that satisfy every constraint. The proof certifies that such a witness exists without revealing it. A valid proof system must satisfy three properties: \emph{completeness} (an honest prover can always produce a convincing proof), \emph{soundness} (no efficient adversary can forge a proof for a false statement), and \emph{zero-knowledge} (the proof reveals nothing beyond the statement's truth). We formalize these properties in our database setting in Section~\ref{sec:overview}, and describe the concrete cryptographic instantiation in Section~\ref{subsec:crypto}.
+\vspace{-0.1in}
+\paragraph{Circuit Size as the Efficiency Metric.}
+Proving time scales almost linearly with the number of circuit constraints (see Section~\ref{subsec:crypto} for precise bounds), making circuit size the primary efficiency metric. This is why materializing intermediate join results inside the circuit is so costly: each materialized tuple adds constraints, and worst-case padding amplifies this to $O(N^k)$.
+
+\subsection{Notations}
+
+We introduce the notation used throughout this paper.
+\vspace{-0.1in}
+\paragraph{Relations and Joins.}
+A \emph{relation} $R$ is a finite set of tuples over a fixed set of attributes $\mathrm{attr}(R)$. We consider natural equi-join queries over $n$ relations of the form
+\[
+    Q = R_1 \bowtie R_2 \bowtie \cdots \bowtie R_n,
+\]
+where each join is performed on shared attributes between relations. For two relations $R_i$ and $R_j$, we denote their shared attributes (join keys) as $\mathrm{attr}(R_i) \cap \mathrm{attr}(R_j)$. We write $N$ for the uniform upper-bound cardinality to which every relation is padded for obliviousness (Section~\ref{sec:gates}).
+\vspace{-0.1in}
+\paragraph{Semijoin.}
+The \emph{semijoin} of $R_i$ with $R_j$, denoted $R_i \ltimes R_j$, retains exactly those tuples of $R_i$ that have at least one matching tuple in $R_j$ on their shared attributes:
+\[
+R_i \ltimes R_j = \{\, t \in R_i \mid \exists\, s \in R_j : t[\mathrm{key}] = s[\mathrm{key}] \,\},
+\]
+where $\mathrm{key} = \mathrm{attr}(R_i) \cap \mathrm{attr}(R_j)$. The semijoin is used to eliminate non-joining (dangling) tuples, e.g.\ in the Yannakakis algorithm~\cite{yannakakis1981algorithms}.
+
+\vspace{-0.1in}
+\paragraph{Antijoin.}
+The \emph{antijoin} of $R_i$ with $R_j$ retains exactly those tuples of $R_i$ that have no matching tuple in $R_j$:
+\[
+R_i \rhd R_j = \{\, t \in R_i \mid \forall\, s \in R_j : t[\mathrm{key}] \neq s[\mathrm{key}] \,\}.
+\]
+The semijoin and antijoin partition $R_i$ into two disjoint subsets: $R_i = (R_i \ltimes R_j) \cup (R_i \rhd R_j)$. This partition is central to the Oblivious Join Gate (Section~\ref{sec:gates}).
+
+\vspace{-0.1in}
+\paragraph{Projection and Multiset Notation.}
+We write $\pi_A(R)$ for the projection of relation $R$ onto attribute set $A$, i.e., $\pi_A(R) = \{t[A] \mid t \in R\}$. We use $R \equiv S$ to denote \emph{multiset equality}: $R$ and $S$ contain the same elements with the same multiplicities.
+
+\vspace{-0.1in}
+\paragraph{Join Trees and Acyclicity.}
+A \emph{join tree} $T$ for query $Q$ is a tree whose nodes correspond to the relations $R_1, \dots, R_n$ such that the \emph{running intersection property} holds~\cite{beeri1983desirability}: for every attribute $A$, the set of nodes whose relations contain $A$ forms a connected subtree of $T$. A query $Q$ is \emph{acyclic} if it admits a join tree.
+
+We fix an arbitrary root for $T$ and refer to edges as parent-child pairs $(P, C)$, where $P$ is the parent relation and $C$ is the child. 
+% Classical algorithms such as Yannakakis~\cite{yannakakis1981algorithms} exploit this tree structure to evaluate acyclic joins in time linear in input plus output size.
+
+% \paragraph{Input and Output Size.}
+% We denote the total input size as $\mathrm{IN} = \sum_{i=1}^{m} |R_i|$ and the output size as $\mathrm{OUT} = |Q(D)|$, where $Q(D)$ is the result of evaluating $Q$ on database instance $D$. 
+% For acyclic queries, the Yannakakis algorithm achieves $O(\mathrm{IN} + \mathrm{OUT})$ complexity. Our witness-guided protocol inherits this bound.
+
+% \paragraph{Free-Connex Queries.}
+% When $Q$ has designated output attributes (i.e., a projection), we say $Q$ is \emph{free-connex} if the output attributes form a connected subset within the join tree structure. Free-connex acyclic queries admit constant-delay enumeration~\cite{bagan2007acyclic} and worst-case optimal evaluation for join-aggregate queries~\cite{abokhamis2016faq}. Our core protocol targets this class; cyclic queries are handled via decomposition (Section~\ref{subsec:cyclic_decomposition}).
+
+
+
+
+% \subsection{The Yannakakis Algorithm}
+% \label{sec:yannakakis}
+
+% The Yannakakis algorithm~\cite{yannakakis1981algorithms} evaluates acyclic join queries in worst-case optimal time $O(\mathrm{IN} + \mathrm{OUT})$. Given a join tree $T$ rooted at an arbitrary node, the algorithm proceeds in two phases:
+
+% \paragraph{Phase 1: Semijoin Reduction.}
+% This phase eliminates \emph{dangling tuples}—tuples that satisfy local join predicates but cannot participate in any complete join result.
+% \begin{itemize}[leftmargin=*]
+%     \item \emph{Bottom-up pass:} Processing edges in post-order (leaves to root), each parent relation $P$ is replaced by $P \leftarrow P \ltimes C$, where $C$ is its child. This removes tuples from $P$ that have no join partner in $C$.
+%     \item \emph{Top-down pass:} Processing edges in pre-order (root to leaves), each child relation $C$ is replaced by $C \leftarrow C \ltimes P$, where $P$ is the (already reduced) parent. This removes tuples from $C$ that cannot extend to complete results upward.
+% \end{itemize}
+% After both passes, every remaining tuple in every relation participates in at least one result tuple.
+
+% \paragraph{Phase 2: Result Enumeration.}
+% The reduced relations are joined along the tree structure. Because all dangling tuples have been eliminated, no intermediate result exceeds $O(\mathrm{IN} + \mathrm{OUT})$ in size, yielding the optimal complexity bound.
+
+% Our witness-guided verification protocol is inspired by this structure: the Oblivious Join Gate (Section~\ref{sec:gates}) verifies semijoin reductions along tree edges, and the final join is computed over the verified reduced relations.
+
+
+
+
+
+\subsection{Obliviousness and Differential Privacy}
+\label{sec:dp-oblivious}
+
+In a ZK proof system, the circuit structure (its size and constraint count) is public. \emph{Obliviousness} requires that these dimensions be independent of the actual data values. Let $\mathcal{C}(D)$ denote the circuit dimensions produced for database $D$. A proof system is oblivious if $\mathcal{C}(D_1) = \mathcal{C}(D_2)$ for all instances $D_1, D_2$ with the same schema. For joins, this demands padding intermediates to worst-case bounds, up to $O(N^k)$ for a $k$-way join over relations of size~$N$. Our OBJ framework (Section~\ref{sec:gates}) eliminates intermediate materialization for acyclic joins, so obliviousness comes for free. However, for cyclic queries, tree decomposition introduces intra-cluster intermediates whose sizes are data-dependent, and padding them to worst-case bounds can be prohibitively expensive. To address this, we observe that strict obliviousness is one extreme of a spectrum that can be formalized through differential privacy (DP).
+
+\vspace{-0.1in}
+\paragraph{Differential Privacy.}
+A randomized mechanism $\mathcal{M}$ satisfies $(\epsilon,\delta)$-differential privacy~\cite{dwork2006differential,dwork2014algorithmic} if for any two neighboring databases $D_1, D_2$ (differing in at most one record) and any set of outcomes $S$:
+\[
+\Pr[\mathcal{M}(D_1) \in S] \leq e^{\epsilon} \cdot \Pr[\mathcal{M}(D_2) \in S] + \delta.
+\]
+The privacy budget $\epsilon$ controls the maximum influence a single record can have on the output; smaller $\epsilon$ means stronger privacy. The noise magnitude is determined by the \emph{sensitivity} of the function being protected, defined as $\Delta f = \max_{D_1 \sim D_2} |f(D_1) - f(D_2)|$, where $D_1 \sim D_2$ denotes neighboring databases differing in one record.
+
+\vspace{-0.1in}
+\paragraph{Obliviousness as a Special Case of DP}
+Viewing the mechanism $\mathcal{M}$ that determines circuit dimensions as a function of the database, obliviousness corresponds exactly to $(0,0)$-DP: the function output is a constant, trivially satisfying the DP inequality. In fact, we can place obliviousness and DP on a single spectrum:
+\begin{itemize}[leftmargin=*]
+    \item $\epsilon = 0, \delta = 0$: strict obliviousness, circuit dimensions are data-independent (worst-case padding);
+    \item $0 < \epsilon < \infty$ (with a fixed negligible $\delta$): DP-guided padding, circuit capacities use noisy cardinality bounds with $(\epsilon,\delta)$-DP guarantees;
+    \item $\epsilon \to \infty$: no privacy, circuit capacities match the true intermediate sizes.
+\end{itemize}
+This unified view yields a tunable privacy--efficiency trade-off controlled by $\epsilon$ and $\delta$. Within this framework, ZK protects the \emph{content} of witness columns, while DP bounds the leakage through \emph{observable circuit dimensions}. We exploit this relaxation for cyclic joins in Section~\ref{sec:relax-cyclic}.
+
+
+\section{Problem Setting}
+\label{sec:overview}
+
+We consider a setting in which a data owner wishes to answer analytical SQL queries over a private database while providing cryptographic guarantees of correctness without exposing the underlying data. The data owner acts as the \emph{prover} and holds a private database~$D$; external clients act as \emph{verifiers} who submit queries and receive results. To bind the prover to a specific database state, the prover first publishes a cryptographic commitment $C(D)$ (e.g., on a public ledger). For each query $Q$, the prover computes the result $R = Q(D)$ and generates a non-interactive ZK proof $\pi$ certifying that $R$ is the correct output of $Q$ on the committed database. Any verifier can then independently check $\pi$ against the public inputs $(C(D), Q, R)$ without further interaction or access to~$D$.
+
+\subsection{Threat Model and Security Guarantees}
+
+We assume a mutually distrustful setting: neither party trusts the other. A malicious prover may attempt to use a fabricated or modified database, or return incorrect query results to mislead the verifier. A curious verifier may attempt to infer private information about the database from the proof, the query result, or observable properties of the proof circuit (e.g., its dimensions). Our proof system defends against both threats through the following standard guarantees~\cite{groth2016size, gabizon2019plonk}:
+
+\begin{itemize}[leftmargin=*]
+    \item \emph{Database binding.} The commitment $C(D)$ is published immutably (e.g., on a public ledger or blockchain) before any queries are issued. Every subsequent proof $\pi$ is cryptographically tied to this commitment, so the prover cannot silently substitute a different database or retroactively modify records.
+
+    \item \emph{Soundness.} No computationally bounded adversary can produce a valid proof for an incorrect result, except with negligible probability in the security parameter~$\lambda$. That is, if the verifier accepts $(R, \pi)$, the result $R$ is guaranteed to be the correct output of $Q$ on the committed database~$D$.
+
+    \item \emph{Knowledge soundness.} Whenever the verifier accepts a proof, the prover must actually possess a valid witness, i.e., a correct execution trace that satisfies all circuit constraints. This is stronger than plain soundness: there exists an efficient \emph{extractor} that, given oracle access to a successful prover, can recover the witness. This rules out provers that produce convincing proofs without actually knowing the database or the computation~\cite{groth2016size}.
+
+    \item \emph{Zero-knowledge.} The proof reveals nothing about $D$ beyond the query result $R$. Formally, for any probabilistic polynomial-time (PPT) verifier, there exists a PPT simulator that, given only the public inputs $(C(D), Q, R)$, produces a transcript computationally indistinguishable from a real proof, ensuring that neither the database contents nor the intermediate computation states are disclosed.
+\end{itemize}
+
+\subsection{Cryptographic Instantiation}
+\label{subsec:crypto}
+We instantiate the proof system using the Halo2 framework~\cite{halo2,halo2-protocol}, the same backend used by PoneglyphDB~\cite{gu2025poneglyphdb}, and inherit its cryptographic guarantees. The key parameters and properties are:
+
+\vspace{-0.1in}
+\paragraph{Setup.}
+Halo2 operates over the Pasta curve cycle~\cite{halo2} (255-bit field, $\lambda{=}128$-bit security) and uses the Inner Product Argument (IPA)~\cite{bowe2020recursive} for polynomial commitments, providing a \emph{transparent} setup with no trusted third party.
+
+\vspace{-0.1in}
+\paragraph{Proof Complexity.}
+Let $n$ denote the number of constraints (rows) in the PLONKish circuit (see Section~\ref{sec:plonk} for a detailed description). The Halo2 IPA-based proof system achieves the following asymptotic bounds:
+\begin{itemize}[leftmargin=*]
+    \item \emph{Proof size:} $O(\log n)$ group elements, yielding proofs of a few tens of kilobytes in practice.
+    \item \emph{Verification time:} $O(\log n)$ group operations, completing in under one second regardless of query complexity.
+    \item \emph{Proving time:} $O(n \log n)$. The prover performs $O(n \log n)$ field operations for polynomial arithmetic (FFT/NTT) and $O(n)$ elliptic-curve group operations for multi-scalar multiplications (MSMs) used in polynomial commitments and the IPA opening proof~\cite{gabizon2019plonk,bowe2020recursive}. Since group operations are orders of magnitude more expensive than field operations, the $O(n)$ MSM term dominates in practice~\cite{gu2025poneglyphdb}, and the observed proving time scales almost linearly with $n$.
+\end{itemize}
+The sublinear proof size and verification time make the system \emph{succinct}: the verifier's cost is independent of the computation being proved. Since proving time is dominated by MSM and thus scales nearly linearly with the circuit size, minimizing the number of constraints is the primary optimization objective, and more importantly, the central motivation for our witness-guided approach that avoids materializing intermediate join results.
+
+\subsection{Privacy Model}
+\label{subsec:privacy}
+
+Three layers of information arise in ZK database systems. First, the \emph{database contents} are protected by the zero-knowledge property (Section~\ref{subsec:crypto}): the verifier learns only $C(D)$ and the query result~$R$. Second, the \emph{query result}~$R$ is inherently revealed; if $R$ itself is sensitive, orthogonal techniques (e.g., differential privacy on outputs) can be applied before proof generation. Third, and most relevant to our work, the \emph{evaluation process} can leak information through the publicly visible circuit structure. Since circuit dimensions depend on intermediate result sizes, which are data-dependent for joins, an adversary may infer join selectivities or cardinality distributions. We address this through oblivious circuit design, formalized via the DP--obliviousness spectrum in Section~\ref{sec:dp-oblivious}: for acyclic joins, the OBJ (Section~\ref{sec:gates}) achieves strict obliviousness with no intermediates to leak; for cyclic joins, DP-guided padding (Section~\ref{sec:relax-cyclic}) provides a tunable privacy--efficiency trade-off.
+
+\section{ZK Proofs Primitives}
+\label{sec:ZKP}
+This section describes the PLONKish constraint framework and the gate primitives used in our circuit design. As described in Section~\ref{subsec:crypto}, our system is built on Halo2~\cite{halo2}, which uses PLONKish arithmetization. We choose this framework for three reasons.
+First, PLONKish \emph{custom gates} let us encode complex join-verification logic into compact, application-specific constraints. 
+% yielding circuits substantially smaller than those built from generic R1CS gates.
+Second, PLONKish provides \emph{native lookup arguments}~\cite{gabizon2020plookup}, which our design exploits heavily for range checks and set-membership proofs.
+Third, PoneglyphDB~\cite{gu2025poneglyphdb} has already designed efficient gate primitives for relational operations (range checks, sorting, etc.) on the same backend, which we directly reuse and extend for our join-verification circuits.
+
+\subsection{PLONKish Arithmetization}
+\label{sec:plonk}
+We briefly review PLONKish arithmetization; see~\cite{gu2025poneglyphdb} for a detailed treatment and Appendix~\ref{sec:plonkish_example} for a worked example.
+A PLONKish circuit is a rectangular matrix with three types of columns:
+\emph{fixed columns} store circuit-determined constants (e.g., selector bits that activate specific gate types on each row),
+\emph{advice columns} hold private witness values (inputs and intermediates) that the prover fills at proving time, and
+\emph{instance columns} carry public inputs and outputs shared with the verifier.
+Since our join-verification logic operates primarily on advice columns, we use \textbf{columns} to refer to advice columns throughout this paper unless otherwise noted.
+
+Computation is expressed through two kinds of constraints.
+\emph{Gate constraints} are low-degree multivariate polynomials over the columns that must evaluate to zero for each row; selector columns (fixed binary values) activate different gate types on different rows, enabling heterogeneous operations within a single circuit.
+\emph{Copy constraints} enforce equality between cells in different positions via a permutation argument~\cite{gabizon2019plonk}, wiring the output of one gate to the input of another.
+The prover fills the advice columns to produce an \emph{execution trace}; the proof system then certifies that every constraint is satisfied without revealing the trace itself.
+
+\subsection{Lookup Arguments and Derived Gates}
+\label{subsec:lookup}
+Lookup arguments~\cite{gabizon2020plookup, habock2022multivariate} allow proving that every element of a private witness column $P$ belongs to a public table $Q$ with $\mathcal{O}(\max(|P|,|Q|))$ constraints.
+In this paper, we use the Plookup protocol~\cite{gabizon2020plookup}, which verifies permutation integrity via a grand product argument:
+\begin{equation}
+\label{equ:permu}
+    \prod_{i} (P_i + \alpha)(Q_i + \beta) = \prod_{i} (P'_i + \alpha)(Q'_i + \beta)
+\end{equation}
+where $P'$, $Q'$ are sorted permutations of $P$ and $Q$, $i$ ranges over all row indices, and $\alpha,\beta$ are random challenges.
+For large domains (e.g., 64-bit integers), a \emph{decomposed} strategy splits each value into $t = \lceil B/b \rceil$ chunks of $b$ bits and checks each chunk against a small table of size $2^b$, giving $\mathcal{O}(M \cdot t)$ constraints independent of the domain size~$2^B$.
+
+Using the Plookup primitive and the permutation argument above, we employ two derived gates used throughout this work:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Range Check}~\cite{gu2025poneglyphdb, gu2025integrating}.
+    Verifies that every value in a column of $N$ elements lies within $[0, 2^B)$ using the decomposed lookup strategy described above. Each value is split into $t = \lceil B/b \rceil$ chunks of $b$ bits, and each chunk is checked against a lookup table of size~$2^b$. 
+
+    \item \textbf{Sort}~\cite{gu2025poneglyphdb}.
+    Verifies that a column is in non-decreasing order by computing consecutive differences $d_i = x_{i+1} - x_i$ and applying a range check to enforce $d_i \geq 0$. 
+\end{itemize}
+
+These primitives, together with the Plookup and permutation arguments, serve as the foundation for the Oblivious Join Gate presented in Section~\ref{sec:gates}.
+
+
+
+
+
+
+
+
+\section{Gates for Acyclic Joins}
+\label{sec:gates}
+
+In this section, we introduce the Oblivious Join Gate (OBJ), a circuit primitive for verifying acyclic multi-way joins within the PLONKish framework. We present both a two-pass and an optimized one-pass variant, followed by extensions for aggregation, projection, and cross-relation predicates. Our design prioritizes efficiency by minimizing the number of (low-degree) polynomial constraints, as proving time scales linearly with the number of constraints.
+
+\subsection{Oblivious Join Gate for Acyclic Joins }
+We start by introducing the notion of an oblivious join gate in the context of acyclic joins.
+
+\textbf{Definition (Oblivious Join Gate (OBJ for short)).} We define the \emph{Oblivious Join Gate} for acyclic join queries as a circuit primitive that verifies the correctness of an \textbf{acyclic} equi-join operation over a set of input relations, while strictly concealing data access patterns and result cardinality.
+\begin{itemize}[leftmargin=*]
+\item \textbf{Input:} A collection of $n$ input relations $\mathcal{R} = \{R_1, \dots, R_n\}$, where each relation $R_i$ consists of a set of attribute columns $\{A_{1}^{(i)}, \dots, A_{m_i}^{(i)}\}$.
+\item \textbf{Output:} A set of \emph{fully reduced} (clean) relations $\mathcal{R}^c = \{R_1^c, \dots, R_n^c\}$, where each $R_i^c \subseteq R_i$ contains exactly those tuples that participate in the global join result. The clean relations serve as a compact, input-sized representation of the join: the full join result can be enumerated from $\mathcal{R}^c$ when needed (e.g., for \texttt{SELECT *} queries), but downstream operations such as aggregation, projection, and cross-relation predicates can be applied directly on $\mathcal{R}^c$ without materializing the join.
+\end{itemize}
+% Crucially, the OBJ gate adheres to two structural properties: (1)~\textbf{Acyclicity}---the hypergraph induced by the input relations and their join predicates must be acyclic (i.e., it admits a join tree); and (2)~\textbf{Obliviousness}---the circuit structure is fully determined by the public schema and the worst-case output bounds, and is statistically independent of the actual data values, thereby concealing the join selectivity and the true cardinality of any intermediate or final results.
+
+
+
+
+
+
+
+
+\subsubsection{Semijoin Gate}
+\label{subsubsec:semijoin}
+We observe that when the joins are acyclic, the full multi-way join can be decomposed into a sequence of local pairwise semijoin reductions along the join tree, inspired by classical semijoin reductions along a join tree~\cite{yannakakis1981algorithms, beeri1983desirability}.  Specifically, by performing semijoins along the edges of the join tree (in bottom-up and top-down passes), we can eliminate all dangling tuples---those that satisfy local predicates but fail to participate in the global result.
+
+Consequently, the verification of a complex multi-way join reduces to the verification of these individual semijoin operations. If the prover can demonstrate the correctness of the semijoin $R_i \ltimes R_j$ for every edge in the join tree, the global consistency of the result is mathematically guaranteed. This decomposition allows us to adopt a modular design: rather than constructing a unique, monolithic gate for every query topology, we define the \textbf{Semijoin Gate} as a generic, atomic primitive. Both the Two-Pass and One-Pass OBJ variants are then realized by composing instances of this primitive according to the query's join tree structure.
+
+\noindent\textbf{Semijoin Gate Implementation.}
+Given an edge in the acyclic join tree connecting two relations $R_i$ and $R_j$, we design a reusable circuit gadget to verify the semijoin operation $R_i \leftarrow R_i \ltimes R_j$. This gate filters $R_i$ to retain only those tuples that have a matching join key in $R_j$. To establish correctness, the prover supplies auxiliary witness tables, upon which the circuit enforces a set of structural invariants to guarantee that the reduction is both sound (no invalid tuples are kept) and complete (no valid tuples are dropped).
+
+\begin{enumerate}
+    \item \textbf{Initialization and Padding.}
+    The prover first allocates advice columns to store the input relations $R_i$ and $R_j$. To conceal the exact data volume and hide the join selectivity, we pad the columns of both relations with dummy rows up to a fixed upper-bound cardinality $N$.
+
+    \item \textbf{Oblivious Partitioning.}
+    The prover locally computes the semijoin and allocates two new sets of advice columns, $R'_i$ (matches) and $R''_i$ (non-matches), each of size $N$. These columns represent a partition of $R_i$ based on joinability with $R_j$: $R'_i$ stores the semijoin result $R'_i = R_i \ltimes R_j$, and $R''_i$ stores the antijoin result $R''_i = R_i \rhd R_j$.
+    To accommodate the fixed circuit size, we populate unused rows in both $R'_i$ and $R''_i$ with distinct dummy values. This padding is guaranteed to be sufficient, since the partition is exhaustive and $|R'_i| + |R''_i| = |R_i| \leq N$. Crucially, this approach standardizes the circuit structure, ensuring it remains static and independent of the actual join selectivity.
+
+    \item \textbf{Conservation Check.}
+    We enforce multiset equality $R_i \equiv R'_i \cup R''_i$ via a permutation argument to guarantee that no tuples are fabricated or dropped during partitioning.
+
+    \item \textbf{Soundness and Completeness.}
+    We verify that the partition correctly separates joining from non-joining tuples.
+    A Membership Check enforces $\pi_{\text{key}}(R'_i) \subseteq \pi_{\text{key}}(R_j)$, proving $R'_i$ contains \emph{only} joinable tuples (\emph{soundness}).
+    A Non-Membership Check enforces $\pi_{\text{key}}(R''_i) \cap \pi_{\text{key}}(R_j) = \emptyset$, proving $R''_i$ contains \emph{only} non-joinable tuples (\emph{completeness}).
+    Combined with the Conservation Check, these constraints imply that $R'_i$ contains \emph{all} joinable tuples: any missing tuple would reside in $R''_i$, violating the disjointness constraint.
+\end{enumerate}
+
+\noindent\textbf{Sub-Gate Implementations.}
+The semijoin gate above relies on three sub-gates, each built from the lookup and permutation primitives of Section~\ref{subsec:lookup}. For multi-attribute tuples, we first compress each tuple into a single field element. 
+% via a \emph{random linear combination} (RLC): given attributes $(a_1, \dots, a_k)$ and a random challenge $r$, the RLC is $\sum_{i} a_i \cdot r^{i-1}$. This reduces all multi-attribute operations to single-column checks at negligible collision probability.
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Membership Check} (lookup argument).
+    Recall that a lookup argument verifies that every value in one column appears in another column (Section~\ref{subsec:lookup}). We apply this directly to join keys: by treating the key column of $R'_i$ as the witness and the key column of $R_j$ as the reference table, the lookup argument enforces $\pi_{\text{key}}(R'_i) \subseteq \pi_{\text{key}}(R_j)$, proving that every tuple retained in the semijoin result indeed has a matching key in~$R_j$. 
+
+    \item \textbf{Non-Membership Check} (merge-and-sort).
+    While a lookup argument can prove that a value \emph{is} in a table, proving that a value is \emph{not} in a table requires a different approach. We prove disjointness of two key sets, i.e., $\pi_{\text{key}}(A) \cap \pi_{\text{key}}(B) = \emptyset$, using a merge-and-sort strategy: (i)~the prover merges both key columns into a single column and provides a sorted permutation of the merged sequence as witness; (ii)~a permutation argument verifies that the sorted sequence is a valid rearrangement of the merged keys; (iii)~a sort gate verifies that the sequence is non-decreasing; and (iv)~a local gate constraint checks that no two consecutive elements from different sources are equal. The key insight is that if the merged sequence is sorted and no two adjacent elements from different sources are equal, the two sets must be disjoint. This enforces the antijoin condition $\pi_{\text{key}}(R_i \rhd R_j) \cap \pi_{\text{key}}(R_j) = \emptyset$. 
+
+    \item \textbf{Conservation Check} (permutation argument).
+    Recall that the permutation argument (\eqref{equ:permu}) can verify that two columns contain exactly the same multiset of elements. We use this to ensure that no tuples are fabricated or dropped during partitioning: by treating the concatenation $R'_i \cup R''_i$ as a single virtual column and checking that it is a permutation of the original~$R_i$, we enforce $R_i \equiv (R_i \ltimes R_j) \cup (R_i \rhd R_j)$. 
+\end{itemize}
+
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1.0\textwidth]{pics/join.pdf}
+\vspace{-0.2in}
+% \captionsetup{skip=2pt} 
+\caption{Illustration of the Two-Pass OBJ on the SQL query \texttt{SELECT * FROM $R_1$, $R_2$, $R_3$ WHERE $R_1.B = R_2.B$ AND $R_2.C = R_3.C$}.}
+\vspace{-0.2in}
+\label{fig:two_pass_join}
+\end{figure*}
+
+
+\subsubsection{Two-Pass OBJ}
+\label{subsubsec:two_pass}
+We compose semijoin gates along all edges of the join tree $T$ to verify the full acyclic join $R_1 \bowtie \dots \bowtie R_n$ in two passes (bottom-up and top-down), following the semijoin reduction strategy of the Yannakakis algorithm.
+
+In the \emph{bottom-up pass}, we process edges from leaves to root, applying a semijoin gate for each edge $(P, C)$ to reduce the parent: $P \leftarrow P \ltimes C$. After processing all children of a node, that node retains only tuples that have a match in every descendant subtree. For instance, in a tree rooted at $R_2$ with children $R_1$ and $R_3$ (as in Example~\ref{ex:two_pass_obj_bottom_up}), the bottom-up pass reduces $R_2$ by $R_1$ and then by $R_3$, yielding the fully reduced root $R_2^c$.
+
+In the \emph{top-down pass}, starting from the fully reduced root, we propagate the reduction outward. For each edge $(P, C)$ processed from root to leaves, we apply a semijoin gate to reduce the child: $C \leftarrow C \ltimes P$, where $P$ is the already-reduced parent. This filters each relation by its reduced parent, ensuring global consistency across all tree edges.
+
+After both passes produce the fully reduced relations $\{R_1^c, R_2^c, \dots, R_n^c\}$, a \emph{pairwise consistency} check verifies that adjacent clean relations agree on their shared join keys. For every edge $(R_i, R_j)$ with shared attributes $K_{ij}$, the circuit checks $\pi_{K_{ij}}(R_i^c) = \pi_{K_{ij}}(R_j^c)$ via two Membership Checks ($R_i^c \to R_j^c$ and $R_j^c \to R_i^c$). This certifies that every clean tuple has a matching join partner in every adjacent clean relation, ensuring the reduced instance admits no dangling tuples.
+
+Finally, the output is computed by joining the verified clean relations along the tree. Since pairwise consistency guarantees key agreement across every edge, the join can be enumerated directly from the reduced relations without further validation.
+
+
+\noindent\textbf{Correctness.}
+We demonstrate the correctness of the Two-Pass OBJ by establishing two properties: \emph{Local Semijoin Correctness} and \emph{Global Reduction Correctness}.
+
+\noindent (1) \emph{Local Semijoin Correctness.} For a specific edge verifying $R_i \leftarrow R_i \ltimes R_j$, we must prove that the output $R'_i$ contains exactly the tuples in $R_i$ that match $R_j$.
+First, the permutation argument (\eqref{equ:permu}) ensures $R_i \equiv R'_i \cup R''_i$, so no tuples are fabricated or lost.
+For \emph{soundness}, the lookup argument enforces $\pi_{\text{key}}(R'_i) \subseteq \pi_{\text{key}}(R_j)$, guaranteeing that every tuple retained in $R'_i$ is a valid semijoin result.
+For \emph{completeness}, suppose for contradiction that a tuple $t \in R_i$ with $t[\text{key}] \in \pi_{\text{key}}(R_j)$ was incorrectly placed in $R''_i$. The non-membership check enforces $\pi_{\text{key}}(R''_i) \cap \pi_{\text{key}}(R_j) = \emptyset$, so the existence of such $t$ in $R''_i$ yields a direct contradiction. Thus $R''_i$ contains only non-matching tuples.
+Since the partition is exhaustive ($R_i \equiv R'_i \cup R''_i$) and $R''_i$ contains no matching tuples, $R'_i$ must contain \emph{all} matching tuples.
+
+\noindent (2) \emph{Global Reduction Correctness.}
+The correctness of the full reduction follows by induction on the join tree structure. Since each semijoin gate strictly implements the relational algebra semantics defined above, the sequential composition of these gates faithfully implements the two-pass semijoin reduction of the Yannakakis algorithm~\cite{yannakakis1981algorithms}. By the correctness of this reduction for acyclic queries, the final relations $\{R_1^c, \dots, R_n^c\}$ resulting from the two-pass execution contain exactly those tuples participating in the global join.
+
+We defer the obliviousness analysis of both OBJ variants to Appendix~\ref{app:obliviousness}.
+
+
+\vspace{-0.1in}
+\begin{example}[Two-Pass OBJ on a 3-way path join]
+\label{ex:two_pass_obj_full}
+\label{ex:two_pass_obj_bottom_up}
+Consider the acyclic join
+$Q = R_1(A,B) \bowtie R_2(B,C) \bowtie R_3(C,D)$,
+with join predicates $R_1.B = R_2.B$ and $R_2.C = R_3.C$
+(as visualized in Figure~\ref{fig:two_pass_join}).
+Let the input relations be $R_1$, $R_2$ and $R_3$.
+% \vspace{-0.1in}
+% \[
+% \begin{aligned}
+% R_1 &= \{(1,1),(2,1),(3,2),(4,3),(5,6)\},\\
+% R_2 &= \{(1,11),(2,12),(3,13),(4,14),(5,16)\},\\
+% R_3 &= \{(10,1),(11,4),(11,2),(15,3),(16,5)\}.
+% \end{aligned}
+% \]
+\vspace{-0.1in}
+\paragraph{Bottom-up pass (witness-guided reductions).}
+We root the join tree at $R_2$, so $R_1$ and $R_3$ are its children.
+For each semijoin along an edge, the prover supplies a \emph{kept} witness
+($R_i \ltimes R_j$) and a \emph{residual} witness ($R_i \rhd R_j$).
+The circuit enforces (i)~\emph{conservation} via a permutation check,
+(ii)~\emph{membership} for kept keys via lookup, and
+(iii)~\emph{non-membership} for residual keys.
+
+\smallskip
+\noindent\emph{Step 1: Reduce $R_2$ against $R_1$ on key $B$.}
+Since $\pi_B(R_1)=\{1,2,3,6\}$, the tuples $(4,14)$ and $(5,16)\in R_2$ (with $B=4,5$) cannot join and are discarded.
+The semijoin gate partitions $R_2 = R'_2 \cup R''_2$:
+\[
+% \begin{aligned}
+% R'_2 &= R_2 \ltimes R_1 =\{(1,11),(2,12),(3,13)\}, 
+% R''_2 &= R_2 \rhd R_1 = \{(4,14),(5,16)\}.
+% \end{aligned}
+R'_2 = R_2 \ltimes R_1 =\{(1,11),(2,12),(3,13)\}, \qquad R''_2 = R_2 \rhd R_1 = \{(4,14),(5,16)\}.
+\]
+The circuit checks:
+(1)~$R_2 \equiv R'_2 \cup R''_2$ (conservation via permutation),
+(2)~$\pi_B(R'_2) \subseteq \pi_B(R_1)$ (membership via lookup),
+(3)~$\pi_B(R''_2) \cap \pi_B(R_1)=\emptyset$ (non-membership).
+
+\smallskip
+\noindent\emph{Step 2: Reduce $R'_2$ \textbf{and} $R_3$ against each other on key $C$.}
+Now $\pi_C(R'_2)=\{11,12,13\}$ and $\pi_C(R_3)=\{10,11,15,16\}$ intersect only on $C=11$.
+Accordingly, both $R'_2$ and $R_3$ are split:
+% \begin{aligned}
+% R_2^{c} &= R'_2 \ltimes R_3 = \{(1,11)\},\\
+% R_2^{r} &= R'_2 \rhd R_3 = \{(2,12),(3,13)\},\\
+% R_3^{c} &= R_3 \ltimes R'_2 = \{(11,4),(11,2)\},\\
+% R_3^{r} &= R_3 \rhd R'_2 = \{(10,1),(15,3),(16,5)\}.
+% \end{aligned}
+%
+% \vspace{-0.1in}
+\[
+R_2^{c} = R'_2 \ltimes R_3 = \{(1,11)\}, \qquad
+R_2^{r} = R'_2 \rhd R_3 = \{(2,12),(3,13)\},
+\]
+\vspace{-0.1in}
+\[
+R_3^{c} = R_3 \ltimes R'_2 = \{(11,4),(11,2)\},\qquad
+R_3^{r} = R_3 \rhd R'_2 = \{(10,1),(15,3),(16,5)\}.
+\]
+The circuit verifies conservation
+($R'_2 \equiv R_2^{c}\cup R_2^{r}$ and
+$R_3 \equiv R_3^{c}\cup R_3^{r}$),
+plus membership/non-membership on $C$-keys.
+
+\vspace{-0.1in}
+\paragraph{Top-down pass (cleanup).}
+The top-down phase propagates reduced keys outward from the root $R_2^{c}$.
+In this instance, it re-derives the same reduced leaves shown above, but now using $R_2^{c}$ as the parent witness.
+
+\smallskip
+\noindent\emph{Step 3: Reduce $R_3$ against $R_2^c$ on key $C$.}
+Since $\pi_C(R_2^c)=\{11\}$, only tuples in $R_3$ with $C=11$ survive, yielding
+$R_3 \ltimes R_2^c = \{(11,4),(11,2)\}$ and residual $\{(10,1),(15,3),(16,5)\}$,
+which matches $(R_3^{c},R_3^{r})$ above.
+The circuit verifies the same three checks (conservation, membership, non-membership).
+
+\smallskip
+\noindent\emph{Step 4: Reduce $R_1$ against $R_2^c$ on key $B$.}
+Since $\pi_B(R_2^c)=\{1\}$, only tuples in $R_1$ with $B=1$ survive:
+\vspace{-0.1in}
+\[
+R_1^c = R_1 \ltimes R_2^c = \{(1,1),(2,1)\}, \qquad
+R_1^{r} = R_1 \rhd R_2^c = \{(3,2),(4,3),(5,6)\}.
+\]
+\vspace{-0.1in}
+Again, the circuit verifies conservation, membership, and non-membership.
+
+
+\paragraph{Pairwise consistency and final join.}
+After the two passes, the fully reduced (clean) instance is:
+\vspace{-0.1in}
+\[
+R_1^c=\{(1,1),(2,1)\},\quad
+R_2^c=\{(1,11)\}, \quad
+R_3^c=\{(11,4),(11,2)\}.
+\]
+% \vspace{-0.1in}
+The circuit verifies edge consistency via mutual lookups:
+$\pi_B(R_1^c)\!=\!\{1\}\!=\!\pi_B(R_2^c)$ and
+$\pi_C(R_2^c)\!=\!\{11\}\!=\!\pi_C(R_3^c)$.
+% The join yields $|Q(D)|=2 \cdot 1 \cdot 2 = 4$ tuples,
+% matching Figure~\ref{fig:two_pass_join}.
+\end{example}
+
+
+
+
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=1.0\textwidth]{pics/one_pass_join.pdf}
+\vspace{-0.2in}
+% \captionsetup{skip=2pt} 
+\caption{Illustration of the One-Pass OBJ on the SQL query \texttt{SELECT * FROM $R_1$, $R_2$, $R_3$ WHERE $R_1.B = R_2.B$ AND $R_2.C = R_3.C$}.}
+
+\vspace{-0.2in}
+\label{fig:one_pass_join}
+\end{figure*}
+
+
+
+
+\subsubsection{One-Pass OBJ}
+\label{subsubsec:opt_semijoin}
+
+While the Two-Pass OBJ (Section~\ref{subsubsec:two_pass}) requires two traversals of the join tree to derive fully reduced relations, we introduce an optimized variant that achieves verification in a single pass. This is accomplished by leveraging the non-interactive nature of the proof system: the prover acts as an oracle, committing to the final reduced state directly, while the circuit merely verifies the validity of this state.
+
+Instead of computing the reduction in-circuit, the prover supplies the set of \emph{perfectly clean} relations $\mathcal{R}^c = \{R_1^c, \dots, R_n^c\}$ and the corresponding \emph{residual} relations $\mathcal{R}^r = \{R_1^r, \dots, R_n^r\}$ as witness columns. Here, $R_i^c$ contains the tuples of $R_i$ that participate in the final join, and $R_i^r$ contains those that do not. To guarantee that $\mathcal{R}^c$ constitutes the correct, fully reduced join result, we verify four structural invariants within the circuit.
+
+\begin{enumerate}
+    \item \textbf{Conservation.}
+    For every relation $R_i$ ($i \in [1, n]$), we enforce multiset equality between the original input and the prover-supplied partition:
+\vspace{-0.1in}
+    \begin{equation}
+        R_i \equiv R_i^c \cup R_i^r
+    \end{equation}
+    This is implemented via a Conservation Check (permutation argument, Equation~\eqref{equ:permu}), ensuring no tuples are fabricated or omitted.
+
+    \item \textbf{Internal Disjointness.}
+    For each relation $R_i$, the clean and residual sets must be disjoint:
+    % \vspace{-0.1in}
+    \begin{equation}
+        R_i^c \cap R_i^r = \emptyset
+    \end{equation}
+    Without this check, a malicious prover could hide a joinable tuple in $R_i^r$ while still passing Conservation. This is enforced via one Non-Membership Check per relation ($n$ checks total), operating on RLC-compressed tuples.
+
+    \item \textbf{Pairwise Consistency.}
+    For every edge $(R_i, R_j)$ in the join tree with shared attributes $K_{ij}$, the clean components must agree on the join key values:
+    \begin{equation}
+        \pi_{K_{ij}}(R_i^c) = \pi_{K_{ij}}(R_j^c)
+    \end{equation}
+    This ensures that every clean tuple has a matching join partner in every adjacent clean relation, i.e., $\mathcal{R}^c$ admits no dangling tuples. Set equality is verified via two mutual Membership Checks ($R_i^c \to R_j^c$ and $R_j^c \to R_i^c$) on~$K_{ij}$.
+
+    \item \textbf{Residual Disconnectedness.}
+    We must prove that no valid joining tuples remain in the residual set. This is verified by a single bottom-up semijoin reduction on $\mathcal{R}^r$ along the join tree~$T$, using $(n{-}1)$ semijoin gates (one per edge):
+    \begin{equation}
+        R_n^r \ltimes (R_{n-1}^r \ltimes (\dots (R_2^r \ltimes R_1^r)\dots)) = \emptyset
+    \end{equation}
+    After the pass, the root's surviving set is checked to be empty.
+\end{enumerate}
+
+By satisfying these four invariants, we guarantee that $\{R_1^c, \dots, R_n^c\}$ contains exactly the tuples contributing to the query result, allowing the final join to be computed directly from these reduced relations.
+
+
+
+
+\textbf{Correctness.}
+To prove that $\mathcal{R}^c$ is the correct fully reduced state---i.e., that the clean relations contain exactly those tuples participating in the global join---we verify Soundness and Completeness.
+
+\noindent (1) \emph{Soundness (no false positives).}
+We must ensure that every tuple in $\mathcal{R}^c$ is valid and fully connected.
+The \textbf{Pairwise Consistency} check enforces that for every edge $(R_i, R_j)$ in the join tree, $\pi_{K_{ij}}(R_i^c) = \pi_{K_{ij}}(R_j^c)$. By induction on the tree structure, this implies that every tuple in any $R_i^c$ has a matching join partner in every adjacent clean relation. Thus, every tuple in the provided clean set participates in the global join.
+
+\noindent (2) \emph{Completeness (no false negatives).}
+We show by contradiction that no valid joining tuple is hidden in $\mathcal{R}^r$.
+Suppose there exists a tuple $t \in R_i^r$ (for some relation $i$) that participates in a valid global join result $\tau$. Consider any edge $(R_i, R_j)$ incident to $R_i$, and let $k = t[K_{ij}]$ be the join key on that edge. By \textbf{Internal Disjointness}, $k \notin \pi_{K_{ij}}(R_i^c)$. By \textbf{Pairwise Consistency}, $k \notin \pi_{K_{ij}}(R_j^c)$ either, so the component of $\tau$ from $R_j$ must also lie in $R_j^r$. Propagating this argument along the tree, every component of $\tau$ must reside in the residual set of its relation, yielding a complete join tuple within $\mathcal{R}^r$. But this contradicts \textbf{Residual Disconnectedness}, which enforces $R_n^r \ltimes (\dots (R_2^r \ltimes R_1^r)\dots) = \emptyset$.
+
+Therefore, $\mathcal{R}^c$ contains all contributing tuples. Combined with the \emph{Conservation Check} ($R_i \equiv R_i^c \cup R_i^r$), this proves that $\mathcal{R}^c$ is the correct result.
+
+
+\begin{example}[One-Pass OBJ on a 3-way path join]
+\label{ex:one_pass_obj}
+Consider the same query and data as in Example~\ref{ex:two_pass_obj_bottom_up} (Figure~\ref{fig:one_pass_join}).
+The prover directly supplies the clean/residual split:
+\[
+\begin{aligned}
+R_1^c &= \{(1,1),(2,1)\}, & R_1^r &= \{(3,2),(4,3),(5,6)\},\\
+R_2^c &= \{(1,11)\},      & R_2^r &= \{(2,12),(3,13),(4,14),(5,16)\},\\
+R_3^c &= \{(11,4),(11,2)\}, & R_3^r &= \{(10,1),(15,3),(16,5)\}.
+\end{aligned}
+\]
+The circuit verifies the four invariants in one pass:
+\emph{(1)~Conservation:} $R_i \equiv R_i^c \cup R_i^r$ for each~$i$.
+\emph{(2)~Internal Disjointness:} e.g., $\pi_B(R_1^c)\!=\!\{1\} \cap \pi_B(R_1^r)\!=\!\{2,3,6\} = \emptyset$; analogous checks hold for $R_2$ (on $B$ and $C$) and $R_3$ (on~$C$).
+\emph{(3)~Pairwise Consistency:} $\pi_B(R_1^c)\!=\!\{1\}\!=\!\pi_B(R_2^c)$ and $\pi_C(R_2^c)\!=\!\{11\}\!=\!\pi_C(R_3^c)$.
+\emph{(4)~Residual Disconnectedness:} a bottom-up semijoin pass on the residuals yields~$\emptyset$: reducing $R_2^r$ against $R_1^r$ on~$B$ removes $(4,14),(5,16)$ since $B\!\in\!\{4,5\}\!\notin\!\pi_B(R_1^r)\!=\!\{2,3,6\}$, leaving $\pi_C\!=\!\{12,13\}$; then $\pi_C(R_3^r)\!=\!\{10,15,16\}$ is disjoint, so the root is empty.
+Hence $\mathcal{R}^c$ is the fully reduced instance, and $|R_1^c \bowtie R_2^c \bowtie R_3^c| = 2\!\cdot\!1\!\cdot\!2 = 4$ output tuples.
+\end{example}
+
+
+\noindent\textbf{Complexity Analysis.}
+\label{sec:complexity}
+We analyze the constraint cost of the Two-Pass and One-Pass OBJ in terms of the number of PLONKish constraints. Table~\ref{tab:constraint_comparison} summarizes the costs; the detailed derivation appears in Appendix~\ref{app:complexity}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Component} & \textbf{Per-unit cost} & \textbf{Count} & \textbf{Total} \\
+\hline
+\multicolumn{4}{|c|}{\textbf{Two-Pass OBJ}} \\
+\hline
+Semijoin gate  & $(1{+}1{+}8{\times}2)N = 18N$ & $2(n{-}1)$ & $36(n{-}1)\,N$ \\
+\hline
+\multicolumn{4}{|c|}{\textbf{One-Pass OBJ}} \\
+\hline
+Semijoin gate  & $(1{+}1{+}8{\times}2)N = 18N$ & $(n{-}1)$ & $18(n{-}1)\,N$ \\
+Internal Disjointness  & $(1{+}8)N = 9N$ & $n$ & $9n\,N$ \\
+\hline
+\textbf{One-Pass total} & & & $(27n{-}18)\,N$ \\
+\hline
+\end{tabular}
+\caption{Constraint cost comparison for Two-Pass and One-Pass OBJ on an $n$-relation acyclic join (excluding optional Pairwise Consistency).}
+\vspace{-0.2in}
+\label{tab:constraint_comparison}
+\end{table}
+
+\noindent To summarize, the One-Pass OBJ eliminates the Top-Down semijoin pass ($(n{-}1)$ gates), replacing it with $n$ lightweight Internal Disjointness checks at $9N$ each (vs.\ $18N$ per semijoin gate). The total cost satisfies
+\[
+    \mathcal{C}_{\text{1-Pass}} = (27n{-}18)\,N
+    \;<\;
+    36(n{-}1)\,N = \mathcal{C}_{\text{2-Pass}},
+\]
+saving $9(n{-}2)\,N$ constraints for $n \geq 3$.
+% In practice, this yields measurably lower proving times, as confirmed in Section~\ref{sec:experiments}.
+
+
+
+
+\subsection{Aggregation with One-Pass OBJ}
+\label{subsec:aggregation}
+
+After the One-Pass OBJ produces the set of perfectly clean relations $\mathcal{R}^c = \{R_1^c, \dots, R_n^c\}$, we must compute aggregates (e.g., COUNT, SUM, AVG) over the join result without materializing the full join. For free-connex acyclic queries---where the output attributes form a connected subset within the join tree~\cite{bagan2007acyclic}---we design an aggregation scheme that propagates \emph{tuple multiplicities} along the join tree, following the annotated-relations paradigm~\cite{abokhamis2016faq}.
+
+\paragraph{Tuple Multiplicities.}
+The prover supplies, as part of the auxiliary witness, a multiplicity $\mu(t)$ for each tuple $t$ in every clean relation $R_i^c$. Leaf-relation multiplicities are set to~1, and internal-node multiplicities encode the number of join extensions into the subtrees below. Concretely, multiplicities are defined \emph{bottom-up} (leaves to root): after processing all children of a node~$P$, each tuple $t_P \in P^c$ must satisfy
+\[
+\mu(t_P) = \prod_{C \text{ child of } P} \left( \sum_{\substack{t_C \in C^c \\ \pi_{K_{PC}}(t_C) = \pi_{K_{PC}}(t_P)}} \mu(t_C) \right),
+\]
+where $K_{PC}$ denotes the shared join attributes between $P$ and $C$.
+The circuit verifies these multiplicities bottom-up; the product over children reflects that extension choices in different subtrees combine independently.
+
+\vspace{-0.1in}
+\paragraph{Circuit Verification.}
+The circuit checks the prover-supplied multiplicities using the sort gate (Section~\ref{subsec:lookup}), the lookup argument, and the group-by and aggregation gates from PoneglyphDB~\cite{gu2025poneglyphdb}. For each edge $(P, C)$ in the join tree, processed bottom-up:
+
+\begin{enumerate}[leftmargin=*]
+    \item Sort $C^c$ by the shared attributes $K_{PC}$ using the sort gate, producing a sorted relation where tuples with identical keys are adjacent.
+
+    \item Apply the group-by gate on the sorted $C^c$ to identify group boundaries (where the key value changes), then compute the SUM of multiplicities within each group using the aggregation gate. This produces a table mapping each distinct key value to its aggregated multiplicity.
+
+    \item For each tuple $t_P \in P^c$, use a lookup argument on $K_{PC}$ to retrieve the aggregated child multiplicity for the matching key, and multiply it into $\mu(t_P)$ via a multiplication gate.
+\end{enumerate}
+
+\paragraph{Final Aggregation.}
+After propagating multiplicities to the root relation $R_{\text{root}}^c$, the final aggregate is computed directly:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{COUNT(*):} $\sum_{t \in R_{\text{root}}^c} \mu(t)$
+    \item \textbf{SUM(A):} $\sum_{t \in R_{\text{root}}^c} \mu(t) \cdot t.A$
+    \item \textbf{AVG(A):} Computed as SUM(A) / COUNT(*)
+\end{itemize}
+
+\noindent When the aggregate attribute $A$ does not belong to the root relation, the aggregation is performed at the node $R_i$ that owns $A$: we compute the partial aggregate $\sum_{t \in R_i^c} \mu(t) \cdot t.A$ at $R_i$ and propagate the scalar result to the root, rather than propagating individual attribute values.
+
+\noindent\textbf{Complexity.}
+For each edge $(P, C)$, the aggregation requires one sort gate ($O(|C^c|)$), one group-by gate ($O(|C^c|)$), and one Lookup for multiplicity transfer ($O(|P^c| + |C^c|)$). Summing over all $n-1$ edges, the total constraint count is $O(\mathrm{IN} + \mathrm{OUT})$, where $\mathrm{IN} = \sum_i |R_i|$ and $\mathrm{OUT}$ is the size of the final aggregated query output. Crucially, we never materialize the full join result, which could be as large as $O(N^k)$ for a $k$-way join even though it is not part of the public query output.
+
+A worked example demonstrating the full aggregation procedure is provided in Appendix~\ref{app:agg_example}.
+
+\subsection{Projection and Predicates with One-Pass OBJ}
+\label{subsec:projection_predicates}
+
+Beyond aggregation, the One-Pass OBJ naturally supports projection, in-relation predicates (e.g., \texttt{WHERE R1.price > 100}), and cross-relation predicates (e.g., \texttt{WHERE R1.price > R2.budget}) without materializing intermediate results. The key idea is that projection is applied during join enumeration over clean relations, in-relation predicates are folded into the witness split as per-tuple filters adding $O(|R_i|)$ constraints, and cross-relation predicates are checked per output row adding $O(\mathit{OUT})$ constraints. None of these operations affect the overall $O(\mathit{IN} + \mathit{OUT})$ complexity. Details are provided in Appendix~\ref{app:projection_predicates}.
+
+
+\section{Join Gate for Cyclic Joins}
+\label{subsec:cyclic_decomposition}
+
+The previous section developed the OBJ framework for acyclic queries, achieving $O(\mathit{IN} + \mathit{OUT})$ circuit complexity with strict obliviousness. However, many important queries are inherently cyclic, such as cycle detection in graph analytics and multi-way foreign-key chains like TPC-H Q5 (a $6$-way cyclic join). In this section, we introduce the \textbf{DP-Guided Join Gate (DPJ)}, which extends OBJ to cyclic queries by combining tree decomposition with differentially private capacity bounds.
+
+
+\subsection{DP-Guided Join Gate}
+We introduce the notion of a DP-guided join gate in the context of cyclic joins.
+
+\textbf{Definition (DP-Guided Join Gate (DPJ for short)).} We define the \emph{DP-Guided Join Gate} for cyclic join queries as a circuit primitive that verifies the correctness of a \textbf{cyclic} equi-join operation over a set of input relations, by reducing the cyclic query to an acyclic one via tree decomposition and applying OBJ at the inter-cluster level, while using differentially private noisy bounds for intra-cluster circuit capacities.
+\begin{itemize}[leftmargin=*]
+\item \textbf{Input:} A collection of $n$ input relations $\mathcal{R} = \{R_1, \dots, R_n\}$ whose join hypergraph is cyclic, together with a tree decomposition into clusters $\{B_1, \dots, B_p\}$ and a privacy budget $\epsilon$.
+\item \textbf{Output:} A set of fully reduced clean relations $\mathcal{R}^c = \{R_1^c, \dots, R_n^c\}$, where each $R_i^c \subseteq R_i$ contains exactly those tuples that participate in the global join result. As with OBJ, the clean relations serve as a compact representation of the join: downstream operations such as aggregation can be applied directly on $\mathcal{R}^c$ without materializing the full join.
+\end{itemize}
+% Crucially, the DPJ gate adheres to the following structural properties:
+% \begin{enumerate}
+% \item \textbf{Tree Decomposition:} The cyclic query hypergraph is decomposed into a tree of clusters (bags), where each cluster contains a subset of relations whose intra-cluster join is materialized. The inter-cluster structure forms an acyclic join tree.
+% \item \textbf{DP-Guided Capacity:} Intra-cluster circuit capacities are set using differentially private noisy cardinality bounds via a one-sided noise mechanism, guaranteeing $\widetilde{m} \geq m$ (no valid tuples are discarded) while providing $(\epsilon, \delta)$-differential privacy for the intermediate cardinalities.
+% \item \textbf{Tunable Privacy--Efficiency Trade-off:} The privacy budget $\epsilon$ smoothly interpolates between strict obliviousness ($\epsilon = 0$, worst-case padding) and the non-private baseline ($\epsilon \to \infty$, true sizes).
+% \end{enumerate}
+
+\noindent\textbf{Cyclic-to-Acyclic Reduction.}
+%
+The key idea is to reduce a cyclic query to an acyclic one so that the OBJ machinery from Section~\ref{sec:gates} can be reused. We apply standard \emph{tree decomposition}~\cite{gottlob1999hypertree, joglekar2016ajar}: the query hypergraph is decomposed into a tree of \emph{clusters} (bags), where each cluster contains a subset of relations whose join must be materialized. For example, the triangle query $R_1(A,B) \bowtie R_2(B,C) \bowtie R_3(C,A)$ can be decomposed into two clusters $\{R_1, R_2\}$ and $\{R_3\}$. The concrete decompositions for all cyclic queries used in our experiments (Q5, GQ3, GQ4) are detailed in Appendix~\ref{app:cyclic_decomposition}.
+
+Once the cluster tree is obtained, the One-Pass OBJ operates \emph{between} clusters exactly as in the acyclic case---each cluster acts as a single relation whose tuples are the materialized intra-cluster join results. The inter-cluster Conservation Checks, Membership Checks, Non-Membership Checks, and Pairwise Consistency checks all carry over directly from Section~\ref{sec:gates}.
+
+\emph{Within} each cluster, the prover must materialize the join of the relations inside the cluster before it can participate in the inter-cluster OBJ. For a cluster containing relations $\{R_{i_1}, \dots, R_{i_w}\}$, the prover computes the join $R_{i_1} \bowtie \cdots \bowtie R_{i_w}$ offline and provides the result as a witness column. The circuit verifies this intra-cluster join using standard lookup-based binary join gates~\cite{gu2025poneglyphdb}, which check that each output tuple has matching keys in all participating relations.
+
+If a cluster contains $w$ relations each of size~$N$, the worst-case intermediate size is $O(N^w)$. Tree decomposition confines this blowup to within each cluster rather than across the entire query, reducing the worst case from $O(N^k)$ for the original $k$-way join to $O(N^w)$ where $w$ is the treewidth---typically much smaller than $k$. Yet in a strictly oblivious circuit, each intra-cluster intermediate must still be padded to its worst-case bound to hide the true cardinality. For queries with non-trivial treewidth, this padding can still be prohibitively expensive.
+
+\subsection{DP-Guided Relaxation of Obliviousness}
+\label{sec:relax-cyclic}
+
+To further mitigate the potentially high intra-cluster padding cost, we exploit the obliviousness--privacy spectrum introduced in Section~\ref{sec:dp-oblivious}: strict obliviousness ($\epsilon = 0 $ and $\delta = 0$) requires circuit dimensions to be completely independent of the data, while the non-private extreme ($\epsilon \to \infty$) uses true sizes. Between these extremes, DP noisy bounds with certain ($\epsilon$, $\delta$)  on the true cardinalities provide formal privacy guarantees while keeping circuit sizes close to the true data-dependent values.
+
+We instantiate this idea as follows. For each intra-cluster intermediate, the prover computes the true cardinality offline, then adds non-negative DP noise and uses the resulting noisy value as the circuit capacity. This gives a smooth, tunable knob controlled by the privacy budget $\epsilon$ with a fixed negligible value of $\delta$: smaller $\epsilon$ adds more noise (stronger privacy, larger circuits), while larger $\epsilon$ yields tighter bounds (weaker privacy, faster proving).
+
+\vspace{-0.1in}
+\paragraph{Incentive-aligned privacy model.}
+A key observation is that in our ZK database setting, the DP noise protects the \emph{prover's own data} from the verifier. This creates a natural alignment of incentives: any manipulation of the DP mechanism---using too little noise, too much noise, or incorrect sensitivity estimates---harms only the prover, either through privacy loss or increased computation. The verifier is unaffected, since it only cares about the correctness of the final query result, not the intermediate sizes. This incentive alignment allows us to omit in-circuit verification of DP parameters entirely: the circuit need not prove that noise was sampled correctly or that $\epsilon$ meets any threshold. These are the prover's concern alone.
+
+\vspace{-0.1in}
+\paragraph{Sensitivity and one-sided noise.}
+The sensitivity of join size under DP determines the noise magnitude.
+Specifically, we adopt the sensitivity computation method from~\cite{dong2024continual},
+which is based on the maximum frequency of the join keys in each relation across the query.
+In our setting, the prover computes this sensitivity locally and denotes it by $\Delta$.
+A critical requirement is that the noisy capacity $\widetilde{m}$ must meet or exceed the true
+cardinality $m$, since underestimating would discard valid tuples and compromise correctness.
+Standard Laplace mechanism~\cite{dwork2014algorithmic} can produce negative values, violating
+this requirement. We therefore adopt the \emph{one-sided noise mechanism} from Wang et al.~\cite{wang2024special},
+which adds only non-negative noise while preserving $(\epsilon,\delta)$-DP.
+
+Concretely, let $Z$ be drawn from a shifted Laplace distribution with density
+\vspace{-0.1in}
+\begin{equation}
+f_Z(x) \;=\; \frac{e^{\epsilon}-1}{e^{\epsilon}+1}\,\exp\!\bigl(-\epsilon\,\lvert x-\mu\rvert\bigr),
+\qquad
+\mu \;=\; 1 - \frac{1}{\epsilon}\ln\!\bigl(\delta\,(e^{\epsilon}+1)\bigr),
+\label{eq:one_sided_pdf}
+\end{equation}
+and define the one-sided noise $\eta = \max(0,\,Z) \ge 0$.
+The noisy capacity is then
+\vspace{-0.1in}
+\begin{equation}
+\widetilde{m} \;\leftarrow\; m \;+\; \Delta \cdot \eta,
+\label{eq:one_sided_cap}
+\end{equation}
+which guarantees $\widetilde{m}\ge m$, so the circuit capacity never underestimates the true intermediate size.
+
+\vspace{-0.1in}
+\paragraph{Circuit realization.}
+The circuit implementation is straightforward. The prover sets each intra-cluster witness column capacity to the noisy bound. The circuit processes all rows uniformly, using standard ``is\_dummy'' selector columns to exclude padding from downstream computations. No additional constraints are needed for the DP mechanism itself.
+
+
+\vspace{-0.1in}
+\paragraph{Correctness.}
+The correctness of DPJ follows from two independent arguments. First, the inter-cluster join is verified by the One-Pass OBJ (Section~\ref{subsubsec:opt_semijoin}), whose correctness is established in Section~\ref{sec:gates}. Second, each intra-cluster join is verified using binary join gates~\cite{gu2025poneglyphdb} that enforce key matching via lookup arguments. The DP mechanism affects only the \emph{capacity} (padding size) of the intra-cluster witness columns, not the correctness constraints themselves: the one-sided noise guarantees $\widetilde{m} \geq m$, so all valid tuples fit within the allocated capacity and no results are lost.
+
+\vspace{-0.1in}
+\paragraph{Privacy--efficiency trade-off.}
+In practice, even modest privacy budgets ($\epsilon \geq 0.1$) keep the DP-induced padding within a few percent of the non-private lower bound, as confirmed by our experiments in Section~\ref{sec:experiments}.
+%
+\noindent This demonstrates the efficacy of relaxing the obliviousness requirement via our DP strategy, allowing us to improve utility while maintaining rigorous privacy guarantees under the formal $(\epsilon, \delta)$-differential privacy definition.
+
+
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate VPJoin against PoneglyphDB~\cite{gu2025poneglyphdb} on both relational (TPC-H) and graph workloads to demonstrate the efficiency of our witness-guided approach for multi-way join verification. All circuits are implemented in Rust using Halo2~\cite{halo2,halo2-protocol}, a state-of-the-art PLONKish ZKP system.
+
+\begin{table}[t]
+\captionsetup{skip=2pt}
+\centering
+\caption{Summary of properties for selected queries.}
+\label{table:query_stat}
+\renewcommand\arraystretch{1.0}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{|c|c|c|c|c|c|c|c|c|c|}
+\hline
+\bfseries Queries  & \bfseries Q3  & \bfseries Q5 & \bfseries Q8 & \bfseries Q9 & \bfseries Q18 & \bfseries GQ1 & \bfseries GQ2 & \bfseries GQ3 & \bfseries GQ4  \\\hline
+\bfseries Cyclic?   & No & Yes & No & No & No & No & No & Yes & Yes \\\hline
+\bfseries Join arity & 3 & 6 & 8  & 6  & 3 & 3  & 4 & 3  & 4   \\\hline
+\end{tabular}%
+}
+\vspace{-0.1in}
+\end{table}
+
+\subsection{Setup}
+
+\subsubsection{Implementation}
+Our system is built on the Halo2 proving stack (Section~\ref{subsec:crypto}), which provides a PLONKish arithmetization backend with native support for custom gates, lookup arguments, and permutation constraints---all essential to our OBJ design. All relational attribute values, including join keys, filter predicates, and aggregation operands, are encoded as Pallas scalar field elements. Following prior ZK database work~\cite{li2023zksql, gu2025poneglyphdb}, we convert all floating-point values to $64$-bit integer representations before circuit encoding, ensuring deterministic arithmetic within the finite field.
+
+\subsubsection{Datasets}
+We evaluate on two categories of datasets.
+
+\paragraph{TPC-H Benchmark.}
+We use the TPC-H benchmark~\cite{TPC-H2023}, the standard workload for evaluating analytical query performance. The database scale is determined by the size of the central fact table, \texttt{lineitem}, with all dimension tables scaled proportionally according to the TPC-H specification. We report results across three database sizes---60K, 120K, and 240K rows---referring to the number of rows in \texttt{lineitem}. Unless otherwise stated, experiments use the 60K configuration as the default. To maintain consistency across runs, we fix all query parameters (e.g., date filters in \texttt{orderdate}) to the same constant values. For query Q9, following prior work~\cite{li2023zksql}, we exclude string pattern-matching predicates (\texttt{LIKE}) from the evaluation, as string operations are orthogonal to join verification and incur disproportionate circuit cost.
+
+\paragraph{Network Datasets.}
+To evaluate graph-style join queries involving self-joins, we use three real-world social and information network datasets from the Stanford Network Analysis Project (SNAP)~\cite{snapnets}:
+\begin{itemize}[leftmargin=*, itemsep=0.1em]
+    \item \textbf{LastFM}~\cite{snap_lastfm}: a social network with $27{,}806$ edges,
+    \item \textbf{Facebook}~\cite{snap_facebook}: an ego-network with $88{,}234$ edges,
+    \item \textbf{Wikipedia Vote}~\cite{snap_wikivote}: a voting network with $103{,}689$ edges.
+\end{itemize}
+Each dataset is represented as a single \texttt{Edge(src, dst)} relation. Graph queries are expressed as multi-way self-joins over this relation, with join predicates on \texttt{src} and \texttt{dst} attributes encoding path and cycle patterns.
+
+
+\begin{figure*}
+% \setlength{\abovecaptionskip}{0.cm}
+% \setlength{\belowcaptionskip}{-0.2cm}
+\centerline{\psfig{figure=pics/expe/time_combined.pdf, width=0.98\textwidth} }
+\captionsetup{skip=2pt} 
+\caption{Proving time for 5
+TPC-H SQL queries on TPC-H Benchmark and 4 graph SQL queries on 3 network datasets.}
+\label{fig:proving_time}
+\vspace{-0.2in}
+\end{figure*}
+\subsubsection{Queries}
+We select $5$ TPC-H queries, Q3, Q5, Q8, Q9, and Q18---that span a range of join arities (from $3$-way to $8$-way) and include both acyclic and cyclic join structures. Q5 is the only cyclic query among all $22$ TPC-H queries, making it a particularly interesting stress test for our cyclic-join decomposition strategy. In addition, we design $4$ graph queries---GQ1, GQ2, GQ3, and GQ4---and evaluate them on all three network datasets. GQ1 is a $3$-way path query, GQ2 is a $4$-way path query, GQ3 is a $3$-way cycle (triangle) query, and GQ4 is a $4$-way cycle query. 
+% All graph queries use self-joins, since each network dataset consists of a single \texttt{Edge} relation.
+
+Table~\ref{table:query_stat} summarizes the key structural properties of all $9$ queries. The \emph{join arity} denotes the number of relations participating in the join. The full SQL definitions of the graph queries are provided in the appendix~\ref{app:graph_query}.
+
+
+
+
+
+
+
+
+
+
+
+
+\subsubsection{Hardware and Runtime Environment}
+All experiments are conducted on a Linux server equipped with dual AMD EPYC 9555 64-core processors (128 cores / 256 threads total) and approximately 2\,TB of DDR5 memory. Proving times are measured as wall-clock time for the end-to-end proof generation pipeline, which includes witness generation, circuit synthesis, and proof construction. Verification time is not reported separately, as it is negligible (typically under $10$\,ms for all queries) due to the succinctness of the Halo2 proof system.
+
+\subsubsection{Baseline}
+We compare VPJoin against PoneglyphDB~\cite{gu2025poneglyphdb}, the state-of-the-art non-interactive ZK database system. PoneglyphDB is built on the same Halo2 proving backend and PLONKish arithmetization, uses the same IPA commitment scheme with identical security parameters (Pasta curves, $\approx$128-bit security), and supports a comparable fragment of SQL including multi-way joins.
+% This shared infrastructure enables a direct, apples-to-apples comparison of the join verification strategy: PoneglyphDB decomposes multi-way joins into sequential binary joins and materializes all intermediate results within the circuit, whereas VPJoin uses witness-guided verification to check semijoin-reduced witnesses without intermediate materialization. 
+Since PoneglyphDB's circuit sizes for high-arity joins grow to worst-case intermediate bounds (up to $O(N^k)$ for a $k$-way join), actually executing its prover is infeasible for many of the tested queries. In such cases, we estimate PoneglyphDB's proving time from its constraint count, using the empirically measured linear relationship between constraint count and wall-clock proving time in Halo2. VPJoin's proving times are all directly measured.
+
+\subsubsection{Differential Privacy Configuration}
+\label{subsubsec:dp_config}
+For cyclic queries, VPJoin optionally applies DP-guided padding (Section~\ref{sec:relax-cyclic}) to reduce the cost of worst-case intra-cluster capacity bounds.
+We use the one-sided noise mechanism~\cite{wang2024special} with total privacy budget $(\epsilon,\delta)$, where $\delta = 10^{-5}$.
+Each intra-cluster intermediate cardinality estimate constitutes one DP step consuming budget~$\epsilon/k$, where $k$ is the number of such estimates in the query; the total privacy cost is $(\epsilon, k\delta)$ by basic composition.
+We run $10$ independent rounds of noise sampling and report the average proving time to mitigate variance from randomized padding. Unless otherwise stated, the default total budget is $\epsilon = 0.1$.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\subsection{Proving Time}
+\label{subsec:proving_time}
+
+We compare the end-to-end proving time of VPJoin and PoneglyphDB on both TPC-H and graph query workloads. All results are plotted on a logarithmic scale due to the vast difference in magnitude between the two systems.
+
+\paragraph{TPC-H Queries.}
+Figure~\ref{fig:proving_time} (a) reports the proving time for the five TPC-H queries on the default 60K-row database. VPJoin achieves proving times on the order of $10^3$--$10^4$ seconds across all queries. In contrast, PoneglyphDB's proving times range from approximately $10^{9}$ seconds for the $3$-way joins (Q3, Q18) to over $10^{19}$ seconds for Q8, the most complex $8$-way join. The gap grows with join arity: for the $3$-way joins, VPJoin is roughly $6$--$7$ orders of magnitude faster; for Q5 and Q9 (both $6$-way joins), the advantage widens to $9$--$13$ orders of magnitude; and for Q8 (an $8$-way join), VPJoin is over $16$ orders of magnitude faster.
+
+This dramatic disparity stems directly from the difference in join verification strategy. PoneglyphDB decomposes each multi-way join into a sequence of binary joins and must provision circuit capacity for each materialized intermediate result, padded to worst-case cardinality bounds. For an $8$-way join like Q8, the accumulated intermediate blowup renders the circuit astronomically large. VPJoin, by contrast, uses witness-guided verification: the prover supplies semijoin-reduced witnesses, and the circuit checks structural invariants (Conservation, Membership, and Non-Membership Checks) along join-tree edges without materializing any intermediate join result. The circuit size therefore scales with $O(\mathit{IN} + \mathit{OUT})$ rather than with worst-case intermediate cardinalities.
+
+Among the five queries, the proving time of VPJoin on Q5 stands out because it is the only cyclic TPC-H query (join arity $6$) for which VPJoin applies tree decomposition and pads intra-cluster intermediates to worst-case bounds (full obliviousness), resulting in a higher proving time ($\sim\!10^4$\,s) compared to the acyclic queries ($\sim\!10^3$\,s). Section~\ref{subsec:dp_eval} shows that DP-guided padding (Section~\ref{sec:relax-cyclic}) reduces this overhead dramatically.
+
+\paragraph{Graph Queries.}
+Figure~\ref{fig:proving_time} (b)-(d) report the proving time for GQ1--GQ4 across the three network datasets. For the acyclic path queries (GQ1 and GQ2), VPJoin achieves proving times of approximately $10^3$--$10^{3.5}$ seconds, while PoneglyphDB's estimated times exceed $10^{11}$ seconds on all three datasets, yielding a gap of $8$--$9$ orders of magnitude. For the cyclic queries (GQ3 and GQ4), VPJoin with full obliviousness (worst-case padding) reaches approximately $10^7$ seconds, while PoneglyphDB's times reach $10^{12}$--$10^{13.5}$ seconds, giving VPJoin a clear $4$--$6$ order-of-magnitude advantage. 
+
+% As shown in Section~\ref{subsec:dp_eval}, DP-guided padding reduces the cyclic query cost to under $10^3$ seconds.
+
+Across all three datasets, the relative performance pattern is consistent: the gap is largest for acyclic queries (GQ1, GQ2), where VPJoin achieves worst-case optimal $O(\mathit{IN}+\mathit{OUT})$ circuit complexity, and narrows for cyclic queries (GQ3, GQ4), where worst-case padding of intra-cluster intermediates increases circuit capacity. As dataset size increases from LastFM ($27{,}806$ edges) to Wikipedia ($103{,}689$ edges), PoneglyphDB's estimated times grow faster than VPJoin's, reflecting the multiplicative effect of intermediate materialization on larger inputs.
+
+
+
+
+
+
+\begin{figure}
+% \setlength{\abovecaptionskip}{0.cm}
+% \setlength{\belowcaptionskip}{-0.2cm}
+\centerline{\psfig{figure=pics/expe/scale.pdf, width=0.4\textwidth} }
+\captionsetup{skip=2pt}
+\caption{Proving time over data of increasing sizes. Q5 (cyclic) uses DP-guided padding with $\epsilon=0.1$; all other queries use full obliviousness.}
+\label{fig:scalability}
+\vspace{-0.2in}
+\end{figure}
+
+\subsection{Scalability}
+\label{subsec:scalability}
+We evaluate how VPJoin's proving time scales with increasing database size. Figure~\ref{fig:scalability} reports the proving time for all five TPC-H queries at three scales: 60K, 120K, and 240K rows in the \texttt{lineitem} table, with dimension tables scaled proportionally. Since Q5 is the only cyclic TPC-H query, its fully oblivious cost is dominated by worst-case intra-cluster padding (see Section~\ref{subsec:dp_eval}); to make the scalability trend comparable, we report Q5 with DP-guided padding at $\epsilon=0.1$.
+
+Across all queries, doubling the input size approximately doubles the proving time. For example, Q3 increases from roughly $155$\,s (60K) to $315$\,s (120K) to $600$\,s (240K), and Q18 follows a similar trajectory from $155$\,s to $300$\,s to $590$\,s. This near-linear scaling is consistent with VPJoin's theoretical circuit complexity of $O(\mathit{IN} + \mathit{OUT})$ for acyclic queries: the number of constraints grows proportionally to the total input and output size, and Halo2's proving time is linear in the constraint count.
+
+Q9 exhibits the highest absolute proving time at every scale ($350$\,s, $700$\,s, $1{,}380$\,s for 60K, 120K, 240K, respectively), approximately $2\times$ the cost of Q3 or Q18. This is expected given that Q9 involves a $6$-way join over larger dimension tables, resulting in a proportionally larger total input size $\mathit{IN}$ and output size $\mathit{OUT}$. Despite the higher absolute cost, Q9's growth rate remains linear, confirming that the per-query overhead scales with data volume rather than with join complexity.
+
+The remaining queries (Q5, Q8) fall between these extremes, with Q5 at approximately $170$\,s/$335$\,s/$660$\,s and Q8 at approximately $180$\,s/$355$\,s/$700$\,s. Notably, Q8 is an $8$-way join yet its proving time is comparable to Q3 (a $3$-way join), because VPJoin's circuit cost depends on input and output sizes rather than join arity. This demonstrates a key advantage of the witness-guided verification approach: the proving cost is decoupled from the number of joins, scaling only with the data volume.
+
+
+
+
+\begin{figure}
+% \setlength{\abovecaptionskip}{0.cm}
+% \setlength{\belowcaptionskip}{-0.2cm}
+\centerline{\psfig{figure=pics/expe/ob_dp.pdf, width=0.43\textwidth} }
+\captionsetup{skip=2pt} 
+\caption{Impact of privacy constraints on proving time.}
+\label{fig:privacy}
+\vspace{-0.2in}
+\end{figure}
+
+\begin{figure}
+% \setlength{\abovecaptionskip}{0.cm}
+% \setlength{\belowcaptionskip}{-0.2cm}
+\centerline{\psfig{figure=pics/expe/dp_para_q5.pdf, width=0.45\textwidth} }
+\captionsetup{skip=2pt} 
+\caption{Proving time of Q5 for various $\epsilon$ values.}
+\label{fig:q5_privacy}
+\vspace{-0.2in}
+\end{figure}
+
+\subsection{Privacy--Efficiency Trade-off for Cyclic Joins}
+\label{subsec:dp_eval}
+
+For acyclic queries, VPJoin achieves strict obliviousness at $O(\mathit{IN}+\mathit{OUT})$ cost. Cyclic queries, however, require tree decomposition, which introduces intra-cluster intermediates whose worst-case sizes can reach $O(N^k)$. Padding to these worst-case bounds preserves full obliviousness but incurs substantial proving overhead. We therefore evaluate the DP-guided padding strategy (Section~\ref{sec:relax-cyclic}), which replaces worst-case bounds with differentially private noisy cardinality estimates, and compare three privacy regimes:
+\begin{itemize}[leftmargin=*, itemsep=0.1em]
+    \item \textbf{VPJoin} (full obliviousness): circuit capacities are set to worst-case upper bounds, revealing no information about intermediate cardinalities.
+    \item \textbf{VPJoin + DP}: circuit capacities are set using noisy cardinality bounds satisfying $(\epsilon,\delta)$-differential privacy, with controlled leakage.
+    \item \textbf{Revealing Join Size}: circuit capacities match the true intermediate cardinalities, providing no privacy protection on join sizes but serving as a lower bound on proving time.
+\end{itemize}
+The DP configuration (noise mechanism, $\epsilon$, $\delta$, and averaging protocol) is specified in Section~\ref{subsubsec:dp_config}.
+
+\paragraph{Overall comparison of the three regimes.}
+Figure~\ref{fig:privacy} reports the proving time of the three cyclic queries (Q5, GQ3, GQ4) under each regime. Full obliviousness (VPJoin) incurs proving times of approximately $17{,}100$\,s for Q5 and exceeding $10^7$\,s for GQ3 and GQ4, reflecting the cost of worst-case padding on decomposed intermediates. In contrast, VPJoin + DP ($\epsilon=0.1$) reduces the proving time to $188$\,s (Q5), $687$\,s (GQ3), and $937$\,s (GQ4)---improvements of roughly $2$, $4$, and $4$ orders of magnitude, respectively. These DP-guided times are remarkably close to the Revealing Join Size baseline ($171$\,s, $671$\,s, $934$\,s), incurring only $2$--$10$\% overhead. This demonstrates that DP-guided padding nearly eliminates the cost of obliviousness for cyclic joins while still providing formal $(\epsilon,\delta)$-DP guarantees on the leaked circuit dimensions.
+
+\paragraph{Sensitivity to privacy budget $\epsilon$.}
+Figure~\ref{fig:q5_privacy} shows VPJoin + DP proving time as a function of $\epsilon$ for Q5, with the fully oblivious and Revealing Join Size baselines as reference lines. The DP curve decreases smoothly from approximately $340$\,s at $\epsilon = 0.01$ to $171$\,s at $\epsilon \ge 2$, converging to the no-privacy baseline. At the default $\epsilon = 0.1$, the proving time is approximately $188$\,s, only about $10\%$ above the lower bound. The graph queries GQ3 and GQ4 exhibit the same trend: the DP-guided proving time decreases monotonically as $\epsilon$ grows and converges to the Revealing Join Size baseline once $\epsilon$ reaches $1$--$2$, at which point the added noise becomes negligible. Per-dataset breakdowns are provided in Appendix~\ref{app:dp_sensitivity}.
+
+These results confirm that moderate privacy budgets ($\epsilon \ge 0.1$) suffice to keep the DP overhead within a small fraction of the no-privacy baseline, while providing meaningful differential privacy guarantees on intermediate join cardinalities. Even with a stringent budget of $\epsilon = 0.01$, the DP-guided proving time remains orders of magnitude below the fully oblivious alternative, making DP-guided padding a practical and principled approach for cyclic join verification.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented VPJoin, which verifies multi-way joins via witness-guided semijoin reductions instead of re-executing the join inside the circuit. For acyclic queries, the Oblivious Join Gate (OBJ) achieves worst-case optimal $O(\mathit{IN} + \mathit{OUT})$ circuit complexity with free obliviousness and supports aggregation without join materialization. For cyclic queries, the DP-Guided Join Gate (DPJ) combines tree decomposition with differentially private capacity bounds under a total budget $(\epsilon,\delta)$, adding only $2$--$10\%$ overhead at $\epsilon = 0.1$. On five TPC-H and four graph queries, VPJoin outperforms PoneglyphDB by $6$--$16$ and $4$--$9$ orders of magnitude, respectively.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{paperBib}
+
+\appendix
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.5\textwidth]{pics/plonkish1.pdf}
+\vspace{-0.1in}
+\captionsetup{skip=2pt}
+\caption{PLONKish circuits illustration for SQL query ``SELECT SUM(B) FROM R''.}
+\vspace{-0.2in}
+\label{fig:plonkish}
+\end{figure}
+
+\section{PLONKish Circuit Example}
+\label{sec:plonkish_example}
+
+
+
+\begin{example}
+Figure~\ref{fig:plonkish} illustrates a PLONKish circuit that evaluates the SQL query
+\texttt{SELECT SUM(B) FROM R}. The relation $R$ consists of two attributes, $A$ and $B$.
+The circuit uses two advice columns, $A$ and $B$, to store the input tuples.
+
+To perform the summation, we introduce an additional advice column $I$ that stores
+intermediate partial sums. We denote the value in column $X \in \{A,B,I,O\}$ at row $i$
+(1-indexed) by $X_i$.
+
+In row~1, we initialize the accumulator by setting $I_1 = 0$ and enforce the polynomial constraint $I_1 - 0 = 0$, which ensures that the summation starts from zero.
+For each subsequent row $i \ge 2$, the circuit adds the previous value in column $B$
+to the running sum. Specifically, in row~2 we add $B_1$ to $I_1$ and store the result in
+$I_2$. This is enforced by the constraint $B_1 + I_1 - I_2 = 0$.
+Similarly, in rows~3 and~4, the circuit enforces
+$B_2 + I_2 - I_3 = 0$ and $B_3 + I_3 - I_4 = 0$, respectively, thereby accumulating the sum of all values in column $B$.
+
+Finally, the value $I_4$, which equals $\sum_{i=1}^{3} B_i$, is copied into the public
+instance column at position $O_1$ using a copy (equality) constraint. This allows the
+verifier to read the final output of the computation while all intermediate values remain
+private.
+\end{example}
+
+
+
+\section{Aggregation Example}
+\label{app:agg_example}
+
+\begin{figure*}[t]
+    \centering
+    \vspace{-0.1in}
+    \includegraphics[width=\linewidth]{pics/agg_example.pdf}
+    \vspace{-0.2in}
+    \caption{Aggregation via tuple multiplicities for \texttt{SELECT $A$, COUNT(*), SUM($D$) FROM $R_1$, $R_2$, $R_3$ WHERE $R_1.B = R_2.B$ AND $R_2.C = R_3.C$ GROUP BY $A$}.}
+    \vspace{-0.1in}
+    \label{fig:agg_example}
+\end{figure*}
+
+\begin{example}[Aggregation via tuple multiplicities]
+\label{ex:aggregation}
+Continuing from Example~\ref{ex:one_pass_obj} with the same clean relations
+$R_1^c = \{(1,1),(2,1)\}$, $R_2^c = \{(1,11)\}$, $R_3^c = \{(11,4),(11,2)\}$
+and join tree rooted at~$R_2$, we compute
+\texttt{SELECT $A$, COUNT(*), SUM($D$) \dots\ GROUP BY $A$} without materializing the join result (see Figure~\ref{fig:agg_example}).
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Initialize leaf multiplicities.}
+    Every tuple in a leaf relation gets $\mu = 1$:
+    $R_1^c$: $(1,1)\!\mapsto\!1$, $(2,1)\!\mapsto\!1$;\quad
+    $R_3^c$: $(11,4)\!\mapsto\!1$, $(11,2)\!\mapsto\!1$.
+
+    \item \textbf{Process edge $(R_2, R_1)$ on $B$.}
+    Sort $R_1^c$ by~$B$ and group: key $B\!=\!1$ has $\Sigma\mu = 1 + 1 = 2$.
+    Lookup into $R_2^c$: tuple $(1,11)$ receives $\mu_L = 2$.
+
+    \item \textbf{Process edge $(R_2, R_3)$ on $C$.}
+    Sort $R_3^c$ by~$C$ and group: key $C\!=\!11$ has $\Sigma\mu = 1 + 1 = 2$.
+    In the same pass, compute the partial aggregate $\sum \mu \cdot D = 1{\cdot}4 + 1{\cdot}2 = 6$ for key $C\!=\!11$.
+    Lookup into $R_2^c$: tuple $(1,11)$ receives $\mu_R = 2$ and partial $\text{SUM}(D) = 6$.
+
+    \item \textbf{Multiply at root.}
+    $\mu(1,11) = \mu_L \times \mu_R = 2 \times 2 = 4$.
+
+    \item \textbf{Group-by and final aggregates.}
+    Since the query groups by~$A$ and $A \in R_1$ (a leaf), per-group aggregates are computed at~$R_1^c$.
+    Each tuple $(a,1) \in R_1^c$ matches the root tuple $(1,11)$, whose right-branch multiplicity is $\mu_R = 2$ and partial $\text{SUM}(D) = 4+2 = 6$.
+    \begin{itemize}[leftmargin=*]
+        \item $A\!=\!1$:\; $\texttt{COUNT(*)} = 1 \cdot \mu_R = 2$,\quad $\texttt{SUM(D)} = 1 \cdot 6 = 6$.
+        \item $A\!=\!2$:\; $\texttt{COUNT(*)} = 1 \cdot \mu_R = 2$,\quad $\texttt{SUM(D)} = 1 \cdot 6 = 6$.
+    \end{itemize}
+    \texttt{AVG(D)} per group is simply $\texttt{SUM(D)} / \texttt{COUNT(*)} = 6/2 = 3$.
+\end{enumerate}
+
+\noindent These match the full join result $\{(1,1,11,4),\,(2,1,11,4),\,(1,1,11,2),\,(2,1,11,2)\}$ grouped by~$A$: each group has 2~tuples with $D \in \{4,2\}$, giving COUNT $= 2$ and SUM(D) $= 6$---all computed without materializing the join.
+\end{example}
+
+
+\section{Projection and Predicates with One-Pass OBJ}
+\label{app:projection_predicates}
+
+\noindent\textbf{Projection.}
+Many analytical queries project the join result onto a subset of attributes (e.g., \texttt{SELECT R1.A, R2.B FROM R1 JOIN R2 JOIN R3 \ldots}). In existing ZK database systems, projection is applied only after the full join is materialized, so the circuit must still accommodate the entire $O(N^k)$ intermediate. In our framework, the OBJ produces clean relations $\mathcal{R}^c$ that are subsets of the original input tables. When the query is a free-connex acyclic query---that is, the output attributes form a connected subset within the join tree---the final join result can be enumerated directly from the clean relations, and projection is applied during this enumeration by copying only the required attribute columns to the output. Relations outside the output subtree contribute only to the semijoin reductions (filtering non-participating tuples) but their non-key attributes never appear in the output circuit. Since projection merely selects a subset of columns from the clean relations and the enumerated output, it introduces no additional constraints beyond those already required by the One-Pass OBJ and the final join enumeration.
+
+\noindent\textbf{In-Relation Predicates.}
+Queries frequently include selection predicates on a single relation---for example, \texttt{WHERE R1.price > 100}. Because each such predicate references only attributes within one input table, it can be evaluated as a per-tuple filter before the OBJ begins: the prover incorporates the predicate into the witness split, placing tuples that fail the condition directly into the residual set. The circuit verifies each tuple in $R_i$ against the predicate with a single arithmetic constraint (e.g., a range-check gate for inequalities), adding at most $O(|R_i|)$ constraints per relation---fully absorbed into the existing $O(\mathit{IN})$ bound.
+
+\noindent\textbf{Cross-Relation Predicates.}
+Queries often include selection predicates that reference attributes from multiple relations---for example, \texttt{WHERE R1.price > R2.budget}. In existing systems, such predicates can only be evaluated after materializing the binary join that brings these attributes together, again requiring $O(N^k)$ worst-case circuit capacity. In contrast, cross-relation predicates can be verified during the final join enumeration over the clean relations in our framework. For each output tuple---which combines attributes from multiple clean relations---the circuit enforces the predicate as an additional arithmetic constraint (e.g., a range check for inequality predicates or an equality gate for exact matches). Since these constraints are applied per output row, they add at most $O(\mathit{OUT})$ constraints and do not affect the overall $O(\mathit{IN} + \mathit{OUT})$ complexity. Importantly, no intermediate relation needs to be materialized to evaluate these predicates: the clean relations already identify which input tuples participate, and the predicate is checked only on the final combined output.
+
+
+
+\section{Queries}
+\label{app:graph_query}
+The complete $4$ graph queries are shown below:
+
+\subsection{Graph Queries}
+\paragraph{GQ 1: 3-way path.}
+\[
+\begin{aligned}
+\texttt{SELECT}\ &\texttt{COUNT(*) AS cnt}\\
+\texttt{FROM}\ &\texttt{Edge}\ \texttt{r1}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r2}\ \texttt{ON}\ \texttt{r1.dst = r2.src}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r3}\ \texttt{ON}\ \texttt{r2.dst = r3.src;}\\
+\texttt{WHERE}\ &\texttt{r1.src < r2.src AND r2.src < r3.src;}
+\end{aligned}
+\]
+
+\paragraph{GQ 2: 4-way path.}
+\[
+\begin{aligned}
+\texttt{SELECT}\ &\texttt{COUNT(*) AS cnt}\\
+\texttt{FROM}\ &\texttt{Edge}\ \texttt{r1}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r2}\ \texttt{ON}\ \texttt{r1.dst = r2.src}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r3}\ \texttt{ON}\ \texttt{r2.dst = r3.src}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r4}\ \texttt{ON}\ \texttt{r3.dst = r4.src;}\\
+\texttt{WHERE}\ &\texttt{r1.src < r2.src}\\
+&\texttt{AND r2.src < r3.src}\\
+&\texttt{AND r3.src < r4.src;}
+\end{aligned}
+\]
+
+
+
+\paragraph{GQ 3: 3-way cycle.}
+\[
+\begin{aligned}
+\texttt{SELECT}\ &\texttt{COUNT(*) AS cnt}\\
+\texttt{FROM}\ &\texttt{Edge}\ \texttt{r1}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r2}\ \texttt{ON}\ \texttt{r1.dst = r2.src}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r3}\ \texttt{ON}\ \texttt{r2.dst = r3.src}\\
+&\hspace{3.3em}\texttt{AND}\ \texttt{r3.dst = r1.src}\\
+\texttt{WHERE}\ &\texttt{r1.src < r2.src AND r2.src < r3.src;}
+\end{aligned}
+\]
+
+\paragraph{GQ 4: 4-way cycle.}
+\[
+\begin{aligned}
+\texttt{SELECT}\ &\texttt{COUNT(*) AS cnt}\\
+\texttt{FROM}\ &\texttt{Edge}\ \texttt{r1}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r2}\ \texttt{ON}\ \texttt{r1.dst = r2.src}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r3}\ \texttt{ON}\ \texttt{r2.dst = r3.src}\\
+\texttt{JOIN}\ &\texttt{Edge}\ \texttt{r4}\ \texttt{ON}\ \texttt{r3.dst = r4.src}\\
+&\hspace{3.3em}\texttt{AND}\ \texttt{r4.dst = r1.src}\\
+\texttt{WHERE}\ &\texttt{r1.src < r2.src}\\
+&\texttt{AND r2.src < r3.src}\\
+&\texttt{AND r3.src < r4.src;}
+\end{aligned}
+\]
+
+
+
+
+\subsection{Cyclic Query Decomposition}
+\label{app:cyclic_decomposition}
+
+We describe how the three cyclic queries (Q5, GQ3, GQ4) are decomposed into acyclic cluster trees for the DPJ gate (Section~\ref{subsec:cyclic_decomposition}).
+
+\paragraph{TPC-H Q5.}
+We abbreviate the six tables as $C$ (customer), $O$ (orders), $L$ (lineitem), $S$ (supplier), $N$ (nation), $R$ (region), and write $ok$, $ck$, $sk$, $nk$, $rk$ for \texttt{orderkey}, \texttt{custkey}, \texttt{suppkey}, \texttt{nationkey}, \texttt{regionkey}.
+Q5 is a 6-way join whose join graph contains a 4-way cycle among $C$, $O$, $L$, and $S$: they are connected through both the transactional path ($O.ck{=}C.ck$, $L.ok{=}O.ok$, $L.sk{=}S.sk$) and the shared nationality constraint ($C.nk{=}S.nk$). The remaining tables $N$ and $R$ join acyclically via $nk$ and $rk$ and thus do not require materialization into bags. We break the cycle by grouping the four cyclic relations into two bags:
+\begin{itemize}[leftmargin=*, itemsep=0.1em]
+    \item \textbf{Bag 1} $\{O, C\}$: materialize $O \bowtie C$ with the date filter, producing tuples $(ok, nk)$.
+    \item \textbf{Bag 2} $\{L, S\}$: materialize $L \bowtie S$, producing tuples $(ok, nk, \mathit{price}, \mathit{disc})$.
+\end{itemize}
+The inter-cluster join tree has four nodes---Bag~1, Bag~2, $N$, $R$: Bag~2 joins Bag~1 on $(ok, nk)$, Bag~2 joins $N$ on $nk$, and $N$ joins $R$ on $rk$. This tree is acyclic, so the One-Pass OBJ verifies all inter-cluster joins. Only the two bags require intra-cluster materialization, and their padding capacities are set using DP-guided noisy bounds (Section~\ref{sec:relax-cyclic}).
+
+\paragraph{GQ3 (3-way cycle / triangle).}
+GQ3 counts triangles $A \to B \to C \to A$ with $A < B < C$ over the \texttt{Edge}$(src, dst)$ relation, using three self-join instances $r_1, r_2, r_3$. The cycle arises from the closing edge $r_3.dst = r_1.src$. We decompose via the separator $(A, C)$:
+\begin{itemize}[leftmargin=*, itemsep=0.1em]
+    \item \textbf{Bag 1} $\{r_1, r_2\}$: materialize the 2-hop path $A \to B \to C$ (wedges).
+    \item \textbf{Bag 2} $\{r_3\}$: the closing edge $C \to A$.
+\end{itemize}
+The separator variables are $(A, C)$. Bag~2 sends a message to Bag~1: for each distinct $(A, C)$ key, the count of closing edges $C \to A$. The final answer aggregates over Bag~1, weighting each wedge by the Bag~2 count and enforcing $A < B < C$.
+
+\paragraph{GQ4 (4-way cycle).}
+GQ4 counts 4-cycles $A \to B \to C \to D \to A$ with $A < B < C < D$ over the \texttt{Edge}$(src, dst)$ relation, using four self-join instances $r_1, r_2, r_3, r_4$. The cycle arises from $r_4.dst = r_1.src$. We decompose via a diagonal cut on $(A, C)$:
+\begin{itemize}[leftmargin=*, itemsep=0.1em]
+    \item \textbf{Bag 1} $\{r_1, r_2\}$: materialize the path $A \to B \to C$.
+    \item \textbf{Bag 2} $\{r_3, r_4\}$: materialize the path $C \to D \to A$.
+\end{itemize}
+The separator variables are $(A, C)$. Bag~2 sends a message to Bag~1: for each $(A, C)$ key, the count of paths $C \to D \to A$ satisfying $C < D$. The final answer aggregates over Bag~1, weighting each path $A \to B \to C$ by the Bag~2 count and enforcing $A < B < C$.
+
+\begin{figure*}
+% \setlength{\abovecaptionskip}{0.cm}
+% \setlength{\belowcaptionskip}{-0.2cm}
+\centerline{\psfig{figure=pics/expe/dp_para_gq3.pdf, width=0.98\textwidth} }
+\captionsetup{skip=2pt} 
+\caption{Proving time of graph queries $GQ3$ for various $\epsilon$ values on $3$ network datasets.}
+\label{fig:gq3_privacy}
+\vspace{-0.2in}
+\end{figure*}
+
+\begin{figure*}
+% \setlength{\abovecaptionskip}{0.cm}
+% \setlength{\belowcaptionskip}{-0.2cm}
+\centerline{\psfig{figure=pics/expe/dp_para_gq4.pdf, width=0.98\textwidth} }
+\captionsetup{skip=2pt} 
+\caption{Proving time of graph queries $GQ4$ for various $\epsilon$ values on $3$ network datasets.}
+\label{fig:gq4_privacy}
+\vspace{-0.2in}
+\end{figure*}
+
+\section{Detailed Privacy Budget Sensitivity for Graph Queries}
+\label{app:dp_sensitivity}
+
+This section provides a detailed, per-dataset analysis of the privacy budget sensitivity for the cyclic graph queries GQ3 and GQ4, complementing the summary presented in Section~\ref{subsec:dp_eval}. For each query, Figures~\ref{fig:gq3_privacy} and~\ref{fig:gq4_privacy} plot the proving time of three configurations---Revealing Join Size (blue, dashed), VPJoin + DP (orange, solid), and VPJoin with full obliviousness (green, dashed)---as a function of $\epsilon$ on the LastFM, Facebook, and Wikipedia Vote datasets. Note that the y-axes use a broken scale: the upper portion shows the (estimated) VPJoin proving time and the lower portion shows the VPJoin + DP and Revealing Join Size proving times.
+
+\paragraph{GQ3 (3-way cycle).}
+Figure~\ref{fig:gq3_privacy} reports the $\epsilon$-sensitivity for GQ3. On LastFM ($27{,}806$ edges), the VPJoin + DP proving time decreases from approximately $820$\,s at $\epsilon = 0.01$ to $670$\,s at $\epsilon \ge 2$, converging to the Revealing Join Size baseline of roughly $670$\,s. The fully oblivious VPJoin time is estimated at approximately $5.18 \times 10^{11}$\,s, which is entirely infeasible. On Facebook ($88{,}234$ edges), the DP curve ranges from approximately $10{,}200$\,s ($\epsilon = 0.01$) down to $9{,}200$\,s ($\epsilon \ge 2$), against a Revealing Join Size baseline of roughly $9{,}200$\,s and a VPJoin estimate of $7.19 \times 10^{13}$\,s. On Wikipedia ($103{,}689$ edges), the DP curve ranges from approximately $11{,}200$\,s ($\epsilon = 0.01$) to $10{,}100$\,s ($\epsilon \ge 2$), with the baseline at roughly $10{,}050$\,s and the VPJoin estimate at $1.08 \times 10^{14}$\,s.
+
+Across all three datasets, the DP overhead at the default $\epsilon = 0.1$ is modest: roughly $4\%$ above the Revealing Join Size baseline on LastFM, $2\%$ on Facebook, and $3\%$ on Wikipedia. This overhead arises from the additional padding rows introduced by the Laplace noise, which translate directly into extra circuit constraints. As $\epsilon$ increases beyond $1$, the noise magnitude becomes negligible relative to the true intermediate cardinalities, and the DP curve converges to the no-privacy baseline.
+
+\paragraph{GQ4 (4-way cycle).}
+Figure~\ref{fig:gq4_privacy} reports the analogous results for GQ4. On LastFM, the DP curve decreases from approximately $964$\,s ($\epsilon = 0.01$) to $934$\,s ($\epsilon \ge 2$), converging to the Revealing Join Size baseline of roughly $934$\,s. The VPJoin estimate is approximately $7.21 \times 10^{11}$\,s. On Facebook, the range is approximately $14{,}200$\,s ($\epsilon = 0.01$) to $12{,}600$\,s ($\epsilon \ge 1$), with a baseline of roughly $12{,}600$\,s and a VPJoin estimate of $9.80 \times 10^{13}$\,s. On Wikipedia, the DP curve ranges from approximately $15{,}250$\,s ($\epsilon = 0.01$) to $13{,}750$\,s ($\epsilon \ge 2$), against a baseline of roughly $13{,}750$\,s and a VPJoin estimate of $1.47 \times 10^{14}$\,s.
+
+Compared to GQ3, the absolute proving times for GQ4 are higher across all datasets, reflecting the additional cost of decomposing and padding a $4$-way cycle versus a $3$-way cycle. However, the relative DP overhead remains small: at $\epsilon = 0.1$, the overhead is approximately $1\%$ on LastFM, $7\%$ on Facebook, and $5\%$ on Wikipedia. The convergence behavior is consistent with GQ3: moderate privacy budgets ($\epsilon \ge 0.5$) bring the DP-guided proving time within a few percent of the no-privacy lower bound, while the fully oblivious alternative remains infeasible by over $8$ orders of magnitude.
+
+
+
+
+\section{Obliviousness Analysis}
+\label{app:obliviousness}
+
+\subsection{Two-Pass OBJ}
+
+The OBJ gate achieves obliviousness through data-independent circuit structuring and padding.
+\begin{itemize}[leftmargin=*]
+    \item \emph{Structural Uniformity:} The number of advice columns and polynomial constraints is determined solely by the public schema and the padding parameter $N$. The wiring of the permutation and lookup arguments is fixed at compile time and does not branch based on tuple values.
+    \item \emph{Data Hiding via Padding:} All input and witness columns are padded to the fixed upper bound $N$ with dummy tuples. The validity flags and selector columns process valid and dummy tuples indistinguishably within the arithmetic constraint system.
+    \item \emph{Cardinality Hiding:} The intermediate result of the semijoin, $R'_i$, is stored in a column of fixed size $N$. The actual selectivity of the join is encoded only in the number of non-dummy rows, which is hidden by the Zero-Knowledge property of the commitment scheme (e.g., IPA commitments) used in the underlying proof system. Thus, the verifier learns nothing about the intermediate join sizes.
+\end{itemize}
+
+\subsection{One-Pass OBJ}
+
+The One-Pass OBJ maintains obliviousness using the same principles as the Two-Pass variant, with additional considerations for the witness splitting:
+\begin{itemize}[leftmargin=*]
+    \item For each relation $R_i$, the prover supplies $R_i^c$ and $R_i^r$ as private witnesses. The split point (i.e., how many tuples are clean vs.\ residual) is data-dependent. However, the circuit layout allocates fixed space $N$ for both $R_i^c$ and $R_i^r$ (or a total space of $N$ split logically). The verifier only sees commitments to these columns and a proof that constraints hold.
+    \item The four invariants (Conservation, Internal Disjointness, Pairwise Consistency, Residual Disconnectedness) are verified using fixed Permutation, Membership, and Non-Membership checks that operate on the entire padded columns. The computational path of the verifier is constant and independent of the ratio $|R_i^c|/|R_i^r|$, leaking no information about the query selectivity.
+\end{itemize}
+
+
+\section{Detailed Complexity Analysis}
+\label{app:complexity}
+
+This appendix provides the full derivation of the constraint costs summarized in Table~\ref{tab:constraint_comparison}.
+Recall that all columns are padded to the uniform upper-bound cardinality $N$ (Section~\ref{sec:gates}).
+Multi-attribute tuples are compressed into a single field element via a random linear combination (RLC), so Conservation and Membership Checks each cost $\mathcal{O}(N)$.
+
+\subsection{Primitive Costs}
+
+The three sub-gate checks used in the OBJ are:
+\begin{itemize}
+    \item \textbf{Conservation Check}: verifies multiset equality $A \equiv B$ via a permutation argument. Cost: $N$ constraints.
+    \item \textbf{Non-Membership Check}: verifies $\pi_K(A) \cap \pi_K(B) = \emptyset$ by merging both key columns into a single sorted sequence and checking that no consecutive elements coincide. The cost depends on the merged sequence length (see below).
+    \item \textbf{Membership Check}: verifies $\pi_K(A) \subseteq \pi_K(B)$ via a lookup argument. Cost: $N$ constraints.
+\end{itemize}
+
+\paragraph{Non-membership check complexity (sort-based).}
+Let the join key be a $B$-bit integer with $B=64$, and let the range-check use $b=8$-bit
+decomposition, giving $t = \lceil 64/8 \rceil = 8$ chunks per value.
+A standard PLONKish non-membership gadget implemented via ``merge + sort'' consists of:
+(i)~a \emph{permutation} argument to bind the prover-provided sorted list to the original
+multiset, and
+(ii)~a \emph{sortedness} proof by range-checking consecutive differences
+$\Delta_i = x'_{i+1} - x'_i$ as $B$-bit nonnegative values ($t = 8$ range-check constraints per element).
+The total cost is therefore $(1 + 8) \times N_{\text{merged}} = 9 \times N_{\text{merged}}$, where $N_{\text{merged}}$ is the combined length of the two key columns being checked.
+
+\noindent A single \textbf{Semijoin Gate} for edge $(R_i, R_j)$ verifying $R_i \leftarrow R_i \ltimes R_j$ invokes:
+\begin{enumerate}
+    \item 1 Conservation Check ($R_i \equiv R'_i \cup R''_i$): cost $N$,
+    \item 1 Membership Check ($\pi_{\text{key}}(R'_i) \subseteq \pi_{\text{key}}(R_j)$): cost $N$,
+    \item 1 Non-Membership Check ($\pi_{\text{key}}(R''_i) \cap \pi_{\text{key}}(R_j) = \emptyset$): sortedness cost $8 \times 2N$ (merged length $2N$).
+\end{enumerate}
+Total per gate: $(1 + 1 + 8 \times 2) \cdot N = 18N$.
+
+\noindent An \textbf{Internal Disjointness NonMem} for relation $R_i$ verifies $R_i^c \cap R_i^r = \emptyset$.
+Since $R_i^c$ and $R_i^r$ partition $R_i$ (by Conservation), $|R_i^c| + |R_i^r| = N$, so the merged length is $N$.
+Cost: $(1 + 8) \cdot N = 9N$ (1~internal permutation $+$ 8~sortedness chunks).
+
+\subsection{Two-Pass OBJ}
+
+The Two-Pass OBJ performs semijoin reductions along all $n-1$ edges of the join tree in two traversals.
+
+\paragraph{Bottom-Up Pass.}
+Processing edges from leaves to root, one semijoin gate is applied per edge to reduce the parent: $P \leftarrow P \ltimes C$.
+When a parent $P$ has multiple children $C_1, \dots, C_k$, the reductions are applied sequentially: each gate takes the current (already-reduced) $P$ as input.
+Total: $(n-1)$ semijoin gates.
+
+\paragraph{Top-Down Pass.}
+Processing edges from root to leaves, one semijoin gate is applied per edge to reduce the child: $C \leftarrow C \ltimes P$, where $P$ is the already-reduced parent.
+Total: $(n-1)$ semijoin gates.
+
+\paragraph{Totals.}
+The Two-Pass OBJ uses $2(n{-}1)$ semijoin gates.
+Each gate costs $(1 + 1 + 8 \times 2) \cdot N = 18N$ constraints (1~Conservation $+$ 1~Membership $+$ Non-Membership sortedness over $2N$ merged elements).
+The total constraint cost is:
+\[
+\mathcal{C}_{\text{2-Pass}} = (1+1+8 \times 2) \cdot N \cdot 2(n{-}1) = 36(n{-}1)\,N.
+\]
+
+\subsection{One-Pass OBJ}
+
+The One-Pass OBJ verifies the prover-supplied witness partition $(\mathcal{R}^c, \mathcal{R}^r)$ via four invariants.
+
+\paragraph{(1) Conservation.}
+One Conservation Check per relation to verify $R_i \equiv R_i^c \cup R_i^r$.
+Total: $n$ checks.
+
+\paragraph{(2) Internal Disjointness.}
+For each relation $R_i$, we verify that the clean and residual sets are disjoint:
+\[
+R_i^c \cap R_i^r = \emptyset.
+\]
+Since RLC compresses each tuple into a single field element, this requires one Non-Membership Check per relation.
+Because $R_i^c$ and $R_i^r$ partition $R_i$ (by Conservation), $|R_i^c| + |R_i^r| = N$, so the merged sequence has length $N$ (not $2N$) and the cost per check is $(1+8) \cdot N = 9N$.
+Total: $n$ NonMem checks, with constraint cost $9n\,N$.
+
+\paragraph{(3) Pairwise Consistency.}
+For every edge $(R_i, R_j)$ with shared attributes $K_{ij}$, set equality $\pi_{K_{ij}}(R_i^c) = \pi_{K_{ij}}(R_j^c)$ is verified via two Membership Checks ($R_i^c \to R_j^c$ and $R_j^c \to R_i^c$).
+Total: $2(n-1)$ checks.
+Note: Pairwise Consistency is only required when the application needs the actual join result tuples; for aggregation-only queries it can be omitted, and we exclude it from the cost comparison below.
+
+\paragraph{(4) Residual Disconnectedness.}
+A bottom-up semijoin reduction on the residual relations $\mathcal{R}^r$ verifies that $R_n^r \ltimes (\dots (R_2^r \ltimes R_1^r)\dots) = \emptyset$.
+This is a single bottom-up pass along the join tree $T$, applying one semijoin gate per edge ($(n{-}1)$ gates total), each costing $(1+1+8 \times 2) \cdot N = 18N$.
+After the pass, the root's surviving set is checked to be empty.
+
+\paragraph{Totals.}
+The One-Pass OBJ consists of:
+\begin{itemize}
+    \item $(n{-}1)$ semijoin gates (Residual Disconnectedness bottom-up), each costing $(1+1+8 \times 2) \cdot N = 18N$,
+    \item $n$ Internal Disjointness NonMem checks, each costing $(1+8) \cdot N = 9N$.
+\end{itemize}
+The total constraint cost (excluding Pairwise Consistency) is:
+\[
+\mathcal{C}_{\text{1-Pass}}
+= (1{+}1{+}8 \times 2) \cdot N \cdot (n{-}1) \;+\; (1{+}8) \cdot N \cdot n
+= 18(n{-}1)\,N + 9n\,N
+= (27n{-}18)\,N.
+\]
+
+\subsection{Comparison}
+
+We compare the constraint costs of the Two-Pass and One-Pass OBJ, excluding Pairwise Consistency from both.
+The Pairwise Consistency check ($2(n{-}1)$ Membership Checks) is not necessary when the application does not require the actual join result tuples---for example, in aggregation-only queries where only counts or sums over the join are needed.
+Both the Two-Pass and the One-Pass can optionally add Pairwise Consistency at the same cost, so it does not affect the relative comparison.
+
+\paragraph{Per-unit cost breakdown.}
+Each \textbf{semijoin gate} (used in both approaches) costs:
+\[
+\underbrace{1}_{\text{Consrv}} + \underbrace{1}_{\text{Memb}} + \underbrace{8 \times 2}_{\text{NonMem sort}} = 18 \quad \text{(in units of $N$)}.
+\]
+Each \textbf{Internal Disjointness NonMem} (One-Pass only) costs:
+\[
+\underbrace{1}_{\text{NonMem perm}} + \underbrace{8}_{\text{NonMem sort}} = 9 \quad \text{(in units of $N$)}.
+\]
+The factor-of-two reduction in the NonMem sortedness term ($8$ vs $8 \times 2$) arises because $R_i^c$ and $R_i^r$ partition~$R_i$, so the merged sequence has $N$ elements instead of $2N$.
+
+\paragraph{Total costs.}
+\[
+\begin{aligned}
+\mathcal{C}_{\text{2-Pass}} &= (1{+}1{+}8 \times 2) \cdot N \cdot 2(n{-}1) &&= 36(n{-}1)\,N, \\[4pt]
+\mathcal{C}_{\text{1-Pass}} &= (1{+}1{+}8 \times 2) \cdot N \cdot (n{-}1) \;+\; (1{+}8) \cdot N \cdot n &&= (27n{-}18)\,N.
+\end{aligned}
+\]
+The One-Pass saves
+\[
+\Delta = 36(n{-}1)\,N - (27n{-}18)\,N = 9(n{-}2)\,N > 0 \quad \text{for } n \geq 3.
+\]
+The savings arise because the One-Pass replaces the Top-Down pass ($(n{-}1)$ semijoin gates at $18N$ each) with $n$ lightweight Internal Disjointness NonMem checks at $9N$ each.
+Additionally, the One-Pass eliminates intermediate column allocations from the top-down pass entirely---the circuit operates directly on the prover-supplied partition.
+
+
+\end{document}
