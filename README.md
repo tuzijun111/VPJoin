@@ -1,4 +1,4 @@
-# PoneglyphDB
+# VPJoin
 
 **Verifiable and privacy-preserving SQL query answering via zero-knowledge proofs.**
 
