@@ -65,15 +65,6 @@ src/
 - **Facebook**: Ego-network, 88,234 edges
 - **Wikipedia Vote**: Voting network, 103,689 edges
 
-### Performance Highlights
-
-VPJoin outperforms the state-of-the-art by **6--16 orders of magnitude** in proving time on TPC-H queries and **4--9 orders of magnitude** on graph workloads. Verification time is negligible (under 10 ms for all queries).
-
-| Query | VPJoin Proving Time | Prior State-of-the-Art | Speedup |
-|-------|-------------------|----------------------|---------|
-| Q3 (3-way)  | ~10^3 s | ~10^9 s  | ~10^6x |
-| Q8 (8-way)  | ~10^3 s | ~10^19 s | ~10^16x |
-| Q5 (6-way, cyclic) | ~10^4 s | ~10^13 s | ~10^9x |
 
 ## Getting Started
 
