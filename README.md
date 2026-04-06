@@ -1,6 +1,6 @@
 # VPJoin
 
-**Verifiable and privacy-preserving SQL query answering via zero-knowledge proofs.**
+
 
 We implement **VPJoin**, a zero-knowledge proof framework for verifiable multi-way SQL join processing. Built on the [Halo2](https://github.com/zcash/halo2) proving system with PLONKish arithmetization, VPJoin enables a data holder to prove the correct execution of complex SQL queries over private data without revealing the underlying records.
 
