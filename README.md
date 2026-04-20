@@ -23,7 +23,7 @@ OBJ verifies multi-way joins via semijoin-based structural checks along a join t
 
 ### Aggregation Without Join Materialization
 
-OBJ computes join-aggregates directly over compact clean relations via **tuple multiplicities**, keeping proof cost at O(IN + OUT) without ever constructing the full O(N^k)-sized join result.
+OBJ computes join-aggregates directly over compact clean relations via **tuple multiplicities**, keeping proof cost at O(IN + OUT) without ever constructing the full O(IN^k)-sized join result.
 
 ### DP-Guided Join Gate (DPJ) for Cyclic Joins
 
