@@ -14,7 +14,7 @@ VPJoin eliminates this bottleneck via **witness-guided verification**: the prove
 
 ### Oblivious Join Gate (OBJ) for Acyclic Joins
 
-OBJ verifies multi-way joins via semijoin-based structural checks along a join tree, achieving **worst-case optimal O(IN + OUT) circuit complexity**. Since the circuit never creates intermediate results, its layout depends only on input table sizes, so **obliviousness is achieved entirely for free** with zero padding overhead. The gate enforces four properties:
+OBJ verifies multi-way joins via semijoin-based structural checks along a join tree, achieving **worst-case O(IN + OUT) circuit complexity**. Since the circuit never creates intermediate results, its layout depends only on input table sizes, so **obliviousness is achieved entirely for free** with zero padding overhead. The gate enforces four properties:
 
 - **Conservation** -- every original tuple appears in exactly one group (via Permutation Argument)
 - **Disjointness** -- clean and residual groups share no tuples (via Non-Membership Check)
