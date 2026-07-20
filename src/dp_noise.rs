@@ -11,10 +11,20 @@
 //! Mechanism (two stages, matching the paper and the Python reference):
 //!  1. release one-sided noisy truncation thresholds `tau_a`, `tau_b` for the
 //!     per-relation maximum join-key frequencies (global sensitivity 1 each);
-//!  2. release the capacity with one-sided noise calibrated to the released
-//!     thresholds: `max(tau_a, tau_b)` for joins of distinct relations, or
-//!     `tau_a + tau_b` for SELF-joins (e.g. Edge |x| Edge), where one record
-//!     change affects both sides.
+//!  2. release the capacity with one-sided noise calibrated to the join-size
+//!     sensitivity `max(tau_a, tau_b)`.
+//!
+//! Sensitivity.  For `A |x| B` with `f = sum_k freq_A(k) freq_B(k)`, under the
+//! standard neighboring definition (change one tuple of ONE relation), a
+//! change to A moves the count by at most `Freq(B)` and a change to B by at
+//! most `Freq(A)`, so the global sensitivity is `max(Freq(A), Freq(B))`, i.e.
+//! `max(tau_a, tau_b)` once the private frequencies are replaced by their
+//! released upper bounds.  This holds for SELF-joins too (e.g. Edge |x| Edge):
+//! each aliased instance `r1`, `r2` is treated as its own relation and
+//! neighboring changes one tuple of one instance -- the per-instance model
+//! standard in DP-SQL work.  (Only a coarser base-relation neighboring, where
+//! one edge change touches both instances at once, would give the sum; we do
+//! not use that model.)
 //!
 //! Every released value is a single draw; the total cost is
 //! `(eps1 + eps2 + eps3, delta1 + delta2 + delta3)` by basic composition.
@@ -40,8 +50,10 @@ pub struct DpCapacity {
     pub capacity: u64,
     pub tau_a: f64,
     pub tau_b: f64,
-    /// The stage-2 sensitivity actually used (max or sum of the thresholds).
+    /// The stage-2 join-size sensitivity used: `max(tau_a, tau_b)`.
     pub sensitivity: f64,
+    /// Recorded for labeling only; does not change the sensitivity (the
+    /// per-instance neighboring model gives `max` for self-joins too).
     pub self_join: bool,
 }
 
@@ -75,8 +87,8 @@ pub fn one_sided_laplace(
 ///   (private).
 /// * `epsilon`, `delta` -- TOTAL budget for this capacity release, split
 ///   equally across the three internal releases (basic composition).
-/// * `self_join`   -- set when `A` and `B` are instances of the same base
-///   relation; the stage-2 sensitivity is then `tau_a + tau_b`.
+/// * `self_join`   -- recorded for labeling only; the sensitivity is
+///   `max(tau_a, tau_b)` regardless (per-instance neighboring model).
 pub fn dp_join_capacity(
     join_size: u64,
     max_freq_a: u64,
@@ -90,7 +102,10 @@ pub fn dp_join_capacity(
 
     let tau_a = max_freq_a as f64 + one_sided_laplace(eps_i, del_i, 1.0, rng);
     let tau_b = max_freq_b as f64 + one_sided_laplace(eps_i, del_i, 1.0, rng);
-    let sens = if self_join { tau_a + tau_b } else { tau_a.max(tau_b) }.max(1.0);
+    // Join-size sensitivity: a single-tuple change to A moves the count by
+    // <= Freq(B) and to B by <= Freq(A), so the global sensitivity is
+    // max(Freq(A), Freq(B)) -> max(tau_a, tau_b) with the released bounds.
+    let sens = tau_a.max(tau_b).max(1.0);
 
     let size_noise = one_sided_laplace(eps_i, del_i, sens, rng);
     DpCapacity {
@@ -146,9 +161,8 @@ mod tests {
                 let out = dp_join_capacity(m, 7, 4, 0.1, 1e-5, self_join, &mut rng);
                 assert!(out.capacity >= m);
                 assert!(out.tau_a >= 7.0 && out.tau_b >= 4.0);
-                if self_join {
-                    assert!(out.sensitivity >= out.tau_a + out.tau_b - 1e-9);
-                }
+                // sensitivity is max(tau_a, tau_b), the same for self-joins.
+                assert!((out.sensitivity - out.tau_a.max(out.tau_b)).abs() < 1e-9);
             }
         }
     }

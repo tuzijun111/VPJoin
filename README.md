@@ -180,9 +180,18 @@ total budget by basic composition.  Replace the legacy hard-coded `*_pad_extra` 
 ```bash
 python3 dp/noise_generator.py          # reference implementation + self-check
 cargo test --release --lib dp_noise    # Rust twin tests
-# per-bag capacities: total budget (0.1, 1e-5) split over 2 self-join bags
+
+# per-bag capacities for a single epsilon (total budget (0.1, 1e-5), 2 self-join bags):
 cargo run --release --bin dp_capacity_gen -- 0.1 1e-5 2  120000 7 4 1  118000 7 4 1
+
+# The FULL epsilon sweep the paper reports (Figures for "various epsilon"),
+# delta = 1e-5, in one run -- the first argument is a comma-separated list:
+cargo run --release --bin dp_capacity_gen -- \
+    0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 1e-5 2  120000 7 4 1  118000 7 4 1
 ```
+
+Each epsilon prints, per bag, `capacity` and `pad_extra = capacity - true_size`.  The paper's
+default is epsilon = 0.1; the swept values are `0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10`.
 
 ### 4. PoneglyphDB-style graph baselines (Section 8.1 estimation methodology)
 
@@ -222,28 +231,43 @@ The originally reported DP runs used hand-chosen constants (recorded in
 
 1. Obtain each bag's true join size and per-side maximum join-key frequencies (printed by the
    witness-generation code, or computed offline from the data).
-2. Release the capacities, dividing the query's total budget across its bags
-   (`self_join = 1` for the Edge-Edge bags of GQ3/GQ4):
+2. Release the capacities for the whole epsilon sweep at once, dividing the query's total
+   budget across its bags (`self_join = 1` for the Edge-Edge bags of GQ3/GQ4, `0` for Q5's
+   distinct-relation bags):
 
 ```bash
-# GQ3 / GQ4 (two self-join bags):
-cargo run --release --bin dp_capacity_gen -- 0.1 1e-5 2  <bag1_size> <mfA> <mfB> 1  <bag2_size> <mfA> <mfB> 1
-# Q5 (two bags over distinct relations):
-cargo run --release --bin dp_capacity_gen -- 0.1 1e-5 2  <co_size> <mfO> <mfC> 0  <ls_size> <mfL> <mfS> 0
+# GQ3 / GQ4 (two self-join bags), full sweep:
+cargo run --release --bin dp_capacity_gen -- \
+    0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 1e-5 2 \
+    <bag1_size> <mfA> <mfB> 1  <bag2_size> <mfA> <mfB> 1
+# Q5 (two bags over distinct relations), full sweep:
+cargo run --release --bin dp_capacity_gen -- \
+    0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 1e-5 2 \
+    <co_size> <mfO> <mfC> 0  <ls_size> <mfL> <mfS> 0
 ```
 
-3. Plug the released capacities into the circuit padding knobs as
-   `pad_extra = capacity - true_size`:
+3. For each epsilon, plug that epsilon's `pad_extra` values into the circuit padding knobs:
    - GQ3: `bag1_pad_extra` / `bag2_pad_extra` in the test harness of `src/graph_sql/g_sql3_obj.rs`
    - GQ4: `bag1_pad_extra` / `bag2_pad_extra` in the test harness of `src/graph_sql/g_sql4_obj.rs`
    - Q5:  `co_pad_extra` / `ls_pad_extra` in the test harness of `src/sql/q5_obj.rs`
    (or call `halo2_experiments::dp_noise::dp_join_capacity` directly at witness-generation
    time instead of hard-coding).
 4. Re-run the corresponding query proofs (commands under "Running TPC-H/Graph Query Proofs")
-   once per epsilon value to regenerate the privacy--efficiency curves.
+   once per epsilon value; the proving time scales with the padded circuit size, so one run
+   per epsilon regenerates the privacy--efficiency curve.
 
-Note: at small total epsilon (e.g. 0.1) the rigorous mechanism produces much larger
-capacities than the legacy constants; expect the small-epsilon end of the DP curves to rise.
+NOTE — the paper's originally reported DP figures were produced from the legacy hand-tuned
+constants (`dp/legacy_capacities.md`), not from this mechanism.  The mechanism here is a
+rigorous (epsilon, delta)-DP release: the join-size sensitivity is `max(F_A, F_B)` (with the
+DP-released frequency upper bounds), and the one-sided noise has scale ~ sensitivity *
+ln(1/delta)/epsilon.  The resulting overhead therefore depends on (i) the real ratio of the
+sensitivity to the true bag size and (ii) how the total budget is split across the query's
+bags and the three per-bag releases (thresholds + size); the equal split used by the CLI is
+one choice, not the only one.  Regenerate the curves with the real bag sizes and max
+frequencies before comparing to the submitted figures, and re-check the "2--10% overhead"
+text against the regenerated numbers.  If the overhead at small epsilon is larger than
+desired, options include a less aggressive budget split, a larger delta, the Gaussian
+mechanism, or reporting a larger operating epsilon.
 
 ### 6. End-to-end comparison with the commitment layers
 
