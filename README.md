@@ -123,6 +123,109 @@ cargo test --package halo2-experiments --lib -- graph_sql::g_sql3_obj::tests::te
 cargo test --package halo2-experiments --lib -- graph_sql::g_sql4_obj::tests::test --exact --nocapture
 ```
 
+The per-test commands above prove **one** query on **one** dataset, and the graph tests
+select their dataset by editing a commented-out line inside the test body (each of
+`g_sqlN_obj::tests::test` has the three `read_edges(...)` calls with two commented out).
+All paths are resolved relative to the crate root by `src/paths.rs`, so the tests work in
+any checkout with no editing. (They previously hard-coded absolute paths into a sibling
+directory and panicked with `NotFound` on `File::open(...).unwrap()` in a fresh clone.)
+Set `VPJOIN_DATA` to relocate the `data/` + `graph_data/` + `proof/` tree.
+
+One caveat remains in the tests themselves: the TPC-H data loaders swallow read errors
+with `if let Ok(records)`, so a missing *table* leaves that relation **empty** and the test
+still "passes" instead of failing. `cargo test --lib -- paths::` checks up front that every
+table, graph dataset, and params file is present. The sweep commands below refuse to run on
+an empty table.
+
+### Running Everything (two commands)
+
+`vpjoin_bench` rebuilds exactly the circuit instances the per-query tests build, but
+drives all of them from one command: the 5 TPC-H queries plus the 4 graph queries on
+**each** of the 3 SNAP datasets (17 rows), writing one CSV.
+
+```bash
+# (A) BASELINE -- the pure query circuits, i.e. what the submission reports.
+cargo run --release --bin vpjoin_bench -- baseline results/vpjoin_baseline.csv
+
+# (B) FULL -- the same circuits plus the complete commitment layer: published
+#     per-column Pedersen commitments to the dataset, the in-circuit check that the
+#     query's witness columns equal the committed data, and the column openings.
+cargo run --release --bin vpjoin_bench -- full results/vpjoin_full.csv
+```
+
+Both modes use the **real proving pipeline** — `keygen_vk` / `keygen_pk` / `create_proof` /
+`verify_proof` over IPA on the Pasta curves, exactly like the `generate_and_verify_proof`
+helpers inside the per-query tests. **`MockProver` is never used.** Every proof is verified,
+and the proof bytes are written to `src/proof/bench/<query>_<dataset>.proof` as auditable
+artifacts. Public parameters are the **persisted `src/proof/param{k}` files** (param15–19
+ship with the repo); every load is logged per row, a params file that exists but cannot be
+parsed is a hard error (never silently regenerated), and only a genuinely absent degree
+(k ≥ 20, needed by GQ3 on the larger graphs) is generated once and persisted there.
+
+**Build profile — read this before comparing any two numbers.** The per-query commands
+above (`cargo test` **without** `--release`) build the *debug* profile, which compiles the
+halo2 library itself at `opt-level = 0` (this repo has no `[profile]` overrides). The same
+circuit therefore proves several times slower there than under `cargo run --release`.
+Measured on Q3, 60K, k=16 — the *same* circuit both times, confirmed by both runs emitting a
+byte-identical 28,448-byte proof:
+
+| | `cargo test` (debug) | `vpjoin_bench` (release) |
+|---|---|---|
+| vk + pk | 25.34s (7.09 + 18.25) | 4.59s |
+| prove | ~117s (by subtraction) | 24.25s |
+| end-to-end | 142.1s (`finished in`) | 28.9s + load |
+
+Neither is "wrong" — they are the same computation under two compilers. Every CSV row
+records a `profile` column (`debug`/`release`) and the binary prints the profile at startup,
+so a mixed comparison is visible rather than silent. **Use one profile for both commands.**
+To reproduce the `cargo test` timings with this harness, just drop `--release`:
+
+```bash
+cargo run --bin vpjoin_bench -- baseline results/vpjoin_baseline_debug.csv q3
+```
+
+The CSV also reports `vk_s` and `pk_s` separately, which line up 1:1 with the
+`Time to generate vk` / `Time to generate pk` lines the tests print, plus `load_s` (data
+parsing) and `wall_s` (end-to-end, comparable to the test's `finished in ...` line).
+
+The difference between the two CSVs is exactly the cost of making a proof bind to a
+committed database instead of to an unauthenticated input. Both write the same schema
+(`query,dataset,k,input_rows,n_columns,public_output,keygen_s,prove_s,verify_s,proof_bytes,
+commit_setup_s,published_bytes,bind_*,open_*,total_prove_s,total_proof_bytes,status`);
+in `baseline` the commitment columns are zero.
+
+Useful variations:
+
+```bash
+# a subset of queries (graph queries still expand over all 3 datasets)
+cargo run --release --bin vpjoin_bench -- baseline results/tpch.csv q3 q5 q8 q9 q18
+cargo run --release --bin vpjoin_bench -- full    results/graph.csv gq1 gq2 gq3 gq4
+
+# point at a different data root (must contain data/ graph_data/ proof/)
+VPJOIN_DATA=/path/to/src cargo run --release --bin vpjoin_bench -- baseline out.csv
+
+# cap the degree the k-fitter may try (default 21)
+VPJOIN_MAX_K=19 cargo run --release --bin vpjoin_bench -- baseline out.csv
+```
+
+Notes:
+
+* **`k` is fitted, not assumed.** Each circuit starts at the degree its test uses
+  (16 for TPC-H, 17 for GQ1/GQ2, 18 for GQ3/GQ4) and `k` is raised until the circuit
+  fits. This is necessary because the graph circuits' intermediate size depends on the
+  dataset, so no single hard-coded `k` serves all three. Missing `param{k}` files are
+  generated and cached under `src/proof/`.
+* **GQ3 is much larger on `facebook` and `wiki`** than on `lastfm` (its wedge
+  intermediate is ~2.7M and ~2.3M rows vs ~233K), so those two rows need `k = 22` and are
+  by far the most expensive in the sweep. With the default `VPJOIN_MAX_K=21` they are
+  recorded as `FAILED: ...` in the `status` column and the sweep continues; raise
+  `VPJOIN_MAX_K=22` to actually measure them (expect a long run and high memory).
+* A failure in any single row is recorded in `status` rather than aborting the sweep,
+  and rows are flushed as they complete, so an interrupted run is still usable.
+* Q5 keeps the DP padding knobs at the values currently set in its test
+  (`nr/co/ls_pad_extra = 0 / 32*89 / 668*89`, see `dp/legacy_capacities.md`), and GQ3's
+  bag padding is applied per dataset rather than fixed at the lastfm constant.
+
 ### Public Parameter Selection (k)
 
 Select appropriate Halo2 public parameter k depending on dataset size and SQL queries.
@@ -154,19 +257,80 @@ cargo run --release --bin commitment_bench -- src/data lineitem_120K orders cust
 cargo run --release --bin commitment_bench -- src/data lineitem_240K orders customer supplier nation part partsupp
 ```
 
-### 2. In-circuit input binding (Appendix A)
+### 2. In-circuit input binding + per-column commitments (Appendix A)
 
-Proves *inside a circuit* that the input columns a query consumes equal the committed
-tables: the committed table lives in fixed columns (whose per-column commitments are
-published at setup and reproduced verbatim in the verifying key), and an equality gate binds
-the advice inputs to them.  Composing the same constraints into a query circuit enforces the
-binding at the same per-cell cost, so the measured numbers are the additional cost of
-checking the input commitments before query processing.
+`src/column_commit.rs` commits **each attribute column separately, over the same
+evaluation domain the query circuits already use** (`k = 16` for the TPC-H circuits, which
+holds the 60K-row `lineitem`).  This reuses the circuits' existing `ParamsIPA` verbatim (no
+separate large setup), gives one published commitment per circuit witness column, and uses a
+fresh random blinder per column so the published commitments are **hiding**.  (Halo2's
+*fixed*-column commitments use the constant `Blind(1)` and are therefore reproducible from
+the data -- not suitable for a private database.)
+
+Binding is a random-point check: a Fiat-Shamir challenge `x` is derived from the published
+commitments, the layout and the query proof; the prover opens each committed column at `x`
+(IPA opening, revealing `v_j`), and the circuit evaluates its own witness column at `x` by a
+Horner accumulation and exposes `v_j` as a public output.  Matching values certify that the
+**query circuit's witness columns equal the committed data**.
 
 ```bash
-cargo test --release --lib input_binding
-cargo run --release --bin input_binding_bench -- src/data nation customer orders lineitem
+cargo test --release --lib column_commit
+
+# PRIMARY command -- per-QUERY additional cost: for each VPJoin query, binds exactly
+# the columns that query's circuit witnesses (inventoried from the circuit code), in
+# that circuit's own domain (k=16 TPC-H / k=17 GQ1-GQ2 / k=18 GQ3-GQ4), and measures
+# baseline vs bound plus openings, into a CSV.  Graph queries run on all 3 SNAP datasets.
+cargo run --release --bin query_commit_bench -- results/query_commit_cost.csv
+# or a subset:
+cargo run --release --bin query_commit_bench -- results/tpch.csv q3 q5 q8 q9 q18
+
+# per-TABLE variant (all tables in one shared k):
+cargo run --release --bin commit_cost_bench -- src/data results/commit_cost.csv \
+    nation supplier customer orders lineitem
 ```
+
+Per-query bound-column counts (from the circuits' witness code): Q3 10, Q5 16, Q8 19,
+Q9 17, Q18 8; GQ1-GQ4 bind Edge(src,dst) = 2 columns per dataset.
+
+The CSV (`results/commit_cost.csv`) has one row per table with:
+`rows, cols, k, setup_params_s, setup_commit_s, published_commit_bytes,`
+`baseline_{keygen,prove,verify}_s, baseline_proof_bytes,`
+`bound_{keygen,prove,verify}_s, bound_proof_bytes,`
+`open_{prove,verify}_s, open_proof_bytes,`
+`delta_prove_s, delta_verify_s, delta_proof_bytes, total_extra_prove_s`.
+
+All tables share ONE domain `k`, derived from the largest table in the set: `lineitem`
+(60,175 rows) gives **k = 16**, the degree the TPC-H circuits actually run at.  This is the
+realistic setting -- a query that reads `lineitem` *is* a k=16 circuit, so the dimension
+tables it also reads live in the same `2^16` domain and their openings cost the same as
+`lineitem`'s.  (The IPA generators are position-indexed and k-independent, so a column
+commits to the same point at any k that holds it -- see the
+`commitment_point_is_independent_of_k` test; only the opening cost changes.)  Parameters are
+generated once and shared, as the circuits share `param16`.
+
+The `delta_*` columns are the additional in-circuit cost of the commitment layer over the
+pure query circuit; `total_extra_prove_s` adds the column openings.  Measured at k=16:
+
+| table | cols | commit setup | published | baseline prove | bound prove | Δ prove | openings |
+|---|---|---|---|---|---|---|---|
+| nation | 4 | 0.017 s | 128 B | 0.77 s | 2.37 s | +1.60 s | 1.00 s |
+| supplier | 7 | 0.019 s | 224 B | 0.75 s | 2.39 s | +1.64 s | 1.74 s |
+| customer | 8 | 0.030 s | 256 B | 0.77 s | 2.54 s | +1.77 s | 1.98 s |
+| orders | 9 | 0.028 s | 288 B | 0.79 s | 2.43 s | +1.64 s | 2.23 s |
+| lineitem | 16 | 0.075 s | 512 B | 0.87 s | 2.74 s | +1.86 s | 3.96 s |
+
+Note how to read these: at a fixed k the circuit cost is dominated by the domain, not by the
+table's row count, so the in-circuit delta is ~1.6--1.9 s for every table; the **openings**
+are what scale with the number of columns (~0.25 s per column at k=16).  The
+`delta_prove_s` values must **not** be summed across tables -- a query uses a *single* k=16
+circuit holding all the columns it reads, so its in-circuit binding is charged once, growing
+with the total column count (the `lineitem` row, 16 bound columns, is the practical upper
+bound).  The openings *do* add up, but only over the columns a query actually reads.
+
+The earlier monolithic single-vector layer (`src/commitment.rs`, one 2^21 commitment for the
+whole database) is retained for reference and benchmarked by `commitment_bench`; it needs a
+separate large setup and cannot be matched to circuit columns without reindexing, so
+`column_commit` supersedes it.
 
 ### 3. DP capacity generation (Appendix G.2)
 

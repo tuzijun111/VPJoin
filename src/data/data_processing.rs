@@ -335,9 +335,9 @@ mod tests {
         // Call the function with different file paths
 
         if let Ok(records) =
-            // customer_read_records_from_file("/home2/binbin/PoneglyphDB/src/data/customer.tbl")
+            // customer_read_records_from_file(&crate::paths::data_file("customer.tbl"))
             customer_read_records_from_file(
-                "/home2/binbin/PoneglyphDB/src/data/customer.tbl",
+                &crate::paths::data_file("customer.tbl"),
             )
         {
             println!("{:?}", string_to_u64(&records[4].c_mktsegment));
@@ -346,7 +346,7 @@ mod tests {
         }
 
         if let Ok(records) =
-            orders_read_records_from_file("/home2/binbin/PoneglyphDB/src/data/orders.tbl")
+            orders_read_records_from_file(&crate::paths::data_file("orders.tbl"))
         {
             println!("{:?}", string_to_u64(&records[0].o_orderdate));
         } else {
@@ -354,7 +354,7 @@ mod tests {
         }
 
         if let Ok(records) =
-            lineitem_read_records_from_file("/home2/binbin/PoneglyphDB/src/data/lineitem.tbl")
+            lineitem_read_records_from_file(&crate::paths::data_file("lineitem.tbl"))
         {
             println!("{:?}", string_to_u64(&records[0].l_shipdate));
             // println!("{:?}", string_to_u64(&records[1].l_shipdate));
@@ -364,7 +364,7 @@ mod tests {
         }
 
         if let Ok(records) =
-            region_read_records_from_cvs("/home2/binbin/PoneglyphDB/src/data/region.cvs")
+            region_read_records_from_cvs(&crate::paths::data_file("region.cvs"))
         {
             println!("{:?}", string_to_u64(&records[3].r_name));
         } else {
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn print_counts_fast() {
-        let base = "/home2/binbin/PoneglyphDB/src/data";
+        let base = &crate::paths::in_src("data");
 
         println!(
             "nation:   {}",

@@ -1702,7 +1702,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param16";
+        let params_path = &crate::paths::param_file(16);
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -1772,12 +1772,12 @@ mod tests {
         let k = 16;
 
         // Adjust paths as in your repo
-        let part_path = "/home2/binbin/PoneglyphDB/src/data/part.tbl";
-        let supplier_path = "/home2/binbin/PoneglyphDB/src/data/supplier.tbl";
-        let nation_path = "/home2/binbin/PoneglyphDB/src/data/nation.tbl";
-        let orders_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
-        let partsupp_path = "/home2/binbin/PoneglyphDB/src/data/partsupp.tbl";
-        let lineitem_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
+        let part_path = &crate::paths::data_file("part.tbl");
+        let supplier_path = &crate::paths::data_file("supplier.tbl");
+        let nation_path = &crate::paths::data_file("nation.tbl");
+        let orders_path = &crate::paths::data_file("orders.tbl");
+        let partsupp_path = &crate::paths::data_file("partsupp.tbl");
+        let lineitem_path = &crate::paths::data_file("lineitem.tbl");
 
         // ---------- load ----------
         // NOTE: function names may differ in your crate; rename accordingly.
@@ -1864,7 +1864,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_obj_q9";
+            let proof_path = &crate::paths::proof_file("proof_obj_q9");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

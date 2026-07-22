@@ -1397,6 +1397,107 @@ impl<F: Field + Ord> Path3OrdChip<F> {
 
 // ---------------- IMPORTANT: join lookups are defined in Circuit::configure ----------------
 
+/// Full constraint-system setup for `Path3OrdCircuit`.
+/// Extracted verbatim so the circuit and any wrapper that embeds it
+/// (see `crate::inline_bind`) configure IDENTICAL constraints -- the
+/// chip's own `configure` alone is NOT sufficient here.
+pub fn configure_path3ord_full<F: Field + Ord>(meta: &mut ConstraintSystem<F>) -> Path3OrdConfig<F> {
+    let cfg = Path3OrdChip::<F>::configure(meta);
+
+    // convenience
+    let t3 = cfg.agg[0].clone(); // table from r3
+    let t2 = cfg.agg[1].clone(); // table from r2
+
+    // r1 joins to T2
+    {
+        let j = cfg.join[0].clone();
+        let rel_dst = cfg.r[0][1];
+        let t = t2.clone();
+
+        // gap lookup: (1-in)*low in key AND (1-in)*high in key_next
+        meta.lookup_any("gap r1->t2", move |m| {
+            let q_in = m.query_selector(j.q_lookup_complex);
+            let inx = m.query_advice(j.in_next, Rotation::cur());
+            let gate = q_in * (Expression::Constant(F::ONE) - inx);
+
+            let low = m.query_advice(j.low, Rotation::cur());
+            let high = m.query_advice(j.high, Rotation::cur());
+
+            let q_tbl = m.query_selector(t.q_map_tbl);
+            let key = m.query_advice(t.map_pair[0], Rotation::cur());
+            let keyn = m.query_advice(t.map_key_next, Rotation::cur());
+
+            vec![
+                (gate.clone() * low, q_tbl.clone() * key),
+                (gate * high, q_tbl * keyn),
+            ]
+        });
+
+        // map lookup: (in*dst, val) exists in (map_key, map_val)
+        // when in=0, join-gate forces val=0 so tuple is (0,0) which exists at map row0
+        meta.lookup_any("map r1->t2", move |m| {
+            let q_in = m.query_selector(j.q_lookup_complex);
+            let inx = m.query_advice(j.in_next, Rotation::cur());
+
+            let dst = m.query_advice(rel_dst, Rotation::cur());
+            let v = m.query_advice(j.val, Rotation::cur());
+
+            let q_tbl = m.query_selector(t.q_map_tbl);
+            let tk = m.query_advice(t.map_pair[0], Rotation::cur());
+            let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+
+            vec![
+                (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
+                (q_in * v, q_tbl * tv),
+            ]
+        });
+    }
+
+    // r2 joins to T3
+    {
+        let j = cfg.join[1].clone();
+        let rel_dst = cfg.r[1][1];
+        let t = t3.clone();
+
+        meta.lookup_any("gap r2->t3", move |m| {
+            let q_in = m.query_selector(j.q_lookup_complex);
+            let inx = m.query_advice(j.in_next, Rotation::cur());
+            let gate = q_in * (Expression::Constant(F::ONE) - inx);
+
+            let low = m.query_advice(j.low, Rotation::cur());
+            let high = m.query_advice(j.high, Rotation::cur());
+
+            let q_tbl = m.query_selector(t.q_map_tbl);
+            let key = m.query_advice(t.map_pair[0], Rotation::cur());
+            let keyn = m.query_advice(t.map_key_next, Rotation::cur());
+
+            vec![
+                (gate.clone() * low, q_tbl.clone() * key),
+                (gate * high, q_tbl * keyn),
+            ]
+        });
+
+        meta.lookup_any("map r2->t3", move |m| {
+            let q_in = m.query_selector(j.q_lookup_complex);
+            let inx = m.query_advice(j.in_next, Rotation::cur());
+
+            let dst = m.query_advice(rel_dst, Rotation::cur());
+            let v = m.query_advice(j.val, Rotation::cur());
+
+            let q_tbl = m.query_selector(t.q_map_tbl);
+            let tk = m.query_advice(t.map_pair[0], Rotation::cur());
+            let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+
+            vec![
+                (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
+                (q_in * v, q_tbl * tv),
+            ]
+        });
+    }
+
+    cfg
+}
+
 impl<F: Field + Ord> Circuit<F> for Path3OrdCircuit<F> {
     type Config = Path3OrdConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
@@ -1406,100 +1507,7 @@ impl<F: Field + Ord> Circuit<F> for Path3OrdCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let cfg = Path3OrdChip::<F>::configure(meta);
-
-        // convenience
-        let t3 = cfg.agg[0].clone(); // table from r3
-        let t2 = cfg.agg[1].clone(); // table from r2
-
-        // r1 joins to T2
-        {
-            let j = cfg.join[0].clone();
-            let rel_dst = cfg.r[0][1];
-            let t = t2.clone();
-
-            // gap lookup: (1-in)*low in key AND (1-in)*high in key_next
-            meta.lookup_any("gap r1->t2", move |m| {
-                let q_in = m.query_selector(j.q_lookup_complex);
-                let inx = m.query_advice(j.in_next, Rotation::cur());
-                let gate = q_in * (Expression::Constant(F::ONE) - inx);
-
-                let low = m.query_advice(j.low, Rotation::cur());
-                let high = m.query_advice(j.high, Rotation::cur());
-
-                let q_tbl = m.query_selector(t.q_map_tbl);
-                let key = m.query_advice(t.map_pair[0], Rotation::cur());
-                let keyn = m.query_advice(t.map_key_next, Rotation::cur());
-
-                vec![
-                    (gate.clone() * low, q_tbl.clone() * key),
-                    (gate * high, q_tbl * keyn),
-                ]
-            });
-
-            // map lookup: (in*dst, val) exists in (map_key, map_val)
-            // when in=0, join-gate forces val=0 so tuple is (0,0) which exists at map row0
-            meta.lookup_any("map r1->t2", move |m| {
-                let q_in = m.query_selector(j.q_lookup_complex);
-                let inx = m.query_advice(j.in_next, Rotation::cur());
-
-                let dst = m.query_advice(rel_dst, Rotation::cur());
-                let v = m.query_advice(j.val, Rotation::cur());
-
-                let q_tbl = m.query_selector(t.q_map_tbl);
-                let tk = m.query_advice(t.map_pair[0], Rotation::cur());
-                let tv = m.query_advice(t.map_pair[1], Rotation::cur());
-
-                vec![
-                    (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
-                    (q_in * v, q_tbl * tv),
-                ]
-            });
-        }
-
-        // r2 joins to T3
-        {
-            let j = cfg.join[1].clone();
-            let rel_dst = cfg.r[1][1];
-            let t = t3.clone();
-
-            meta.lookup_any("gap r2->t3", move |m| {
-                let q_in = m.query_selector(j.q_lookup_complex);
-                let inx = m.query_advice(j.in_next, Rotation::cur());
-                let gate = q_in * (Expression::Constant(F::ONE) - inx);
-
-                let low = m.query_advice(j.low, Rotation::cur());
-                let high = m.query_advice(j.high, Rotation::cur());
-
-                let q_tbl = m.query_selector(t.q_map_tbl);
-                let key = m.query_advice(t.map_pair[0], Rotation::cur());
-                let keyn = m.query_advice(t.map_key_next, Rotation::cur());
-
-                vec![
-                    (gate.clone() * low, q_tbl.clone() * key),
-                    (gate * high, q_tbl * keyn),
-                ]
-            });
-
-            meta.lookup_any("map r2->t3", move |m| {
-                let q_in = m.query_selector(j.q_lookup_complex);
-                let inx = m.query_advice(j.in_next, Rotation::cur());
-
-                let dst = m.query_advice(rel_dst, Rotation::cur());
-                let v = m.query_advice(j.val, Rotation::cur());
-
-                let q_tbl = m.query_selector(t.q_map_tbl);
-                let tk = m.query_advice(t.map_pair[0], Rotation::cur());
-                let tv = m.query_advice(t.map_pair[1], Rotation::cur());
-
-                vec![
-                    (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
-                    (q_in * v, q_tbl * tv),
-                ]
-            });
-        }
-
-        cfg
+        configure_path3ord_full(meta)
     }
 
     fn synthesize(
@@ -1546,7 +1554,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param17";
+        let params_path = &crate::paths::param_file(17);
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -1626,7 +1634,7 @@ mod tests {
 
     #[test]
     fn test() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
+        let base_path = &crate::paths::graph_dir();
 
         let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
         // let mut edges =
@@ -1653,7 +1661,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/wiki_proof_q1";
+            let proof_path = &crate::paths::proof_file("wiki_proof_q1");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

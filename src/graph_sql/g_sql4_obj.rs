@@ -1991,7 +1991,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param18";
+        let params_path = &crate::paths::param_file(18);
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -2120,7 +2120,7 @@ mod tests {
 
     #[test]
     fn test_max_fre() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
+        let base_path = &crate::paths::graph_dir();
         // let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
         // [test_max_fre] max src freq: node=2565 count=893
         // [test_max_fre] max dst freq: node=4037 count=457
@@ -2143,7 +2143,7 @@ mod tests {
 
     #[test]
     fn test() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
+        let base_path = &crate::paths::graph_dir();
 
         // let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
 
@@ -2174,7 +2174,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/last_proof_q4";
+            let proof_path = &crate::paths::proof_file("last_proof_q4");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

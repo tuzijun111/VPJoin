@@ -1576,7 +1576,7 @@ mod tests {
 
     #[test]
     fn test_1() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data/facebook";
+        let base_path = &crate::paths::graph_file("facebook");
 
         let mut r1 = read_edges(&format!("{}/R1.tsv", base_path)).unwrap();
         let mut r2 = read_edges(&format!("{}/R2.tsv", base_path)).unwrap();

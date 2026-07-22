@@ -1892,7 +1892,7 @@ mod tests {
 
     #[test]
     fn test_1() {
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data/facebook";
+        let base_path = &crate::paths::graph_file("facebook");
 
         // Use whichever loader you actually have:
         // let r1 = read_edges_tsv(&format!("{}/R1.tsv", base_path)).unwrap();

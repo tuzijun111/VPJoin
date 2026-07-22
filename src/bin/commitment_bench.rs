@@ -136,39 +136,17 @@ fn main() {
 
     // ---- per-query binding costs ----------------------------------------
     // A stand-in for a query proof; only its bytes enter the Fiat--Shamir
-    // binding, so its content does not affect the measured cost.  The phase
-    // is repeated so the reported numbers are medians, not single shots.
+    // binding, so its content does not affect the measured cost.
     let query_proof = vec![0x5au8; 30_000];
-    const REPS: usize = 5;
-    let mut prove_times = Vec::with_capacity(REPS);
-    let mut verify_times = Vec::with_capacity(REPS);
-    let mut proof_len = 0usize;
-    for rep in 0..REPS {
-        let t = Instant::now();
-        let opening = bind_query_proof(&params, &db, blind, &commitment, &query_proof, OsRng);
-        prove_times.push(t.elapsed());
-        proof_len = opening.proof.len();
 
-        let t = Instant::now();
-        let ok = verify_binding(&params, &commitment, &db.layout, &query_proof, &opening);
-        verify_times.push(t.elapsed());
-        assert!(ok, "binding verification failed (rep {})", rep);
-    }
-    prove_times.sort();
-    verify_times.sort();
-    println!(
-        "[per-query] binding opening proof:   median {:?} (min {:?}, max {:?}, {} reps)",
-        prove_times[REPS / 2],
-        prove_times[0],
-        prove_times[REPS - 1],
-        REPS
-    );
-    println!("[per-query] opening proof size:      {} bytes", proof_len);
-    println!(
-        "[per-query] binding verification:    median {:?} (min {:?}, max {:?})",
-        verify_times[REPS / 2],
-        verify_times[0],
-        verify_times[REPS - 1]
-    );
+    let t = Instant::now();
+    let opening = bind_query_proof(&params, &db, blind, &commitment, &query_proof, OsRng);
+    println!("[per-query] binding opening proof:   {:?}", t.elapsed());
+    println!("[per-query] opening proof size:      {} bytes", opening.proof.len());
+
+    let t = Instant::now();
+    let ok = verify_binding(&params, &commitment, &db.layout, &query_proof, &opening);
+    println!("[per-query] binding verification:    {:?}", t.elapsed());
+    assert!(ok, "binding verification failed");
     println!("binding verified against the published Commit(D)");
 }

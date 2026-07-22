@@ -778,7 +778,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param16";
+        let params_path = &crate::paths::param_file(16);
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -849,9 +849,9 @@ mod tests {
             }
         }
 
-        let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
-        let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
-        let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
+        let customer_file_path = &crate::paths::data_file("customer.tbl");
+        let orders_file_path = &crate::paths::data_file("orders.tbl");
+        let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
 
         let mut customer: Vec<Vec<u64>> = Vec::new();
         let mut orders: Vec<Vec<u64>> = Vec::new();
@@ -909,7 +909,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_obj_q18";
+            let proof_path = &crate::paths::proof_file("proof_obj_q18");
             generate_and_verify_proof(k, circuit, &public_input, proof_path);
         }
     }

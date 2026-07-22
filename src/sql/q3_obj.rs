@@ -1757,12 +1757,15 @@ impl<F: Field + Ord> TestChip<F> {
 }
 
 // ---------------- Circuit wrapper ----------------
-struct MyCircuit<F> {
-    customer: Vec<Vec<u64>>,
-    orders: Vec<Vec<u64>>,
-    lineitem: Vec<Vec<u64>>,
+// Visibility only (revision): `pub` so the additive bench harness in
+// `crate::bench_queries` can build this circuit outside the test module.
+// No field, gate, or synthesis logic is changed.
+pub struct MyCircuit<F> {
+    pub customer: Vec<Vec<u64>>,
+    pub orders: Vec<Vec<u64>>,
+    pub lineitem: Vec<Vec<u64>>,
     pub condition: [u64; 2],
-    _marker: PhantomData<F>,
+    pub _marker: PhantomData<F>,
 }
 
 impl<F: Copy + Default> Default for MyCircuit<F> {
@@ -1842,7 +1845,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param16";
+        let params_path = &crate::paths::param_file(16);
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -1894,10 +1897,10 @@ mod tests {
         use std::collections::HashMap;
 
         // ---------------- paths ----------------
-        let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
-        let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
-        let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
-        let supplier_file_path = "/home2/binbin/PoneglyphDB/src/data/supplier.tbl";
+        let customer_file_path = &crate::paths::data_file("customer.tbl");
+        let orders_file_path = &crate::paths::data_file("orders.tbl");
+        let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
+        let supplier_file_path = &crate::paths::data_file("supplier.tbl");
 
         // ---------------- load records ----------------
         let customers = data_processing::customer_read_records_from_file(customer_file_path)
@@ -1977,10 +1980,10 @@ mod tests {
             use std::collections::HashMap;
 
             // ---------------- paths ----------------
-            let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
-            let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
-            let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
-            let supplier_file_path = "/home2/binbin/PoneglyphDB/src/data/supplier.tbl";
+            let customer_file_path = &crate::paths::data_file("customer.tbl");
+            let orders_file_path = &crate::paths::data_file("orders.tbl");
+            let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
+            let supplier_file_path = &crate::paths::data_file("supplier.tbl");
 
             // ---------------- load records ----------------
             let customers = data_processing::customer_read_records_from_file(customer_file_path)
@@ -2085,9 +2088,9 @@ mod tests {
             }
         }
 
-        let customer_file_path = "/home2/binbin/PoneglyphDB/src/data/customer.tbl";
-        let orders_file_path = "/home2/binbin/PoneglyphDB/src/data/orders.tbl";
-        let lineitem_file_path = "/home2/binbin/PoneglyphDB/src/data/lineitem.tbl";
+        let customer_file_path = &crate::paths::data_file("customer.tbl");
+        let orders_file_path = &crate::paths::data_file("orders.tbl");
+        let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
 
         let mut customer: Vec<Vec<u64>> = Vec::new();
         let mut orders: Vec<Vec<u64>> = Vec::new();
@@ -2145,7 +2148,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/proof_obj_q3";
+            let proof_path = &crate::paths::proof_file("proof_obj_q3");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

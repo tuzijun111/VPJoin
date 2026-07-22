@@ -1305,6 +1305,73 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
 }
 
 // ---- LOOKUPS (must use complex selectors for lookup-table gating) ----
+/// Full constraint-system setup for `GraphPath4OrderCircuit`.
+/// Extracted verbatim so the circuit and any wrapper that embeds it
+/// (see `crate::inline_bind`) configure IDENTICAL constraints -- the
+/// chip's own `configure` alone is NOT sufficient here.
+pub fn configure_path4order_full<F: Field + Ord>(meta: &mut ConstraintSystem<F>) -> GraphPath4OrderConfig<F> {
+    let mut cfg = GraphPath4OrderChip::<F>::configure(meta);
+
+    // Tables:
+    // T4 = cfg.agg[0]
+    // T3 = cfg.agg[1]
+    // T2 = cfg.agg[2]
+    let t4 = cfg.agg[0].clone();
+    let t3 = cfg.agg[1].clone();
+    let t2 = cfg.agg[2].clone();
+
+    // helper: add join lookups (gap + map)
+    let mut add_join =
+        |step: usize, rel_dst: Column<Advice>, j: JoinConfig<F>, t: AggConfig<F>| {
+            // Gap pair: (low, high) are consecutive keys around dst, when in_next=0
+            meta.lookup_any(format!("gap pair step {}", step), move |m| {
+                let q_in = m.query_selector(j.q_lookup_complex); // complex
+                let inx = m.query_advice(j.in_next, Rotation::cur());
+                let gate = q_in * (Expression::Constant(F::ONE) - inx);
+
+                let low = m.query_advice(j.low, Rotation::cur());
+                let high = m.query_advice(j.high, Rotation::cur());
+
+                let q_tbl = m.query_selector(t.q_map_tbl); // complex
+                let key = m.query_advice(t.map_pair[0], Rotation::cur());
+                let keyn = m.query_advice(t.map_key_next, Rotation::cur());
+
+                vec![
+                    (gate.clone() * low, q_tbl.clone() * key),
+                    (gate * high, q_tbl * keyn),
+                ]
+            });
+
+            // Map: (in*dst, val) exists in (map_key, map_val)
+            // If in=0, we force val=0 and in*dst=0, so (0,0) hits dummy row0.
+            meta.lookup_any(format!("map step {}", step), move |m| {
+                let q_in = m.query_selector(j.q_lookup_complex); // complex
+                let inx = m.query_advice(j.in_next, Rotation::cur());
+
+                let dst = m.query_advice(rel_dst, Rotation::cur());
+                let v = m.query_advice(j.val, Rotation::cur());
+
+                let q_tbl = m.query_selector(t.q_map_tbl); // complex
+                let tk = m.query_advice(t.map_pair[0], Rotation::cur());
+                let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+
+                vec![
+                    (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
+                    (q_in * v, q_tbl * tv),
+                ]
+            });
+        };
+
+    // r3.dst -> T4
+    add_join(2, cfg.r[2][1], cfg.join[2].clone(), t4);
+    // r2.dst -> T3
+    add_join(1, cfg.r[1][1], cfg.join[1].clone(), t3);
+    // r1.dst -> T2
+    add_join(0, cfg.r[0][1], cfg.join[0].clone(), t2);
+
+    cfg
+}
+
 impl<F: Field + Ord> Circuit<F> for GraphPath4OrderCircuit<F> {
     type Config = GraphPath4OrderConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
@@ -1314,66 +1381,7 @@ impl<F: Field + Ord> Circuit<F> for GraphPath4OrderCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let mut cfg = GraphPath4OrderChip::<F>::configure(meta);
-
-        // Tables:
-        // T4 = cfg.agg[0]
-        // T3 = cfg.agg[1]
-        // T2 = cfg.agg[2]
-        let t4 = cfg.agg[0].clone();
-        let t3 = cfg.agg[1].clone();
-        let t2 = cfg.agg[2].clone();
-
-        // helper: add join lookups (gap + map)
-        let mut add_join =
-            |step: usize, rel_dst: Column<Advice>, j: JoinConfig<F>, t: AggConfig<F>| {
-                // Gap pair: (low, high) are consecutive keys around dst, when in_next=0
-                meta.lookup_any(format!("gap pair step {}", step), move |m| {
-                    let q_in = m.query_selector(j.q_lookup_complex); // complex
-                    let inx = m.query_advice(j.in_next, Rotation::cur());
-                    let gate = q_in * (Expression::Constant(F::ONE) - inx);
-
-                    let low = m.query_advice(j.low, Rotation::cur());
-                    let high = m.query_advice(j.high, Rotation::cur());
-
-                    let q_tbl = m.query_selector(t.q_map_tbl); // complex
-                    let key = m.query_advice(t.map_pair[0], Rotation::cur());
-                    let keyn = m.query_advice(t.map_key_next, Rotation::cur());
-
-                    vec![
-                        (gate.clone() * low, q_tbl.clone() * key),
-                        (gate * high, q_tbl * keyn),
-                    ]
-                });
-
-                // Map: (in*dst, val) exists in (map_key, map_val)
-                // If in=0, we force val=0 and in*dst=0, so (0,0) hits dummy row0.
-                meta.lookup_any(format!("map step {}", step), move |m| {
-                    let q_in = m.query_selector(j.q_lookup_complex); // complex
-                    let inx = m.query_advice(j.in_next, Rotation::cur());
-
-                    let dst = m.query_advice(rel_dst, Rotation::cur());
-                    let v = m.query_advice(j.val, Rotation::cur());
-
-                    let q_tbl = m.query_selector(t.q_map_tbl); // complex
-                    let tk = m.query_advice(t.map_pair[0], Rotation::cur());
-                    let tv = m.query_advice(t.map_pair[1], Rotation::cur());
-
-                    vec![
-                        (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
-                        (q_in * v, q_tbl * tv),
-                    ]
-                });
-            };
-
-        // r3.dst -> T4
-        add_join(2, cfg.r[2][1], cfg.join[2].clone(), t4);
-        // r2.dst -> T3
-        add_join(1, cfg.r[1][1], cfg.join[1].clone(), t3);
-        // r1.dst -> T2
-        add_join(0, cfg.r[0][1], cfg.join[0].clone(), t2);
-
-        cfg
+        configure_path4order_full(meta)
     }
 
     fn synthesize(
@@ -1421,7 +1429,7 @@ mod tests {
         public_input: &[Fp],
         proof_path: &str,
     ) {
-        let params_path = "/home2/binbin/PoneglyphDB/src/proof/param17";
+        let params_path = &crate::paths::param_file(17);
         let mut fd = std::fs::File::open(&params_path).unwrap();
         let params = ParamsIPA::<vesta::Affine>::read(&mut fd).unwrap();
 
@@ -1514,7 +1522,7 @@ mod tests {
     #[test]
     fn test() {
         // Use REAL dataset R1.tsv as requested
-        let base_path = "/home2/binbin/PoneglyphDB/src/graph_data";
+        let base_path = &crate::paths::graph_dir();
 
         // let mut edges =
         //     read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
@@ -1545,7 +1553,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = "/home2/binbin/PoneglyphDB/src/proof/wiki_proof_q2";
+            let proof_path = &crate::paths::proof_file("wiki_proof_q2");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

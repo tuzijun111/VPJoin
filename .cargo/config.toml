@@ -1,0 +1,6 @@
+# Convenience aliases. These do NOT change any build profile settings;
+# they only spell out the flags so the commands stay short.
+[alias]
+# Additional cost of the data commitment + the in-circuit witness-equality
+# check, with the check inlined into the query circuit (Appendix A).
+commit-diff = "run --release --bin commit_diff --"
