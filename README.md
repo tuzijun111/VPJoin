@@ -226,6 +226,72 @@ Notes:
   (`nr/co/ls_pad_extra = 0 / 32*89 / 668*89`, see `dp/legacy_capacities.md`), and GQ3's
   bag padding is applied per dataset rather than fixed at the lastfm constant.
 
+### Baseline vs bound circuit files (where to look when debugging)
+
+Every query has TWO circuit files sitting next to each other; the bound file is
+the baseline **plus** the inlined witness-binding check of Appendix A, and must
+differ from it **only** by the binding columns/gates:
+
+| baseline (pure query) | bound (query + in-circuit binding check) |
+|---|---|
+| `src/sql/q3_obj.rs` | `src/sql/q3_bound.rs` |
+| `src/sql/q5_obj.rs` | `src/sql/q5_bound.rs` |
+| `src/sql/q8_obj.rs` | `src/sql/q8_bound.rs` |
+| `src/sql/q9_obj.rs` | `src/sql/q9_bound.rs` |
+| `src/sql/q18_obj.rs` | `src/sql/q18_bound.rs` |
+| `src/graph_sql/g_sql1_obj.rs` | `src/graph_sql/g_sql1_bound.rs` |
+| `src/graph_sql/g_sql2_obj.rs` | `src/graph_sql/g_sql2_bound.rs` |
+| `src/graph_sql/g_sql3_obj.rs` | `src/graph_sql/g_sql3_bound.rs` |
+| `src/graph_sql/g_sql4_obj.rs` | `src/graph_sql/g_sql4_bound.rs` |
+
+The pieces of the commitment layer that live **outside** the circuit are shared:
+`src/column_commit.rs` (per-column Pedersen commitments, Fiat-Shamir challenge,
+IPA openings) and `src/inline_bind.rs` (the binding gate library
+`configure_bind`/`assign_bind`, plus the measurement helpers). The structural
+guard `cargo test --lib -- inline_bind` asserts every bound circuit is a strict
+superset of its baseline (same lookups, +2 gates, +6/+2NC advice columns), so a
+drift between the pair fails the test suite instead of silently skewing
+measurements.
+
+### In-circuit binding cost (`cargo commit-diff`)
+
+The additional cost of the commitment layer measured the way Appendix A
+describes it -- the witness-equality check INLINED into the query circuit, one
+proof covering both. Each row is proved twice (base and bound) at the same
+degree; `in-circ` is the median of the paired differences.
+
+The two commands for the full test:
+
+```bash
+# queries that materialize no intermediates (privacy setting irrelevant)
+cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
+
+# queries that materialize bags (Q5, GQ3, GQ4): measure at Revealing-Join-Size
+VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
+```
+
+Notes:
+
+* **`in-circ` is a difference of two large proof times**, so pin to one NUMA
+  node for publishable numbers (floor drops from +/-1.5 s to +/-0.2 s on this
+  4-node server). `numactl` must wrap the binary, not cargo:
+
+  ```bash
+  numactl --cpunodebind=0 --membind=0 ./target/release/commit_diff reps=3 q3 q8 q9 q18 gq1 gq2
+  VPJOIN_PRIVACY=rjs numactl --cpunodebind=0 --membind=0 ./target/release/commit_diff reps=3 q5 gq3 gq4
+  ```
+* Measure the noise floor first with the control experiment (proves the base
+  circuit against itself; the true answer is zero, so whatever it reports is
+  bias): `VPJOIN_SELFTEST=1 cargo commit-diff reps=2 q18`.
+* **The gq3/gq4 rows on facebook/wiki run at k=22-23 and cost hours each**
+  (the inlined check inherits the query circuit's bag-inflated domain even
+  though it binds only 2 Edge columns). For those rows the separate-circuit
+  measurement (`vpjoin_bench commit`, ~1 s at k=15-17) is both far cheaper and
+  the more meaningful number; if you do run them inlined, say which framing the
+  reported number uses.
+* `reps=N` on the command line overrides `VPJOIN_REPS`; `gq2:wiki` selects one
+  dataset; `VPJOIN_VERBOSE=1` prints each repetition's raw base/bound times.
+
 ### Public Parameter Selection (k)
 
 Select appropriate Halo2 public parameter k depending on dataset size and SQL queries.
@@ -365,28 +431,85 @@ fixed capacity, verified by the same lookup-argument machinery).  The bench runs
 *anchor* execution at true intermediate sizes (measured N_0, G_C0, T_0), reports the
 worst-case padded size (N, G_C), and prints the extrapolated T_est = T_0 * G_C / G_C0.
 
+All 4 graph queries on all 3 datasets, one command.  **Omit `--release`** so the anchor is
+measured under the same unoptimized profile as the paper's other proving times
+(`cargo test ... qN_obj::tests::test_1`); mixing the two profiles in one comparison inflates
+the ratio by roughly 5x:
+
+```bash
+cargo run --bin pone_graph_bench -- results/pone_graph_debug.csv
+```
+
+Check the plan without proving anything (instant), or restrict to a subset:
+
+```bash
+PONE_PLAN_ONLY=1 cargo run --bin pone_graph_bench -- /dev/null
+```
+
+```bash
+cargo run --bin pone_graph_bench -- results/pone_gq3.csv gq3 gq4 wiki
+```
+
+The anchor **must** subsample: `|P_3|` is 79M rows on Facebook and 202M on Wiki, so the
+unpadded execution does not fit at full scale.  The harness therefore takes the largest
+prefix of the edge list that still fits a `2^PONE_K0` domain (default `k0=17`, giving
+anchors of 2.6K-15K edges), and — this is the part that must not be got wrong — derives the
+worst-case `N`, `G_C` from the **full** dataset regardless.  The anchor's only job is to
+measure seconds per domain row for this circuit shape; the padded circuit it is scaled to is
+the one over the real graph.  Raise `PONE_K0` for a tighter anchor (a larger anchor amortizes
+fixed overheads better, which is *more* conservative in PoneglyphDB's favor); force a
+specific subsample with `PONE_EDGES=n`.
+
+Anchor and padded circuit share the same row-count formula (`pone_baseline::circuit_rows`)
+and the same column count, so `T_0 / G_{C,0}` is a per-domain-row rate for an unchanged
+shape.  Note that the levels occupy **disjoint column groups of one region**, so the row
+count is the max of the per-level heights, not their sum.
+
+**Two worst-case bounds are reported.**
+
+| bound | applies when | GQ1/GQ3 lastfm | source |
+|---|---|---|---|
+| `m^t` (the paper's) | bag semantics, no key constraint (the evaluated setting) | `G_C = 2^45` | `worst_case_rows` |
+| AGM `m^ceil((t+1)/2)` | set semantics (publicly assumed edge distinctness) | `G_C = 2^30` | `worst_case_rows_agm` |
+
+`m^t` is not merely valid but **tight** in the paper's setting: the graph queries are SQL
+queries (bag semantics) with no uniqueness constraint on the edge relation, and an instance
+that concentrates its multiplicity on a single t-edge path attains `(m/t)^t = Theta(m^t)`.
+The AGM bound (fractional edge cover `ceil((t+1)/2)` of a t-edge path) applies only if a key
+constraint on the edges is publicly assumed, which is exactly the class of schema assumptions
+the paper's evaluation excludes (Parameter Setting paragraph of the experiments section);
+padding to it without that constraint would under-provision on duplicate-heavy instances.
+The harness reports both because the paper's robustness claim quotes them: even under AGM
+the padded domains span 2^30 to 2^50, all beyond the largest runnable domain (2^23), and the
+speedups stay at or above three orders of magnitude.
+
+The baseline computes the **same query** as VPJoin with the **same per-row join machinery**:
+every materialized row is bound to one specific (parent, edge) occurrence pair through
+`g_sql4_obj::IndexedViewChip`, the identical PermAny-bound sorted-view chip VPJoin's own bag
+materializations use, and the ascending-vertex predicates (`a<b<c`, plus `c<d` for the
+4-edge queries) are enforced with the same 8-byte `LtChip` comparisons.
+`tests::counts_match_the_vpjoin_ground_truth` pins the baseline's counts to
+`bench_queries::count_gq1..4`, and two adversarial tests pin the gates: unordered rows and
+mis-indexed rows are both rejected.  This matters for the anchor: an under-constrained
+baseline is cheaper per row than PoneglyphDB really is, and the extrapolation multiplies
+that error by `G_C / G_{C,0}`.  The shapes are genuinely comparable now -- 131 advice / 70
+lookups against gq1's 141 / 84, and a measured debug `T_0` of ~195 s at `2^17` against
+VPJoin's ~251 s.  That 0.78 ratio matches the released PoneglyphDB artifact's own TPC-H
+per-row cost (about 0.75x of VPJoin's); the residual gap is PoneglyphDB's genuine advantage
+(simpler gates, constraint degree 5 vs 7), not missing constraints.
+
+Edge parsing matches `bench_queries::load_graph` exactly, so the baseline sees the same edge
+multiset as VPJoin: no symmetrization, and no duplicate edges in any of the three files.
+The ordering predicates are a no-op on LastFM and Facebook, which store every edge as
+`src < dst`, so only Wiki's anchor sizing changes (its intermediates roughly halve).
+LastFM and Facebook store each undirected edge once with `src < dst`, so no directed cycle
+exists and GQ3/GQ4 report a count of 0 on them — matching VPJoin's own `count_gq3`/`count_gq4`.
+That does not affect the cost anchor: every `|P_t|` row is still materialized and constrained,
+and the closure gate only marks the non-closed ones as dummies.
+
 ```bash
 cargo test --release --lib pone_baseline
-# quick smoke run on a subsample ('sym' inserts both edge directions; the count subsamples edges)
-cargo run --release --bin pone_graph_bench -- gq3 src/graph_data/facebook/facebook_combined.txt 2000 sym
 ```
-
-Full-scale anchors for every query/dataset pair of Figure 3 (the three SNAP datasets ship in
-`src/graph_data/`; the loader accepts whitespace- or comma-separated edge lists and skips
-headers/comments).  Each run prints the anchor `N_0`, `G_C0`, `T_0`, the worst-case `N`,
-`G_C`, and the extrapolated `T_est` — these are the values for the Section 8.1 anchor table:
-
-```bash
-for q in gq1 gq2 gq3 gq4; do
-  cargo run --release --bin pone_graph_bench -- $q src/graph_data/last/lastfm_asia_edges.csv sym
-  cargo run --release --bin pone_graph_bench -- $q src/graph_data/facebook/facebook_combined.txt sym
-  cargo run --release --bin pone_graph_bench -- $q src/graph_data/wiki/wiki_Vote.txt sym
-done
-```
-
-Warning: anchor cost scales with the true intermediate sizes; on the dense Facebook graph
-the higher levels (gq2/gq4) can be very large.  Use a `[max_edges]` subsample first to gauge
-the size (the true intermediate sizes are printed before proving starts).
 
 ### 5. Regenerating the DP experiments with the corrected mechanism
 

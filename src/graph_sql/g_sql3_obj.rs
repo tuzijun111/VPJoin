@@ -1502,7 +1502,9 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 let real12 = t12.len();
                 let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
 
-                println!("The length of n12 is: {}", t12.len());
+                // Debug print, silenced: `assign` runs during keygen as well as
+                // proving, so this fired several times per measured row.
+                // println!("The length of n12 is: {}", t12.len());
 
                 // key list for gap witnesses
                 let mut keys: Vec<u64> = msg_map.keys().copied().collect();
@@ -1906,6 +1908,25 @@ mod tests {
 
         let cnt = expected_cnt(&edges);
 
+        // ---------------------------------------------------------------
+        // PAPER-REPORTED PADDING CONSTANTS (VPJoin + DP, GQ3 on LastFM).
+        //
+        // Hand-chosen capacity behind the GQ3 "VPJoin + DP" numbers in the
+        // paper; NOT an output of the DP mechanism in
+        // `dp/noise_generator.py` / `src/dp_noise.rs`. See
+        // `dp/legacy_capacities.md`.
+        //
+        //   18067 = 203 * 89, added to BOTH bags, on top of the true wedge
+        //   size (|n12| = 232,943 on LastFM -- see the comments above).
+        //
+        // The equivalents for the other datasets, recorded from the same
+        // calibration, are facebook 92,827 = 1043*89 and wiki 79,427 = 893*89;
+        // the benchmark harness holds all three in
+        // `bench_queries::gq3_pad_extra` (VPJOIN_PRIVACY=legacy). Setting both
+        // knobs to 0 gives the "Revealing Join Size" baseline (=rjs);
+        // VPJOIN_PRIVACY=dp instead releases capacities from the corrected
+        // mechanism. Keep this test and that function in agreement.
+        // ---------------------------------------------------------------
         let circuit = MyCircuit::<Fp> {
             edges,
             bag1_pad_extra: 18067,

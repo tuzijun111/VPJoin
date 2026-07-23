@@ -979,131 +979,34 @@ impl<F: Field + Ord> Q5Chip<F> {
             out
         }
 
-        // ---------- build shifted maps ----------
-        // shift nationkey+1, regionkey+1 to keep 0 as sentinel
-        let mut cust_to_nk: HashMap<u64, u64> = HashMap::new();
-        for r in customer.iter() {
-            cust_to_nk.insert(r[0], r[1] + 1);
-        }
-        let mut supp_to_nk: HashMap<u64, u64> = HashMap::new();
-        for r in supplier.iter() {
-            supp_to_nk.insert(r[0], r[1] + 1);
-        }
-        let mut reg_to_name: HashMap<u64, u64> = HashMap::new();
-        for r in region_file.iter() {
-            reg_to_name.insert(r[0] + 1, r[1]); // regionkey_shift
-        }
-
-        // ---------- NR derivation (nation ⋈ region, filter EUROPE) ----------
-        let mut nr_rname_u64 = vec![0u64; nation.len()];
-        let mut nr_keep_b = vec![false; nation.len()];
-        let mut nr_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; nation.len()];
-
-        for i in 0..nation.len() {
-            let nk_shift = nation[i][0] + 1;
-            let nm_hash = nation[i][1];
-            let rk_shift = nation[i][2] + 1;
-            let rname = *reg_to_name.get(&rk_shift).unwrap_or(&0);
-            nr_rname_u64[i] = rname;
-            nr_keep_b[i] = rname == europe_hash;
-            nr_pair_u64[i] = vec![nk_shift, nm_hash];
-        }
-        let nr_filtered: Vec<Vec<u64>> = nr_pair_u64
-            .iter()
-            .cloned()
-            .zip(nr_keep_b.iter())
-            .filter(|(_, &k)| k)
-            .map(|(r, _)| r)
-            .collect();
-
-        let pad2 = vec![PAD_U64; 2];
-        let nr_filt_pad_u64 = pad_filter_u64(&nr_pair_u64, &nr_keep_b, &pad2);
-
-        // NEW: allow NR to be padded beyond nation.len()
-        let nr_total = nation.len().saturating_add(nr_pad_extra).max(1);
-        let mut nr_filt_pad_u64_ext = nr_filt_pad_u64.clone();
-        while nr_filt_pad_u64_ext.len() < nr_total {
-            nr_filt_pad_u64_ext.push(pad2.clone());
-        }
-        let nr_out_pad_u64 = pad_out_u64(&nr_filtered, nr_total, &pad2);
-
-        // map nk_shift -> name_hash for filtered NR
-        let mut nk_to_name: HashMap<u64, u64> = HashMap::new();
-        for r in nr_filtered.iter() {
-            nk_to_name.insert(r[0], r[1]);
-        }
-
-        // ---------- CO derivation (orders ⋈ customer, filter by date range) ----------
-        let mut co_nk_u64 = vec![0u64; orders.len()];
-        let mut co_ge_b = vec![false; orders.len()];
-        let mut co_lt_b = vec![false; orders.len()];
-        let mut co_keep_b = vec![false; orders.len()];
-        let mut co_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; orders.len()];
-
-        for i in 0..orders.len() {
-            let odate = orders[i][0];
-            let cust = orders[i][1];
-            let okey = orders[i][2];
-
-            let nk_shift = *cust_to_nk.get(&cust).unwrap_or(&0);
-            co_nk_u64[i] = nk_shift;
-
-            co_ge_b[i] = start_ts <= odate;
-            co_lt_b[i] = odate < end_ts;
-            co_keep_b[i] = co_ge_b[i] && co_lt_b[i];
-
-            co_pair_u64[i] = vec![okey, nk_shift];
-        }
-
-        let co_filtered: Vec<Vec<u64>> = co_pair_u64
-            .iter()
-            .cloned()
-            .zip(co_keep_b.iter())
-            .filter(|(_, &k)| k)
-            .map(|(r, _)| r)
-            .collect();
-
-        let co_filt_pad_u64 = pad_filter_u64(&co_pair_u64, &co_keep_b, &pad2);
-
-        // NEW: allow CO to be padded beyond orders.len()
-        let co_total = orders.len().saturating_add(co_pad_extra).max(1);
-        let mut co_filt_pad_u64_ext = co_filt_pad_u64.clone();
-        while co_filt_pad_u64_ext.len() < co_total {
-            co_filt_pad_u64_ext.push(pad2.clone());
-        }
-        let co_out_pad_u64 = pad_out_u64(&co_filtered, co_total, &pad2);
-
-        // build key sets for join
-        let co_set: HashSet<u64> = co_filtered
-            .iter()
-            .map(|r| r[0] * SHIFT_NATION + r[1])
-            .collect();
-
-        let nr_set: HashSet<u64> = nr_filtered.iter().map(|r| r[0]).collect();
-
-        // ---------- LS materialization (lineitem ⋈ supplier) ----------
-        let mut ls_mat_u64: Vec<Vec<u64>> = vec![vec![0, 0, 0, 0]; lineitem.len()];
-        for i in 0..lineitem.len() {
-            let okey = lineitem[i][0];
-            let supp = lineitem[i][1];
-            let ext = lineitem[i][2];
-            let disc = lineitem[i][3];
-            let nk_shift = *supp_to_nk.get(&supp).unwrap_or(&0);
-            ls_mat_u64[i] = vec![okey, nk_shift, ext, disc];
-        }
-
-        // ---------- partition LS into join/disjoin (relative to CO and NR) ----------
-        let mut ls_join_u64 = vec![];
-        let mut ls_dis_u64 = vec![];
-        for r in ls_mat_u64.iter() {
-            let packed = r[0] * SHIFT_NATION + r[1];
-            let ok = co_set.contains(&packed) && nr_set.contains(&r[1]);
-            if ok {
-                ls_join_u64.push(r.clone());
-            } else {
-                ls_dis_u64.push(r.clone());
-            }
-        }
+        // Derived intermediates come from ONE shared definition (see
+        // `q5_derive`), which `bench_queries::q5_pads` also uses to size the
+        // DP capacity for Bag 2 {L,S} -- so the two can never drift.
+        let Q5Derived {
+            nr_rname_u64,
+            nr_keep_b,
+            nr_pair_u64,
+            nr_filtered,
+            nk_to_name,
+            co_nk_u64,
+            co_ge_b,
+            co_lt_b,
+            co_keep_b,
+            co_pair_u64,
+            co_filtered,
+            ls_mat_u64,
+            ls_join_u64,
+            ls_dis_u64,
+            nr_filt_pad_u64_ext,
+            co_filt_pad_u64_ext,
+            nr_total,
+            co_total,
+            nr_out_pad_u64,
+            co_out_pad_u64,
+        } = q5_derive(
+            &customer, &orders, &lineitem, &supplier, &nation, &region_file,
+            europe_hash, start_ts, end_ts, nr_pad_extra, co_pad_extra,
+        );
 
         // key vectors for membership+gap
         let mut valid_co_keys: Vec<u64> = co_filtered
@@ -1859,6 +1762,224 @@ impl<F: Field + Ord> Q5Chip<F> {
     }
 }
 
+/// Everything Q5's witness generation derives from the base tables before
+/// any circuit region is touched.
+///
+/// Extracted from `assign` VERBATIM so that the bag sizes needed for DP
+/// capacity release (`bench_queries::q5_pads`) come from the SAME code the
+/// circuit witnesses, and cannot drift from it.
+pub struct Q5Derived {
+    pub nr_rname_u64: Vec<u64>,
+    pub nr_keep_b: Vec<bool>,
+    pub nr_pair_u64: Vec<Vec<u64>>,
+    pub nr_filtered: Vec<Vec<u64>>,
+    pub nk_to_name: HashMap<u64,u64>,
+    pub co_nk_u64: Vec<u64>,
+    pub co_ge_b: Vec<bool>,
+    pub co_lt_b: Vec<bool>,
+    pub co_keep_b: Vec<bool>,
+    pub co_pair_u64: Vec<Vec<u64>>,
+    pub co_filtered: Vec<Vec<u64>>,
+    pub ls_mat_u64: Vec<Vec<u64>>,
+    pub ls_join_u64: Vec<Vec<u64>>,
+    pub ls_dis_u64: Vec<Vec<u64>>,
+    pub nr_filt_pad_u64_ext: Vec<Vec<u64>>,
+    pub co_filt_pad_u64_ext: Vec<Vec<u64>>,
+    pub nr_total: usize,
+    pub co_total: usize,
+    pub nr_out_pad_u64: Vec<Vec<u64>>,
+    pub co_out_pad_u64: Vec<Vec<u64>>,
+}
+
+/// Derive Q5's intermediates from the base tables (pure; no circuit access).
+///
+/// Bag 1 {O,C} is `co_*` and is sized `orders.len() + co_pad_extra`; Bag 2
+/// {L,S} is `ls_join_u64` and is sized `ls_join_u64.len() + ls_pad_extra` by
+/// the caller. `nr_*` is the N join R dimension filter (one row per nation),
+/// not a bag.
+#[allow(clippy::too_many_arguments)]
+pub fn q5_derive(
+    customer: &[Vec<u64>],
+    orders: &[Vec<u64>],
+    lineitem: &[Vec<u64>],
+    supplier: &[Vec<u64>],
+    nation: &[Vec<u64>],
+    region_file: &[Vec<u64>],
+    europe_hash: u64,
+    start_ts: u64,
+    end_ts: u64,
+    nr_pad_extra: usize,
+    co_pad_extra: usize,
+) -> Q5Derived {
+    // NOTE: positional, not compacting -- a filtered-out row is REPLACED by a
+    // PAD row at the same index, preserving order and length. Copied verbatim
+    // from `assign`; an earlier hand-written "compact then pad" version broke
+    // every downstream constraint.
+    fn pad_filter_u64(rows: &[Vec<u64>], keep: &[bool], pad: &[u64]) -> Vec<Vec<u64>> {
+        rows.iter()
+            .zip(keep.iter())
+            .map(|(r, &k)| if k { r.clone() } else { pad.to_vec() })
+            .collect()
+    }
+    fn pad_out_u64(filtered: &[Vec<u64>], total: usize, pad: &[u64]) -> Vec<Vec<u64>> {
+        let mut out: Vec<Vec<u64>> = Vec::with_capacity(total);
+        out.extend_from_slice(filtered);
+        while out.len() < total {
+            out.push(pad.to_vec());
+        }
+        out
+    }
+
+// ---------- build shifted maps ----------
+// shift nationkey+1, regionkey+1 to keep 0 as sentinel
+let mut cust_to_nk: HashMap<u64, u64> = HashMap::new();
+for r in customer.iter() {
+    cust_to_nk.insert(r[0], r[1] + 1);
+}
+let mut supp_to_nk: HashMap<u64, u64> = HashMap::new();
+for r in supplier.iter() {
+    supp_to_nk.insert(r[0], r[1] + 1);
+}
+let mut reg_to_name: HashMap<u64, u64> = HashMap::new();
+for r in region_file.iter() {
+    reg_to_name.insert(r[0] + 1, r[1]); // regionkey_shift
+}
+
+// ---------- NR derivation (nation ⋈ region, filter EUROPE) ----------
+let mut nr_rname_u64 = vec![0u64; nation.len()];
+let mut nr_keep_b = vec![false; nation.len()];
+let mut nr_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; nation.len()];
+
+for i in 0..nation.len() {
+    let nk_shift = nation[i][0] + 1;
+    let nm_hash = nation[i][1];
+    let rk_shift = nation[i][2] + 1;
+    let rname = *reg_to_name.get(&rk_shift).unwrap_or(&0);
+    nr_rname_u64[i] = rname;
+    nr_keep_b[i] = rname == europe_hash;
+    nr_pair_u64[i] = vec![nk_shift, nm_hash];
+}
+let nr_filtered: Vec<Vec<u64>> = nr_pair_u64
+    .iter()
+    .cloned()
+    .zip(nr_keep_b.iter())
+    .filter(|(_, &k)| k)
+    .map(|(r, _)| r)
+    .collect();
+
+let pad2 = vec![PAD_U64; 2];
+let nr_filt_pad_u64 = pad_filter_u64(&nr_pair_u64, &nr_keep_b, &pad2);
+
+// NEW: allow NR to be padded beyond nation.len()
+let nr_total = nation.len().saturating_add(nr_pad_extra).max(1);
+let mut nr_filt_pad_u64_ext = nr_filt_pad_u64.clone();
+while nr_filt_pad_u64_ext.len() < nr_total {
+    nr_filt_pad_u64_ext.push(pad2.clone());
+}
+let nr_out_pad_u64 = pad_out_u64(&nr_filtered, nr_total, &pad2);
+
+// map nk_shift -> name_hash for filtered NR
+let mut nk_to_name: HashMap<u64, u64> = HashMap::new();
+for r in nr_filtered.iter() {
+    nk_to_name.insert(r[0], r[1]);
+}
+
+// ---------- CO derivation (orders ⋈ customer, filter by date range) ----------
+let mut co_nk_u64 = vec![0u64; orders.len()];
+let mut co_ge_b = vec![false; orders.len()];
+let mut co_lt_b = vec![false; orders.len()];
+let mut co_keep_b = vec![false; orders.len()];
+let mut co_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; orders.len()];
+
+for i in 0..orders.len() {
+    let odate = orders[i][0];
+    let cust = orders[i][1];
+    let okey = orders[i][2];
+
+    let nk_shift = *cust_to_nk.get(&cust).unwrap_or(&0);
+    co_nk_u64[i] = nk_shift;
+
+    co_ge_b[i] = start_ts <= odate;
+    co_lt_b[i] = odate < end_ts;
+    co_keep_b[i] = co_ge_b[i] && co_lt_b[i];
+
+    co_pair_u64[i] = vec![okey, nk_shift];
+}
+
+let co_filtered: Vec<Vec<u64>> = co_pair_u64
+    .iter()
+    .cloned()
+    .zip(co_keep_b.iter())
+    .filter(|(_, &k)| k)
+    .map(|(r, _)| r)
+    .collect();
+
+let co_filt_pad_u64 = pad_filter_u64(&co_pair_u64, &co_keep_b, &pad2);
+
+// NEW: allow CO to be padded beyond orders.len()
+let co_total = orders.len().saturating_add(co_pad_extra).max(1);
+let mut co_filt_pad_u64_ext = co_filt_pad_u64.clone();
+while co_filt_pad_u64_ext.len() < co_total {
+    co_filt_pad_u64_ext.push(pad2.clone());
+}
+let co_out_pad_u64 = pad_out_u64(&co_filtered, co_total, &pad2);
+
+// build key sets for join
+let co_set: HashSet<u64> = co_filtered
+    .iter()
+    .map(|r| r[0] * SHIFT_NATION + r[1])
+    .collect();
+
+let nr_set: HashSet<u64> = nr_filtered.iter().map(|r| r[0]).collect();
+
+// ---------- LS materialization (lineitem ⋈ supplier) ----------
+let mut ls_mat_u64: Vec<Vec<u64>> = vec![vec![0, 0, 0, 0]; lineitem.len()];
+for i in 0..lineitem.len() {
+    let okey = lineitem[i][0];
+    let supp = lineitem[i][1];
+    let ext = lineitem[i][2];
+    let disc = lineitem[i][3];
+    let nk_shift = *supp_to_nk.get(&supp).unwrap_or(&0);
+    ls_mat_u64[i] = vec![okey, nk_shift, ext, disc];
+}
+
+// ---------- partition LS into join/disjoin (relative to CO and NR) ----------
+let mut ls_join_u64 = vec![];
+let mut ls_dis_u64 = vec![];
+for r in ls_mat_u64.iter() {
+    let packed = r[0] * SHIFT_NATION + r[1];
+    let ok = co_set.contains(&packed) && nr_set.contains(&r[1]);
+    if ok {
+        ls_join_u64.push(r.clone());
+    } else {
+        ls_dis_u64.push(r.clone());
+    }
+}
+
+    Q5Derived {
+        nr_rname_u64,
+        nr_keep_b,
+        nr_pair_u64,
+        nr_filtered,
+        nk_to_name,
+        co_nk_u64,
+        co_ge_b,
+        co_lt_b,
+        co_keep_b,
+        co_pair_u64,
+        co_filtered,
+        ls_mat_u64,
+        ls_join_u64,
+        ls_dis_u64,
+        nr_filt_pad_u64_ext,
+        co_filt_pad_u64_ext,
+        nr_total,
+        co_total,
+        nr_out_pad_u64,
+        co_out_pad_u64,
+    }
+}
+
 // ---------------- Circuit wrapper ----------------
 pub struct MyCircuit<F> {
     // base tables (UNSHIFTED keys as loaded from .tbl/.csv)
@@ -2121,7 +2242,24 @@ mod tests {
         let start_ts = date_to_timestamp("1997-01-01");
         let end_ts = date_to_timestamp("1998-01-01"); // strict < end
 
-        // NEW: padding knobs (set to 0 if you don't need)
+        // ---------------------------------------------------------------
+        // PAPER-REPORTED PADDING CONSTANTS (VPJoin + DP, Q5).
+        //
+        // These are the hand-chosen capacities behind the Q5 "VPJoin + DP"
+        // numbers reported in the paper (Fig. "Impact of privacy constraints"
+        // and the epsilon sweep). They are NOT outputs of the DP mechanism in
+        // `dp/noise_generator.py` / `src/dp_noise.rs`; they predate it. See
+        // `dp/legacy_capacities.md`.
+        //
+        //   nr_pad_extra = 0            NR permutation, |nation| = 25, unpadded
+        //   co_pad_extra = 32  * 89     CO bag, on top of |orders|
+        //   ls_pad_extra = 668 * 89     LS bag, on top of the filtered join
+        //
+        // Setting all three to 0 gives the paper's "Revealing Join Size"
+        // baseline. The benchmark harness selects between the two via
+        // `bench_queries::q5_pads` (VPJOIN_PRIVACY=legacy | rjs); keep this
+        // test and that function in agreement.
+        // ---------------------------------------------------------------
         let nr_pad_extra = 0usize;
         let co_pad_extra = (32 * 89) as usize;
         let ls_pad_extra = (668 * 89) as usize;

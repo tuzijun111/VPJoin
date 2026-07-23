@@ -83,7 +83,7 @@ fn tbl(name: &str) -> String {
 /// under different parameters than the ones in `src/proof/`.  A degree that
 /// is genuinely absent (the repo ships param15..param19; GQ3 on the larger
 /// graphs needs more) is generated once, persisted there, and loudly logged.
-fn params_for(k: u32) -> ParamsIPA<vesta::Affine> {
+pub fn params_for(k: u32) -> ParamsIPA<vesta::Affine> {
     let path = PathBuf::from(crate::paths::param_file(k));
     if path.exists() {
         let mut fd = std::fs::File::open(&path)
@@ -273,7 +273,18 @@ pub enum Mode {
 pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
     match (query, dataset) {
         // TPC-H: every query includes lineitem (60,175 rows), so k = 16.
-        ("q3" | "q5" | "q8" | "q9" | "q18", _) => 16,
+        //
+        // Q5 also materializes intermediates, but its padded bags still fit
+        // 2^16 in every supported regime (rjs shrinks them; legacy adds
+        // 2,848 + 59,452 rows on top of |orders| and the LS join). The
+        // assertion in `run_at` fails loudly if that ever stops holding.
+        ("q5", _) => {
+            // Resolve the pads here too, so an unsupported regime (dp) is
+            // rejected during planning rather than hours into a run.
+            let _ = q5_pads(privacy);
+            16
+        }
+        ("q3" | "q8" | "q9" | "q18", _) => 16,
 
         // Path queries: k = 17 on all three graphs (measured).
         ("gq1" | "gq2", _) => 17,
@@ -769,6 +780,104 @@ impl Privacy {
     }
 }
 
+/// Padding knobs for Q5's three materialized intermediates, under a given
+/// privacy regime.
+///
+/// Returns `(nr_pad_extra, co_pad_extra, ls_pad_extra)`. The circuit sizes each
+/// intermediate as `base + pad_extra`, where `base` is the true size it
+/// computes internally (`nation.len()`, `orders.len()`, and the filtered
+/// lineitem-supplier join length respectively, see `q5_obj.rs`).
+///
+/// `Rjs` and `Legacy` need no size model: the former is all-zero by definition,
+/// the latter replays the constants used for the submitted results. `Dp` DOES
+/// need the true bag sizes and join-key frequencies, and Q5's LS bag is the
+/// output of the full multi-way filter (`ls_join_u64` in `q5_obj.rs`, gated by
+/// `co_set` and `nr_set`) -- reproducing that outside the circuit would be a
+/// second, drifting implementation of the query. Rather than guess it, DP is
+/// refused for Q5 until the circuit exposes its own bag sizes.
+pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
+    match privacy {
+        Privacy::Rjs => (0, 0, 0),
+        // Values used for the DP results reported in the paper; see
+        // `dp/legacy_capacities.md` and the note in `q5_obj.rs`.
+        Privacy::Legacy => (0, 32 * 89, 668 * 89),
+        Privacy::Dp { epsilon, delta } => {
+            let input = tpch_inputs_raw("q5");
+            let (nr, co, ls) = match &input {
+                TpchInput::Q5 {
+                    customer, orders, lineitem, supplier, nation, region,
+                    europe_hash, start_ts, end_ts, ..
+                } => {
+                    // Bag sizes come from the circuit's OWN derivation, so the
+                    // released capacity is calibrated to the size the circuit
+                    // will actually materialize.
+                    let d = crate::sql::q5_obj::q5_derive(
+                        customer, orders, lineitem, supplier, nation, region,
+                        *europe_hash, *start_ts, *end_ts, 0, 0,
+                    );
+                    let ls_true = d.ls_join_u64.len() as u64;
+
+                    // Only Bag 2 {L,S} needs a release:
+                    //  * the N-R dimension filter is sized `nation.len()`, and
+                    //  * Bag 1 {O,C} is sized `orders.len()`,
+                    // both PUBLIC base-relation row counts that the verifier
+                    // already knows, so neither leaks and neither consumes
+                    // budget (same argument as GQ3's public-size second bag).
+                    // The whole (epsilon, delta) therefore goes to Bag 2.
+                    //
+                    // Sensitivity: Bag 2 is lineitem |x| supplier on suppkey.
+                    // suppkey is unique in supplier, so one side has frequency
+                    // 1; the other is the maximum number of lineitems sharing
+                    // a suppkey. `dp_join_capacity` takes max(tau_a, tau_b) of
+                    // the NOISY frequencies, per the per-instance neighboring
+                    // model documented there.
+                    let mut freq: HashMap<u64, u64> = HashMap::new();
+                    for r in lineitem.iter() {
+                        *freq.entry(r[1]).or_insert(0) += 1;
+                    }
+                    let mf_l = freq.values().copied().max().unwrap_or(1);
+
+                    let mut rng = dp_rng("q5", "tpch-60K");
+                    let cap = crate::dp_noise::dp_join_capacity(
+                        ls_true, mf_l, 1, epsilon, delta, false, &mut rng,
+                    );
+                    // Clamp to the PUBLIC worst case. Every row of Bag 2 comes
+                    // from exactly one lineitem tuple (suppkey is unique in
+                    // supplier), so |L |x| S| <= |lineitem| always -- a bound
+                    // the verifier can check without seeing the data. A
+                    // released capacity above it would be strictly worse than
+                    // the fully oblivious choice, and here it also overflows
+                    // 2^16. Clamping with a data-INDEPENDENT constant is
+                    // post-processing, so the DP guarantee is preserved, and
+                    // correctness holds because ls_true <= the bound too.
+                    let oblivious_ub = lineitem.len() as u64;
+                    let capacity = cap.capacity.min(oblivious_ub);
+                    let ls_pad = capacity.saturating_sub(ls_true) as usize;
+                    println!(
+                        "  [dp] q5: bag1 {{O,C}} {} (+0 pad, public size), \
+                         bag2 {{L,S}} {} (+{} pad, mf {}/1){}",
+                        orders.len(),
+                        ls_true,
+                        ls_pad,
+                        mf_l,
+                        if cap.capacity > oblivious_ub {
+                            format!(
+                                " [clamped from {} to the public bound |lineitem|={}]",
+                                cap.capacity, oblivious_ub
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                    (0, 0, ls_pad)
+                }
+                _ => unreachable!("tpch_inputs_raw(\"q5\") returns Q5"),
+            };
+            (nr, co, ls)
+        }
+    }
+}
+
 /// True sizes and join-key frequencies of a cyclic query's two bags.
 ///
 /// GQ3: bag1 is the wedge join `in(a->b, a<b) |x|_b out(b->c)`; bag2 is `t3`,
@@ -814,14 +923,20 @@ fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
             bag2_mf_b: 1,
             bag2_is_public: true,
         },
+        // Both GQ4 bags are the SAME wedge shape (Bag1 is A->B->C joined on B,
+        // Bag2 is C->D->A joined on D), and both apply an early ordering
+        // filter on the incoming edge (A<B and C<D respectively), so both
+        // materialize `wedge(indeg_lt)` rows -- see the EARLY FILTER comments
+        // in `g_sql4_obj::synthesize`.  Modelling them with the unfiltered
+        // `indeg` overstated wiki by 2x and pushed it to k=23.
         "gq4" => {
-            let n = wedge(&indeg);
+            let n = wedge(&indeg_lt);
             BagStats {
                 bag1_size: n,
-                bag1_mf_a: max_of(&indeg),
+                bag1_mf_a: max_of(&indeg_lt),
                 bag1_mf_b: max_of(&outdeg),
                 bag2_size: n,
-                bag2_mf_a: max_of(&indeg),
+                bag2_mf_a: max_of(&indeg_lt),
                 bag2_mf_b: max_of(&outdeg),
                 bag2_is_public: false,
             }
@@ -1255,11 +1370,10 @@ fn run_tpch(query: &str, mode: Mode, privacy: Privacy) -> Row {
                 europe_hash: string_to_u64("EUROPE"),
                 start_ts: date_to_timestamp("1997-01-01"),
                 end_ts: date_to_timestamp("1998-01-01"),
-                // DP-padding knobs as currently set in `tests::test_1`
-                // (see dp/legacy_capacities.md).
-                nr_pad_extra: 0,
-                co_pad_extra: 32 * 89,
-                ls_pad_extra: 668 * 89,
+                // Same source of truth as commit_diff: see `q5_pads`.
+                nr_pad_extra: q5_pads(privacy).0,
+                co_pad_extra: q5_pads(privacy).1,
+                ls_pad_extra: q5_pads(privacy).2,
                 _marker: PhantomData,
             };
             (cols, {
@@ -1541,7 +1655,30 @@ pub enum TpchInput {
 }
 
 /// Load one TPC-H query's inputs, with the same projections the query tests use.
-pub fn tpch_inputs(query: &str) -> TpchInput {
+///
+/// `privacy` only affects Q5, the sole TPC-H query that materializes
+/// intermediates (see [`q5_pads`]); the others ignore it.
+pub fn tpch_inputs(query: &str, privacy: Privacy) -> TpchInput {
+    let (nr_pad_extra, co_pad_extra, ls_pad_extra) = if query == "q5" {
+        q5_pads(privacy)
+    } else {
+        (0, 0, 0)
+    };
+    tpch_inputs_padded(query, nr_pad_extra, co_pad_extra, ls_pad_extra)
+}
+
+/// Q5's inputs with zero padding, used by the DP path to read the true bag
+/// sizes without recursing through [`q5_pads`].
+fn tpch_inputs_raw(query: &str) -> TpchInput {
+    tpch_inputs_padded(query, 0, 0, 0)
+}
+
+fn tpch_inputs_padded(
+    query: &str,
+    nr_pad_extra: usize,
+    co_pad_extra: usize,
+    ls_pad_extra: usize,
+) -> TpchInput {
     use crate::data::data_processing as dp;
     let load = |name: &str| tbl(name);
 
@@ -1608,9 +1745,9 @@ pub fn tpch_inputs(query: &str) -> TpchInput {
             europe_hash: string_to_u64("EUROPE"),
             start_ts: date_to_timestamp("1997-01-01"),
             end_ts: date_to_timestamp("1998-01-01"),
-            nr_pad_extra: 0,
-            co_pad_extra: 32 * 89,
-            ls_pad_extra: 668 * 89,
+            nr_pad_extra,
+            co_pad_extra,
+            ls_pad_extra,
         },
         "q8" => TpchInput::Q8 {
             region: proj!(dp::region_read_records_from_cvs, "region.cvs", |r| vec![

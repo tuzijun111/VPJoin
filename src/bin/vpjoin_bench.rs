@@ -30,8 +30,11 @@
 //!             VPJOIN_RESUME =1 to keep the rows already in <out.csv> and only
 //!                           run the ones that are missing or previously
 //!                           FAILED, appending results in place.
-//!             VPJOIN_PRIVACY  how GQ3/GQ4 size their materialized bags:
-//!                           dp (default) | rjs | legacy
+//!             VPJOIN_PRIVACY  how the queries that MATERIALIZE intermediates
+//!                           (Q5, GQ3, GQ4) size their bags:
+//!                             dp (default) | rjs | legacy
+//!                           Q5 supports rjs and legacy only (see q5_pads).
+//!                           The other queries materialize nothing and ignore it.
 //!             VPJOIN_EPS / VPJOIN_DELTA   total DP budget (default 0.1 / 1e-5)
 //!             VPJOIN_DP_SEED  fixes the capacity-release randomness so a
 //!                           re-run reproduces the same circuit sizes
@@ -105,8 +108,8 @@ fn main() {
         }
     }
 
-    // Privacy regime for the cyclic queries (GQ3/GQ4). The acyclic queries
-    // materialize no intermediate and are unaffected.
+    // Privacy regime for the queries that materialize intermediates (Q5, GQ3,
+    // GQ4). The others materialize nothing and are unaffected.
     let privacy = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("dp") {
         "rjs" => Privacy::Rjs,
         "legacy" => Privacy::Legacy,
@@ -142,7 +145,7 @@ fn main() {
         .collect();
 
     println!(
-        "mode={}  profile={}  privacy={} (cyclic queries GQ3/GQ4 only)",
+        "mode={}  profile={}  privacy={} (Q5, GQ3, GQ4 -- the queries that materialize bags)",
         args[0],
         build_profile(),
         privacy.label()

@@ -185,237 +185,35 @@ pub fn bind_instance(columns: &[Vec<u64>], x: Fp) -> Vec<Fp> {
 }
 
 // ---------------------------------------------------------------------------
-// Query circuits with the check inlined
+// The bound circuits themselves live in separate files, one per query,
+// NEXT TO their baselines, so the two can be diffed side by side:
+//
+//   baseline                        bound (baseline + inlined check)
+//   src/sql/q3_obj.rs           <-> src/sql/q3_bound.rs
+//   src/sql/q5_obj.rs           <-> src/sql/q5_bound.rs
+//   src/sql/q8_obj.rs           <-> src/sql/q8_bound.rs
+//   src/sql/q9_obj.rs           <-> src/sql/q9_bound.rs
+//   src/sql/q18_obj.rs          <-> src/sql/q18_bound.rs
+//   src/graph_sql/g_sql1_obj.rs <-> src/graph_sql/g_sql1_bound.rs
+//   src/graph_sql/g_sql2_obj.rs <-> src/graph_sql/g_sql2_bound.rs
+//   src/graph_sql/g_sql3_obj.rs <-> src/graph_sql/g_sql3_bound.rs
+//   src/graph_sql/g_sql4_obj.rs <-> src/graph_sql/g_sql4_bound.rs
+//
+// Re-exported here so existing call sites keep working.
 // ---------------------------------------------------------------------------
 
-use halo2_proofs::circuit::SimpleFloorPlanner;
-use halo2_proofs::plonk::Circuit;
-use std::marker::PhantomData;
-
-/// Generate a wrapper circuit that runs a query chip and the binding gates in
-/// ONE constraint system, so a single proof covers both.
-macro_rules! bound_query {
-    (
-        $name:ident, $chipty:ty, $cfgty:ty, $nc:expr,
-        fields { $($f:ident : $ty:ty),* $(,)? },
-        assign ($chipvar:ident, $lay:ident, $me:ident) $body:block
-    ) => {
-        pub struct $name {
-            $(pub $f: $ty,)*
-            /// The query's input columns, in witness order.
-            pub columns: Vec<Vec<u64>>,
-            /// Fiat-Shamir challenge from the commitments and the query proof.
-            pub x: Fp,
-        }
-
-        impl Circuit<Fp> for $name {
-            type Config = ($cfgty, BindConfig);
-            type FloorPlanner = SimpleFloorPlanner;
-
-            fn without_witnesses(&self) -> Self {
-                Self {
-                    $($f: Default::default(),)*
-                    columns: Vec::new(),
-                    x: self.x,
-                }
-            }
-
-            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
-                // The query's own gates and the binding gates share ONE
-                // constraint system -- this is what "inlined" means.
-                let q = <$chipty>::configure(meta);
-                let b = configure_bind(meta, $nc);
-                (q, b)
-            }
-
-            fn synthesize(
-                &self,
-                config: Self::Config,
-                mut layouter: impl Layouter<Fp>,
-            ) -> Result<(), Error> {
-                let $chipvar = <$chipty>::construct(config.0);
-                let $me = self;
-                let $lay = &mut layouter;
-                let out = $body;
-                $chipvar.expose_public($lay, out, 0)?;
-                assign_bind($lay, &config.1, &self.columns, self.x)?;
-                Ok(())
-            }
-        }
-    };
-}
-
-bound_query!(
-    BoundQ3,
-    crate::sql::q3_obj::TestChip<Fp>, crate::sql::q3_obj::TestCircuitConfig<Fp>, 10,
-    fields {
-        customer: Vec<Vec<u64>>, orders: Vec<Vec<u64>>, lineitem: Vec<Vec<u64>>,
-        condition: [u64; 2],
-    },
-    assign (chip, lay, me) {
-        chip.assign(lay, me.customer.clone(), me.orders.clone(), me.lineitem.clone(), me.condition)?
-    }
-);
-
-bound_query!(
-    BoundQ5,
-    crate::sql::q5_obj::Q5Chip<Fp>, crate::sql::q5_obj::Q5Config<Fp>, 16,
-    fields {
-        customer: Vec<Vec<u64>>, orders: Vec<Vec<u64>>, lineitem: Vec<Vec<u64>>,
-        supplier: Vec<Vec<u64>>, nation: Vec<Vec<u64>>, region: Vec<Vec<u64>>,
-        europe_hash: u64, start_ts: u64, end_ts: u64,
-        nr_pad_extra: usize, co_pad_extra: usize, ls_pad_extra: usize,
-    },
-    assign (chip, lay, me) {
-        chip.assign(
-            lay, me.customer.clone(), me.orders.clone(), me.lineitem.clone(),
-            me.supplier.clone(), me.nation.clone(), me.region.clone(),
-            me.europe_hash, me.start_ts, me.end_ts,
-            me.nr_pad_extra, me.co_pad_extra, me.ls_pad_extra,
-        )?
-    }
-);
-
-bound_query!(
-    BoundQ8,
-    crate::sql::q8_obj::TestChip<Fp>, crate::sql::q8_obj::TestCircuitConfig<Fp>, 19,
-    fields {
-        region: Vec<Vec<u64>>, nation: Vec<Vec<u64>>, customer: Vec<Vec<u64>>,
-        orders: Vec<Vec<u64>>, part: Vec<Vec<u64>>, supplier: Vec<Vec<u64>>,
-        lineitem: Vec<Vec<u64>>,
-        cond_nation_hash: u64, const_region_name_hash: u64, const_part_type_hash: u64,
-    },
-    assign (chip, lay, me) {
-        chip.assign(
-            lay, me.region.clone(), me.nation.clone(), me.customer.clone(),
-            me.orders.clone(), me.part.clone(), me.supplier.clone(), me.lineitem.clone(),
-            me.cond_nation_hash, me.const_region_name_hash, me.const_part_type_hash,
-        )?
-    }
-);
-
-bound_query!(
-    BoundQ9,
-    crate::sql::q9_obj::TestChip<Fp>, crate::sql::q9_obj::TestCircuitConfig<Fp>, 16,
-    fields {
-        part: Vec<Vec<u64>>, supplier: Vec<Vec<u64>>, nation: Vec<Vec<u64>>,
-        orders: Vec<Vec<u64>>, partsupp: Vec<Vec<u64>>, lineitem: Vec<Vec<u64>>,
-        cond_hash: u64,
-    },
-    assign (chip, lay, me) {
-        chip.assign(
-            lay, me.part.clone(), me.supplier.clone(), me.nation.clone(),
-            me.orders.clone(), me.partsupp.clone(), me.lineitem.clone(), me.cond_hash,
-        )?
-    }
-);
-
-bound_query!(
-    BoundQ18,
-    crate::sql::q18_obj::Q18Chip<Fp>, crate::sql::q18_obj::Q18Config<Fp>, 8,
-    fields {
-        customer: Vec<Vec<u64>>, orders: Vec<Vec<u64>>, lineitem: Vec<Vec<u64>>,
-        threshold: u64,
-    },
-    assign (chip, lay, me) {
-        chip.assign(lay, me.customer.clone(), me.orders.clone(), me.lineitem.clone(), me.threshold)?
-    }
-);
-
-// Graph queries: the committed input is Edge(src, dst) -- 2 columns.
+pub use crate::graph_sql::{
+    g_sql1_bound::BoundGq1, g_sql2_bound::BoundGq2, g_sql3_bound::BoundGq3,
+    g_sql4_bound::BoundGq4,
+};
+pub use crate::sql::{
+    q18_bound::BoundQ18, q3_bound::BoundQ3, q5_bound::BoundQ5, q8_bound::BoundQ8,
+    q9_bound::BoundQ9,
+};
 
 use crate::data::graph_data_processing::Edge;
-
-macro_rules! bound_graph {
-    ($name:ident, $chipty:ty, $cfgty:ty, $configure:expr, $assign:expr) => {
-        pub struct $name {
-            pub edges: Vec<Edge>,
-            pub bag1_pad_extra: usize,
-            pub bag2_pad_extra: usize,
-            pub columns: Vec<Vec<u64>>,
-            pub x: Fp,
-        }
-
-        impl Circuit<Fp> for $name {
-            type Config = ($cfgty, BindConfig);
-            type FloorPlanner = SimpleFloorPlanner;
-
-            fn without_witnesses(&self) -> Self {
-                Self {
-                    edges: Vec::new(),
-                    bag1_pad_extra: self.bag1_pad_extra,
-                    bag2_pad_extra: self.bag2_pad_extra,
-                    columns: Vec::new(),
-                    x: self.x,
-                }
-            }
-
-            fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
-                // MUST match the original circuit's configure exactly. For
-                // GQ1/GQ2 the chip's own `configure` is NOT sufficient: the
-                // circuit adds further lookup arguments on top of it, and
-                // omitting them would prove a strictly weaker statement (and
-                // measure as *negative* overhead).
-                let q = $configure(meta);
-                let b = configure_bind(meta, 2);
-                (q, b)
-            }
-
-            fn synthesize(
-                &self,
-                config: Self::Config,
-                mut layouter: impl Layouter<Fp>,
-            ) -> Result<(), Error> {
-                let chip = <$chipty>::construct(config.0);
-                let lay = &mut layouter;
-                #[allow(clippy::redundant_closure_call)]
-                let out = ($assign)(&chip, lay, self)?;
-                chip.expose_public(lay, out, 0)?;
-                assign_bind(lay, &config.1, &self.columns, self.x)?;
-                Ok(())
-            }
-        }
-    };
-}
-
-bound_graph!(
-    BoundGq1,
-    crate::graph_sql::g_sql1_obj::Path3OrdChip<Fp>,
-    crate::graph_sql::g_sql1_obj::Path3OrdConfig<Fp>,
-    crate::graph_sql::g_sql1_obj::configure_path3ord_full::<Fp>,
-    |chip: &crate::graph_sql::g_sql1_obj::Path3OrdChip<Fp>, lay: &mut _, me: &BoundGq1| chip
-        .assign(lay, &me.edges)
-);
-
-bound_graph!(
-    BoundGq2,
-    crate::graph_sql::g_sql2_obj::GraphPath4OrderChip<Fp>,
-    crate::graph_sql::g_sql2_obj::GraphPath4OrderConfig<Fp>,
-    crate::graph_sql::g_sql2_obj::configure_path4order_full::<Fp>,
-    |chip: &crate::graph_sql::g_sql2_obj::GraphPath4OrderChip<Fp>, lay: &mut _, me: &BoundGq2| chip
-        .assign(lay, &me.edges)
-);
-
-bound_graph!(
-    BoundGq3,
-    crate::graph_sql::g_sql3_obj::TrianglePathCloserChip<Fp>,
-    crate::graph_sql::g_sql3_obj::TrianglePathCloserConfig<Fp>,
-    <crate::graph_sql::g_sql3_obj::TrianglePathCloserChip<Fp>>::configure,
-    |chip: &crate::graph_sql::g_sql3_obj::TrianglePathCloserChip<Fp>, lay: &mut _, me: &BoundGq3| {
-        chip.assign(lay, me.edges.clone(), me.bag1_pad_extra, me.bag2_pad_extra)
-    }
-);
-
-bound_graph!(
-    BoundGq4,
-    crate::graph_sql::g_sql4_obj::Cycle4OrderedChip<Fp>,
-    crate::graph_sql::g_sql4_obj::Cycle4OrderedConfig<Fp>,
-    <crate::graph_sql::g_sql4_obj::Cycle4OrderedChip<Fp>>::configure,
-    |chip: &crate::graph_sql::g_sql4_obj::Cycle4OrderedChip<Fp>, lay: &mut _, me: &BoundGq4| {
-        chip.assign(lay, me.edges.clone(), me.bag1_pad_extra, me.bag2_pad_extra)
-    }
-);
-
+use halo2_proofs::circuit::SimpleFloorPlanner;
+use halo2_proofs::plonk::Circuit;
 // ---------------------------------------------------------------------------
 // Proving both variants from one loaded input
 // ---------------------------------------------------------------------------
@@ -723,24 +521,12 @@ pub fn prove_graph_bound(
     match query {
         "gq1" => prove_one(
             params,
-            &BoundGq1 {
-                edges: edges.to_vec(),
-                bag1_pad_extra: 0,
-                bag2_pad_extra: 0,
-                columns,
-                x,
-            },
+            &BoundGq1 { edges: edges.to_vec(), columns, x },
             inst,
         ),
         "gq2" => prove_one(
             params,
-            &BoundGq2 {
-                edges: edges.to_vec(),
-                bag1_pad_extra: 0,
-                bag2_pad_extra: 0,
-                columns,
-                x,
-            },
+            &BoundGq2 { edges: edges.to_vec(), columns, x },
             inst,
         ),
         "gq3" => prove_one(
@@ -843,6 +629,75 @@ mod tests {
         assert_bound_superset::<g_sql2_obj::GraphPath4OrderCircuit<Fp>, BoundGq2>("gq2");
         assert_bound_superset::<g_sql3_obj::MyCircuit<Fp>, BoundGq3>("gq3");
         assert_bound_superset::<g_sql4_obj::MyCircuit<Fp>, BoundGq4>("gq4");
+    }
+
+    /// Advice-column growth per query: the binding adds 2*NC+2 columns, and
+    /// prover cost is roughly proportional to column count at a fixed degree.
+    /// This gives an expected in-circ as a fraction of the base proof.
+    #[test]
+    fn expected_incirc_fraction() {
+        fn row<B: Circuit<Fp>, D: Circuit<Fp>>(name: &str, base_s: f64) {
+            let b = cs_shape::<B>();
+            let d = cs_shape::<D>();
+            let frac = (d.advice - b.advice) as f64 / b.advice as f64;
+            println!(
+                "{:<12} advice {:>3} -> {:>3} (+{:>2}, {:>5.1}%)   base {:>5.1}s  => expected in-circ ~{:.2}s",
+                name, b.advice, d.advice, d.advice - b.advice, 100.0 * frac, base_s, frac * base_s
+            );
+        }
+        row::<q3_obj::MyCircuit<Fp>, BoundQ3>("q3", 24.2);
+        row::<q8_obj::MyCircuit<Fp>, BoundQ8>("q8", 18.1);
+        row::<q9_obj::MyCircuit<Fp>, BoundQ9>("q9", 20.1);
+        row::<q18_obj::MyCircuit<Fp>, BoundQ18>("q18", 12.6);
+        row::<g_sql2_obj::GraphPath4OrderCircuit<Fp>, BoundGq2>("gq2", 96.5);
+    }
+
+    /// Post-compression gate cost: `compress_selectors` runs inside keygen and
+    /// repacks ALL selectors into fixed columns, rewriting every gate that used
+    /// a simple selector. Adding selectors can therefore change the expressions
+    /// of the HOST circuit's gates, and the quotient evaluation pays that cost
+    /// on every one of the 2^ext_k rows.
+    #[test]
+    fn post_compression_gate_cost() {
+        use halo2_proofs::poly::commitment::ParamsProver;
+        use halo2_proofs::poly::ipa::commitment::ParamsIPA;
+        use halo2curves::pasta::vesta;
+
+        fn nodes(e: &halo2_proofs::plonk::Expression<Fp>) -> usize {
+            use halo2_proofs::plonk::Expression::*;
+            match e {
+                Sum(a, b) | Product(a, b) => 1 + nodes(a) + nodes(b),
+                Negated(a) | Scaled(a, _) => 1 + nodes(a),
+                _ => 1,
+            }
+        }
+        fn probe<C: Circuit<Fp>>(name: &str, params: &ParamsIPA<vesta::Affine>, c: &C) {
+            let vk = halo2_proofs::plonk::keygen_vk(params, c).expect("keygen_vk");
+            let cs = vk.cs();
+            let total: usize = cs
+                .gates()
+                .iter()
+                .flat_map(|g| g.polynomials().iter())
+                .map(nodes)
+                .sum();
+            let n: usize = cs.gates().iter().map(|g| g.polynomials().len()).sum();
+            println!(
+                "{:<11} POST-compression: gates={:<3} constraints={:<4} expr_nodes={:<6} fixed={:<3} degree={}",
+                name,
+                cs.gates().len(),
+                n,
+                total,
+                cs.num_fixed_columns(),
+                cs.degree()
+            );
+        }
+
+        let params: ParamsIPA<vesta::Affine> = ParamsIPA::new(9);
+        probe("gq1 base", &params, &g_sql1_obj::Path3OrdCircuit::<Fp>::default());
+        probe("gq1 bound", &params, &BoundGq1 {
+            edges: vec![],
+            columns: vec![vec![], vec![]], x: Fp::ZERO,
+        });
     }
 
     /// The quotient-polynomial degree drives the EXTENDED domain size, which
@@ -970,22 +825,51 @@ pub fn paired_runs<B: Circuit<Fp>, D: Circuit<Fp>>(
     bound_inst: &[&[Fp]],
     reps: usize,
 ) -> Vec<(f64, f64)> {
-    let pk_b = keygen_for(params, base);
-    let pk_d = keygen_for(params, bound);
+    // Measure each circuit in ISOLATION: build its proving key, run one
+    // discarded warm-up proof, take the timed proof, then DROP the key before
+    // touching the other circuit.
+    //
+    // Keeping both keys resident at once is not neutral: they are multi-GB
+    // (extended cosets at 2^ext_k), and whichever is allocated second gets
+    // better page placement -- worth about 4s out of 60 here, which is several
+    // times the effect being measured. Building the two keys in the opposite
+    // order flips the sign of the result, which is how that was diagnosed.
+    fn timed<C: Circuit<Fp>>(
+        params: &ParamsIPA<vesta::Affine>,
+        c: &C,
+        inst: &[&[Fp]],
+    ) -> f64 {
+        let pk = keygen_for(params, c);
+        let _warm = prove_with(params, &pk, c, inst);
+        let t = prove_with(params, &pk, c, inst).prove_s;
+        drop(pk);
+        t
+    }
 
-    // Discarded warm-up of both circuits.
-    let _ = prove_with(params, &pk_b, base, base_inst);
-    let _ = prove_with(params, &pk_d, bound, bound_inst);
+    // Process-level burn-in. A per-circuit warm-up is not enough: the control
+    // experiment (base vs base) shows the first TWO measurements of a process
+    // are inflated (64.3s, 61.7s, then settling near 61s), so the drift spans
+    // more than one proof. Run and discard a couple of full measurements
+    // before anything counts.
+    let burn: usize = std::env::var("VPJOIN_BURNIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    for _ in 0..burn {
+        let _ = timed(params, base, base_inst);
+    }
 
     let mut out = Vec::with_capacity(reps);
     for i in 0..reps {
+        // Alternate which circuit is measured first, so any residual drift
+        // cancels across repetitions.
         if i % 2 == 0 {
-            let b = prove_with(params, &pk_b, base, base_inst).prove_s;
-            let d = prove_with(params, &pk_d, bound, bound_inst).prove_s;
+            let b = timed(params, base, base_inst);
+            let d = timed(params, bound, bound_inst);
             out.push((b, d));
         } else {
-            let d = prove_with(params, &pk_d, bound, bound_inst).prove_s;
-            let b = prove_with(params, &pk_b, base, base_inst).prove_s;
+            let d = timed(params, bound, bound_inst);
+            let b = timed(params, base, base_inst);
             out.push((b, d));
         }
     }
@@ -1017,7 +901,7 @@ pub fn graph_paired(
             params,
             &g_sql1_obj::Path3OrdCircuit::<Fp> { edges: e.clone(), _marker: PhantomData },
             bi,
-            &BoundGq1 { edges: e, bag1_pad_extra: 0, bag2_pad_extra: 0, columns, x },
+            &BoundGq1 { edges: e, columns, x },
             di,
             reps,
         ),
@@ -1025,7 +909,7 @@ pub fn graph_paired(
             params,
             &g_sql2_obj::GraphPath4OrderCircuit::<Fp> { edges: e.clone(), _marker: PhantomData },
             bi,
-            &BoundGq2 { edges: e, bag1_pad_extra: 0, bag2_pad_extra: 0, columns, x },
+            &BoundGq2 { edges: e, columns, x },
             di,
             reps,
         ),
@@ -1180,5 +1064,139 @@ pub fn tpch_paired(
             di,
             reps,
         ),
+    }
+}
+
+/// Control experiment: measure the BASE circuit against ITSELF with the exact
+/// same harness (two proving keys, warm-up, alternation).
+///
+/// The true difference is zero by construction, so whatever this reports is
+/// pure harness bias. If a base-vs-base pair shows the same negative offset as
+/// a base-vs-bound pair, the offset is positional, not circuit work.
+pub fn graph_selftest(
+    params: &ParamsIPA<vesta::Affine>,
+    query: &str,
+    edges: &[Edge],
+    pads: (usize, usize),
+    cnt: u64,
+    reps: usize,
+) -> Vec<(f64, f64)> {
+    use crate::graph_sql::{g_sql1_obj, g_sql2_obj, g_sql3_obj, g_sql4_obj};
+    use std::marker::PhantomData;
+
+    let out = [Fp::from(cnt)];
+    let bi: &[&[Fp]] = &[&out];
+    let e = edges.to_vec();
+
+    match query {
+        "gq1" => paired_runs(
+            params,
+            &g_sql1_obj::Path3OrdCircuit::<Fp> { edges: e.clone(), _marker: PhantomData },
+            bi,
+            &g_sql1_obj::Path3OrdCircuit::<Fp> { edges: e, _marker: PhantomData },
+            bi,
+            reps,
+        ),
+        "gq2" => paired_runs(
+            params,
+            &g_sql2_obj::GraphPath4OrderCircuit::<Fp> { edges: e.clone(), _marker: PhantomData },
+            bi,
+            &g_sql2_obj::GraphPath4OrderCircuit::<Fp> { edges: e, _marker: PhantomData },
+            bi,
+            reps,
+        ),
+        "gq3" => paired_runs(
+            params,
+            &g_sql3_obj::MyCircuit::<Fp> {
+                edges: e.clone(), bag1_pad_extra: pads.0, bag2_pad_extra: pads.1,
+                _marker: PhantomData,
+            },
+            bi,
+            &g_sql3_obj::MyCircuit::<Fp> {
+                edges: e, bag1_pad_extra: pads.0, bag2_pad_extra: pads.1,
+                _marker: PhantomData,
+            },
+            bi,
+            reps,
+        ),
+        "gq4" => paired_runs(
+            params,
+            &g_sql4_obj::MyCircuit::<Fp> {
+                edges: e.clone(), bag1_pad_extra: pads.0, bag2_pad_extra: pads.1,
+                _marker: PhantomData,
+            },
+            bi,
+            &g_sql4_obj::MyCircuit::<Fp> {
+                edges: e, bag1_pad_extra: pads.0, bag2_pad_extra: pads.1,
+                _marker: PhantomData,
+            },
+            bi,
+            reps,
+        ),
+        other => panic!("unknown graph query {}", other),
+    }
+}
+
+/// Control experiment for a TPC-H query: prove the BASE circuit against
+/// ITSELF with the identical harness. The true difference is zero, so whatever
+/// this reports is pure harness bias.
+pub fn tpch_selftest(
+    params: &ParamsIPA<vesta::Affine>,
+    input: &TpchInput,
+    reps: usize,
+) -> Vec<(f64, f64)> {
+    use crate::sql::{q18_obj, q3_obj, q5_obj, q8_obj, q9_obj};
+    use std::marker::PhantomData;
+
+    let one = [Fp::from(1u64)];
+    let bi: &[&[Fp]] = &[&one];
+
+    macro_rules! pair {
+        ($ctor:expr) => {{
+            let a = $ctor;
+            let b = $ctor;
+            paired_runs(params, &a, bi, &b, bi, reps)
+        }};
+    }
+
+    match input {
+        TpchInput::Q3 { customer, orders, lineitem, condition } => pair!(q3_obj::MyCircuit::<Fp> {
+            customer: customer.clone(),
+            orders: orders.clone(),
+            lineitem: lineitem.clone(),
+            condition: *condition,
+            _marker: PhantomData,
+        }),
+        TpchInput::Q5 {
+            customer, orders, lineitem, supplier, nation, region,
+            europe_hash, start_ts, end_ts, nr_pad_extra, co_pad_extra, ls_pad_extra,
+        } => pair!(q5_obj::MyCircuit::<Fp> {
+            customer: customer.clone(), orders: orders.clone(), lineitem: lineitem.clone(),
+            supplier: supplier.clone(), nation: nation.clone(), region: region.clone(),
+            europe_hash: *europe_hash, start_ts: *start_ts, end_ts: *end_ts,
+            nr_pad_extra: *nr_pad_extra, co_pad_extra: *co_pad_extra,
+            ls_pad_extra: *ls_pad_extra, _marker: PhantomData,
+        }),
+        TpchInput::Q8 {
+            region, nation, customer, orders, part, supplier, lineitem,
+            cond_nation_hash, const_region_name_hash, const_part_type_hash,
+        } => pair!(q8_obj::MyCircuit::<Fp> {
+            region: region.clone(), nation: nation.clone(), customer: customer.clone(),
+            orders: orders.clone(), part: part.clone(), supplier: supplier.clone(),
+            lineitem: lineitem.clone(), cond_nation_hash: *cond_nation_hash,
+            const_region_name_hash: *const_region_name_hash,
+            const_part_type_hash: *const_part_type_hash, _marker: PhantomData,
+        }),
+        TpchInput::Q9 { part, supplier, nation, orders, partsupp, lineitem, cond_hash } => {
+            pair!(q9_obj::MyCircuit::<Fp> {
+                part: part.clone(), supplier: supplier.clone(), nation: nation.clone(),
+                orders: orders.clone(), partsupp: partsupp.clone(),
+                lineitem: lineitem.clone(), cond_hash: *cond_hash, _marker: PhantomData,
+            })
+        }
+        TpchInput::Q18 { customer, orders, lineitem, threshold } => pair!(q18_obj::MyCircuit::<Fp> {
+            customer: customer.clone(), orders: orders.clone(),
+            lineitem: lineitem.clone(), threshold: *threshold, _marker: PhantomData,
+        }),
     }
 }

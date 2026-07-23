@@ -658,6 +658,13 @@ impl<F: Field + Ord> IndexedViewChip<F> {
         Self { cfg }
     }
 
+    /// Load the u8 range table backing the sortedness comparison.  Needed by
+    /// external users of the chip (`pone_baseline`), which cannot reach the
+    /// private `lt_key` field to load it themselves.
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+        LtChip::<F, NUM_BYTES>::construct(self.cfg.lt_key.clone()).load(layouter)
+    }
+
     pub fn configure(meta: &mut ConstraintSystem<F>) -> IndexedViewConfig<F> {
         let in_key = meta.advice_column();
         let in_val = meta.advice_column();
@@ -1529,6 +1536,22 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 for (&b, incoming) in in_groups.iter() {
                     if let Some(outgoing) = out_groups.get(&b) {
                         for (i, (r1_eid, a)) in incoming.iter().enumerate() {
+                            // EARLY FILTER: r1.src < r2.src  (A < B), mirroring
+                            // `g_sql3_obj`.  The "contrib gate" computes
+                            // real * msg_val * [A<B] * [B<C], so a row with
+                            // A >= B contributes exactly zero; materializing it
+                            // only pays for capacity.  Dropping it here is why
+                            // GQ4 fits the same domain as GQ3 on the directed
+                            // graph (wiki: 4,542,805 -> 2,255,867 rows, i.e.
+                            // k=23 -> k=22).
+                            //
+                            // Skip BEFORE the inner loop so `i` keeps its
+                            // meaning as the index into `incoming`: it is
+                            // looked up against `in_by_dst.idx`, so it must
+                            // stay the original enumerate index.
+                            if *a >= b {
+                                continue;
+                            }
                             for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
                                 t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
                             }
@@ -1544,6 +1567,16 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 for (&d, incoming) in in_groups.iter() {
                     if let Some(outgoing) = out_groups.get(&d) {
                         for (i, (r3_eid, c)) in incoming.iter().enumerate() {
+                            // EARLY FILTER: r3.src < r3.dst  (C < D).  The
+                            // "msg input from bag2" gate sets
+                            // keep = t34_real * [C<D] and emits
+                            // (in_key, in_val) = (PAD, 0) when keep = 0, so a
+                            // row with C >= D contributes nothing to the
+                            // message map.  Same reasoning and same placement
+                            // as the Bag1 filter above.
+                            if *c >= d {
+                                continue;
+                            }
                             for (j, (r4_eid, a)) in outgoing.iter().enumerate() {
                                 t34.push((*c, d, *a, i as u64, j as u64, *r3_eid, *r4_eid));
                             }
@@ -1567,7 +1600,13 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // -------------------
                 let real34 = t34.len();
                 let n34 = std::cmp::max(real34 + bag2_pad_extra, 1);
-                println!("The length of n34 is: {}", t12.len());
+                // Debug print, silenced: `assign` runs during keygen as well as
+                // proving, so this fired several times per measured row.
+                // NOTE if re-enabling: it printed `t12.len()` under the label
+                // "n34". Harmless here only because |t12| == |t34| (both bags
+                // are the same unfiltered in x out wedge join), but the label
+                // and the variable do not match. Print `t34.len()` instead.
+                // println!("The length of n34 is: {}", t34.len());
 
                 let mut agg_in: Vec<(u64, u64)> = vec![(PAD_U64, 0); n34]; // default PAD bucket
 
@@ -1711,7 +1750,9 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // -------------------
                 let real12 = t12.len();
                 let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
-                println!("The length of n12 is: {}", t12.len());
+                // Debug print, silenced: `assign` runs during keygen as well as
+                // proving, so this fired several times per measured row.
+                // println!("The length of n12 is: {}", t12.len());
 
                 // Prepare sorted key list for gap witness (host-side)
                 // IMPORTANT: must include 0 and PAD
@@ -2157,6 +2198,23 @@ mod tests {
 
         let cnt = expected_cnt(&edges);
 
+        // ---------------------------------------------------------------
+        // PADDING CONSTANTS (GQ4).
+        //
+        // As checked in, both knobs are 0, i.e. capacity = the true bag size.
+        // That is the paper's "Revealing Join Size" baseline, NOT its
+        // "VPJoin + DP" configuration.
+        //
+        // The non-zero values used for the reported GQ4 + DP runs were edited
+        // in place per run and were NOT preserved anywhere -- see
+        // `dp/legacy_capacities.md`. GQ4 therefore has no recoverable legacy
+        // DP constants, unlike Q5 (`q5_obj.rs`) and GQ3 (`g_sql3_obj.rs`).
+        // Regenerate them with the corrected mechanism instead:
+        // VPJOIN_PRIVACY=dp in the benchmark harness releases capacities via
+        // `bench_queries::graph_pads` -> `dp_noise::dp_join_capacity`, which
+        // applies to BOTH bags here (both are genuine self-joins, unlike GQ3
+        // whose second bag is the public-size edge relation).
+        // ---------------------------------------------------------------
         let circuit = MyCircuit::<Fp> {
             edges,
             bag1_pad_extra: 0,

@@ -23,9 +23,28 @@
 //!   cargo commit-diff gq2:wiki     # one graph query on one dataset
 //!   cargo commit-diff reps=5 q18   # 5 repetitions instead of the default 3
 //!   cargo commit-diff reps=1 gq3   # single quick pass (noisier)
+//!   VPJOIN_PRIVACY=rjs cargo commit-diff q5 gq3 gq4   # no bag padding
+//!
+//! VPJOIN_PRIVACY (dp | rjs | legacy) sizes the materialized bags of Q5, GQ3
+//! and GQ4; every other query materializes nothing and ignores it. `rjs` gives
+//! the smallest circuits and is deterministic, so it is the cheapest setting
+//! for measuring the binding overhead -- but quote the result for the regime
+//! the paper reports the query in, since `in-circ` scales with the domain 2^k.
 //!
 //! `reps=N` may appear anywhere in the argument list. It overrides the
 //! VPJOIN_REPS environment variable; the default is 3.
+//!
+//! MEASUREMENT FLOOR. `in-circ` is a difference of two large proof times, so it
+//! is only meaningful when the effect exceeds the harness noise. Measure that
+//! floor directly with the control experiment, which proves the BASE circuit
+//! against ITSELF (true difference zero):
+//!
+//!   VPJOIN_SELFTEST=1 cargo commit-diff reps=2 gq1:lastfm
+//!
+//! Whatever that reports is pure bias. Trust an `in-circ` only if it is well
+//! above it. Other knobs: VPJOIN_BURNIN (discarded measurements before timing,
+//! default 2), VPJOIN_SWAP_KEYGEN=1 (diagnostic: reverses key-build order),
+//! VPJOIN_VERBOSE=1 (print the raw base/bound time of every repetition).
 //!
 //! The binding cost is a small fraction of the query proof, so a single pair is
 //! dominated by run-to-run variance; repeating and alternating the order also
@@ -44,7 +63,8 @@ use halo2_experiments::column_commit::{
     verify_column_openings,
 };
 use halo2_experiments::inline_bind::{
-    bind_instance, graph_paired, prove_graph_base, prove_plain, tpch_paired,
+    bind_instance, graph_paired, graph_selftest, prove_graph_base, prove_plain, tpch_paired,
+    tpch_selftest,
 };
 use halo2_experiments::paths;
 use halo2_proofs::poly::{commitment::Params, ipa::commitment::ParamsIPA};
@@ -106,14 +126,18 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// median(bound) - median(base): each pair is measured back to back, so shared
 /// drift cancels within the pair.
 fn summarise(runs: &[(f64, f64)]) -> (f64, f64, f64) {
-    for (i, (b, d)) in runs.iter().enumerate() {
-        eprintln!(
-            "\n      rep {}: base {:>8.2}s  bound {:>8.2}s  diff {:>+8.2}s",
-            i + 1,
-            b,
-            d,
-            d - b
-        );
+    // Raw per-repetition base/bound times are diagnostic only (they were added
+    // to track down a keygen-ordering bias); opt in with VPJOIN_VERBOSE=1.
+    if std::env::var("VPJOIN_VERBOSE").map(|v| v == "1").unwrap_or(false) {
+        for (i, (b, d)) in runs.iter().enumerate() {
+            eprintln!(
+                "\n      rep {}: base {:>8.2}s  bound {:>8.2}s  diff {:>+8.2}s",
+                i + 1,
+                b,
+                d,
+                d - b
+            );
+        }
     }
     let diffs: Vec<f64> = runs.iter().map(|(b, d)| d - b).collect();
     let lo = diffs.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -191,7 +215,8 @@ fn main() {
         eprintln!("WARNING: unoptimized build -- use `cargo commit-diff`, which builds release.");
     }
 
-    // Privacy regime for the cyclic queries, same knobs as vpjoin_bench.
+    // Privacy regime for the queries that materialize intermediates (Q5, GQ3,
+    // GQ4), same knobs as vpjoin_bench. Q5 supports rjs/legacy only.
     let privacy = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("dp") {
         "rjs" => Privacy::Rjs,
         "legacy" => Privacy::Legacy,
@@ -216,6 +241,10 @@ fn main() {
         if cfg!(debug_assertions) { "debug" } else { "release" }
     );
 
+    // Control mode: prove the BASE circuit against itself. Reports harness
+    // bias, which should be ~0.
+    let selftest = std::env::var("VPJOIN_SELFTEST").map(|v| v == "1").unwrap_or(false);
+
     // Precedence: reps=N on the command line, else VPJOIN_REPS, else 3.
     let reps: usize = reps_arg
         .or_else(|| {
@@ -232,6 +261,13 @@ fn main() {
          Set VPJOIN_REPS=1 for a single quick pass.\n",
         reps
     );
+
+    if selftest {
+        println!(
+            "*** VPJOIN_SELFTEST=1: proving the BASE circuit against ITSELF.\n\
+             *** in-circ should be ~0; anything else is harness bias.\n"
+        );
+    }
 
     let mut rows: Vec<RowOut> = Vec::new();
     print_header();
@@ -291,7 +327,13 @@ fn main() {
                 let bind_pub = bind_instance(&cols, x);
                 drop(first);
 
-                let runs = graph_paired(&params, q, &edges, pads, cnt, x, &bind_pub, reps);
+                let runs = if selftest {
+                    // Control: base vs base. True difference is zero, so any
+                    // non-zero result here is harness bias.
+                    graph_selftest(&params, q, &edges, pads, cnt, reps)
+                } else {
+                    graph_paired(&params, q, &edges, pads, cnt, x, &bind_pub, reps)
+                };
                 let (incirc, lo, hi) = summarise(&runs);
 
                 let t = Instant::now();
@@ -319,7 +361,7 @@ fn main() {
 
         eprint!("  {} ... ", q);
         let params = load_params(K);
-        let input = tpch_inputs(q);
+        let input = tpch_inputs(q, privacy);
         input.require_loaded();
         let cols = input.columns();
 
@@ -333,7 +375,12 @@ fn main() {
         let bind_pub = bind_instance(&cols, x);
         drop(first);
 
-        let runs = tpch_paired(&params, &input, x, &bind_pub, reps);
+        let runs = if selftest {
+            // Control: base vs base. True difference is zero.
+            tpch_selftest(&params, &input, reps)
+        } else {
+            tpch_paired(&params, &input, x, &bind_pub, reps)
+        };
         let (incirc, lo, hi) = summarise(&runs);
 
         let t = Instant::now();
