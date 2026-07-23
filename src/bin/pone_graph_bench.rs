@@ -33,7 +33,13 @@
 //! (verified) no duplicate edges in any of the three files.
 //!
 //! Usage:
-//!   cargo run --bin pone_graph_bench -- <out.csv> [query ...] [dataset ...]
+//!   cargo run --bin pone_graph_bench -- [query ...] [dataset ...] [out.csv]
+//!
+//!   By default the only output is one header line plus one line per
+//!   (query, dataset) giving the measured anchor proving time in seconds.
+//!   An argument ending in `.csv` additionally writes the full row (anchor
+//!   shape, worst-case bounds, extrapolations) to that file; with no such
+//!   argument no file is written.
 //!
 //!   queries:   gq1 gq2 gq3 gq4          (default: all)
 //!   datasets:  lastfm facebook wiki     (default: all)
@@ -41,6 +47,9 @@
 //!              PONE_EDGES  force the anchor subsample size, skipping the
 //!                          automatic sizing
 //!              PONE_PLAN_ONLY=1  print the plan and exit without proving
+//!              PONE_VERBOSE=1    restore the full diagnostics: banner, plan,
+//!                          per-level true intermediate sizes, extrapolation
+//!                          commentary and the trailing summary table
 //!              VPJOIN_DATA root holding graph_data/ and proof/
 //!
 //! Add `--release` to measure under the optimized profile.  Without it this
@@ -238,28 +247,43 @@ impl Row {
     }
 }
 
+fn usage() -> String {
+    format!(
+        "usage: pone_graph_bench [query ...] [dataset ...] [out.csv]\n  \
+         queries:  {}\n  datasets: {}\n  \
+         prints one line per (query, dataset) with the anchor proving time;\n  \
+         an argument ending in .csv also writes the full rows to that file.\n  \
+         PONE_VERBOSE=1 restores the plan and diagnostics, \
+         PONE_PLAN_ONLY=1 prints the plan and exits.",
+        QUERIES.join(" "),
+        DATASETS.join(" ")
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        eprintln!(
-            "usage: pone_graph_bench <out.csv> [query ...] [dataset ...]\n  \
-             queries:  {}\n  datasets: {}",
-            QUERIES.join(" "),
-            DATASETS.join(" ")
-        );
-        std::process::exit(2);
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", usage());
+        return;
     }
-    let out_path = args[0].clone();
+    // The output file is optional and recognised by its `.csv` suffix.
+    let mut out_path: Option<String> = None;
     let mut queries: Vec<String> = Vec::new();
     let mut datasets: Vec<String> = Vec::new();
-    for a in &args[1..] {
+    for a in &args {
         if QUERIES.contains(&a.as_str()) {
             queries.push(a.clone());
         } else if DATASETS.contains(&a.as_str()) {
             datasets.push(a.clone());
+        } else if a.ends_with(".csv") {
+            if out_path.is_some() {
+                eprintln!("at most one <out.csv> argument (got `{}` twice over)", a);
+                std::process::exit(2);
+            }
+            out_path = Some(a.clone());
         } else {
             eprintln!(
-                "unknown argument `{}` (queries: {}; datasets: {})",
+                "unknown argument `{}` (queries: {}; datasets: {}; or a path ending in .csv)",
                 a,
                 QUERIES.join(" "),
                 DATASETS.join(" ")
@@ -282,15 +306,21 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
     let plan_only = std::env::var("PONE_PLAN_ONLY").map(|v| v == "1").unwrap_or(false);
+    let verbose = std::env::var("PONE_VERBOSE").map(|v| v == "1").unwrap_or(false);
+    // The plan and every diagnostic are opt-in; PONE_PLAN_ONLY=1 keeps them
+    // because printing the plan is the whole point of that mode.
+    let loud = verbose || plan_only;
 
-    println!(
-        "PoneglyphDB-style graph baseline: anchor + extrapolation (Section 8.1)\n\
-         profile={}  target anchor domain=2^{}\n\
-         prover: REAL Halo2 pipeline (keygen_vk / keygen_pk / create_proof / verify_proof, \
-         IPA over Pasta) -- MockProver is NOT used here",
-        if cfg!(debug_assertions) { "DEBUG (unoptimized)" } else { "RELEASE (optimized)" },
-        target_k
-    );
+    if loud {
+        println!(
+            "PoneglyphDB-style graph baseline: anchor + extrapolation (Section 8.1)\n\
+             profile={}  target anchor domain=2^{}\n\
+             prover: REAL Halo2 pipeline (keygen_vk / keygen_pk / create_proof / verify_proof, \
+             IPA over Pasta) -- MockProver is NOT used here",
+            if cfg!(debug_assertions) { "DEBUG (unoptimized)" } else { "RELEASE (optimized)" },
+            target_k
+        );
+    }
 
     // Plan every job first: loading and counting is cheap next to proving, and
     // it means a bad dataset or a missing params file surfaces immediately.
@@ -306,11 +336,13 @@ fn main() {
         gc_agm_log2: u32,
     }
     let mut jobs: Vec<Job> = Vec::new();
-    println!("\nplan:");
-    println!(
-        "    {:<4} {:<9} {:>8}  {:>8} {:>5}   {:>7} {:>7}  {}",
-        "qry", "dataset", "edges", "anchor", "k0", "GC", "GC(agm)", "worst-case rows N"
-    );
+    if loud {
+        println!("\nplan:");
+        println!(
+            "    {:<4} {:<9} {:>8}  {:>8} {:>5}   {:>7} {:>7}  {}",
+            "qry", "dataset", "edges", "anchor", "k0", "GC", "GC(agm)", "worst-case rows N"
+        );
+    }
     for d in &datasets {
         let edges = load_edges(d);
         for q in &queries {
@@ -322,18 +354,20 @@ fn main() {
             let n_worst = worst_case_rows(edges.len() as u128, levels);
             let gc_log2 = ceil_log2(n_worst);
             let gc_agm_log2 = ceil_log2(worst_case_rows_agm(edges.len() as u128, levels));
-            println!(
-                "    {:<4} {:<9} {:>8}  {:>8} {:>5}   {:>7} {:>7}  {} (~2^{:.1})",
-                q,
-                d,
-                edges.len(),
-                a,
-                k0,
-                format!("2^{}", gc_log2),
-                format!("2^{}", gc_agm_log2),
-                n_worst,
-                (n_worst as f64).log2()
-            );
+            if loud {
+                println!(
+                    "    {:<4} {:<9} {:>8}  {:>8} {:>5}   {:>7} {:>7}  {} (~2^{:.1})",
+                    q,
+                    d,
+                    edges.len(),
+                    a,
+                    k0,
+                    format!("2^{}", gc_log2),
+                    format!("2^{}", gc_agm_log2),
+                    n_worst,
+                    (n_worst as f64).log2()
+                );
+            }
             jobs.push(Job {
                 query: q.clone(),
                 dataset: d.clone(),
@@ -347,41 +381,56 @@ fn main() {
             });
         }
     }
-    println!(
-        "\nGC uses |P_t| <= m^t, the bound the paper reports; it is TIGHT in the paper's\n\
-         setting (SQL bag semantics, no public uniqueness constraint on the edges).\n\
-         GC(agm) is the set-semantics AGM bound |P_t| <= m^ceil((t+1)/2), which would apply\n\
-         only if edge distinctness were publicly assumed; it is reported for the paper's\n\
-         robustness claim: even under AGM the padded domains stay unrunnable and the\n\
-         speedups stay at or above three orders of magnitude.  Both T_est values are in the CSV."
-    );
+    if loud {
+        println!(
+            "\nGC uses |P_t| <= m^t, the bound the paper reports; it is TIGHT in the paper's\n\
+             setting (SQL bag semantics, no public uniqueness constraint on the edges).\n\
+             GC(agm) is the set-semantics AGM bound |P_t| <= m^ceil((t+1)/2), which would apply\n\
+             only if edge distinctness were publicly assumed; it is reported for the paper's\n\
+             robustness claim: even under AGM the padded domains stay unrunnable and the\n\
+             speedups stay at or above three orders of magnitude.  Both T_est values are\n\
+             reported and, when an out.csv is given, written there."
+        );
+    }
     if plan_only {
         println!("\nPONE_PLAN_ONLY=1 -- stopping before any proving.");
         return;
     }
 
-    if let Some(dir) = std::path::Path::new(&out_path).parent() {
-        if !dir.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(dir);
+    let mut out: Option<std::fs::File> = match &out_path {
+        Some(p) => {
+            if let Some(dir) = std::path::Path::new(p).parent() {
+                if !dir.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+            }
+            let mut f = std::fs::File::create(p).expect("cannot create output csv");
+            writeln!(f, "{}", Row::header()).unwrap();
+            f.flush().unwrap();
+            Some(f)
         }
+        None => None,
+    };
+
+    if !verbose {
+        println!("{:<5} {:<9} {:>15}", "query", "dataset", "anchor_prove_s");
     }
-    let mut f = std::fs::File::create(&out_path).expect("cannot create output csv");
-    writeln!(f, "{}", Row::header()).unwrap();
-    f.flush().unwrap();
 
     let total = jobs.len();
     let mut rows: Vec<Row> = Vec::new();
     for (i, job) in jobs.iter().enumerate() {
-        println!(
-            "\n[{}/{}] {} on {}: anchor over {} of {} edges (k0={})",
-            i + 1,
-            total,
-            job.query,
-            job.dataset,
-            job.anchor_edges,
-            job.edges.len(),
-            job.k0
-        );
+        if verbose {
+            println!(
+                "\n[{}/{}] {} on {}: anchor over {} of {} edges (k0={})",
+                i + 1,
+                total,
+                job.query,
+                job.dataset,
+                job.anchor_edges,
+                job.edges.len(),
+                job.k0
+            );
+        }
         let (levels, cyclic) = shape(&job.query);
         let anchor: Vec<(u64, u64)> = job.edges[..job.anchor_edges].to_vec();
         let (lvls, count) = enumerate_paths(&anchor, levels, cyclic);
@@ -391,7 +440,9 @@ fn main() {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        println!("        true intermediates: [{}]  output count = {}", level_str, count);
+        if verbose {
+            println!("        true intermediates: [{}]  output count = {}", level_str, count);
+        }
 
         let circuit = PoneBaselineCircuit {
             edges: anchor,
@@ -402,6 +453,8 @@ fn main() {
         };
         let public_input = vec![Fp::from(count)];
 
+        // `params_for` logs the SRS load on stderr, so the stdout table stays
+        // one line per row.
         let params = params_for(job.k0);
         let t = Instant::now();
         let vk = keygen_vk(&params, &circuit).expect("keygen_vk");
@@ -436,22 +489,33 @@ fn main() {
         let t_est_years = t_est_s / year_s;
         let t_est_agm_s = t0_s * 2f64.powi(job.gc_agm_log2 as i32 - job.k0 as i32);
         let t_est_agm_years = t_est_agm_s / year_s;
-        println!(
-            "        keygen={:.2}s  T_0={:.2}s  verify={:.3}s  proof={}B  verified={}",
-            keygen_s,
-            t0_s,
-            verify_s,
-            proof.len(),
-            ok
-        );
-        println!(
-            "        T_est = T_0 * 2^({} - {}) = {:.3e} s  (~{:.2e} years)   [bound m^t]",
-            job.gc_log2, job.k0, t_est_s, t_est_years
-        );
-        println!(
-            "        T_est = T_0 * 2^({} - {}) = {:.3e} s  (~{:.2e} years)   [bound AGM]",
-            job.gc_agm_log2, job.k0, t_est_agm_s, t_est_agm_years
-        );
+        if verbose {
+            println!(
+                "        keygen={:.2}s  T_0={:.2}s  verify={:.3}s  proof={}B  verified={}",
+                keygen_s,
+                t0_s,
+                verify_s,
+                proof.len(),
+                ok
+            );
+            println!(
+                "        T_est = T_0 * 2^({} - {}) = {:.3e} s  (~{:.2e} years)   [bound m^t]",
+                job.gc_log2, job.k0, t_est_s, t_est_years
+            );
+            println!(
+                "        T_est = T_0 * 2^({} - {}) = {:.3e} s  (~{:.2e} years)   [bound AGM]",
+                job.gc_agm_log2, job.k0, t_est_agm_s, t_est_agm_years
+            );
+        } else {
+            // Default output: exactly one line per (query, dataset).
+            println!("{:<5} {:<9} {:>15.2}", job.query, job.dataset, t0_s);
+        }
+        if !ok {
+            eprintln!(
+                "FAILED_VERIFY: {} on {} -- the anchor proof did not verify",
+                job.query, job.dataset
+            );
+        }
 
         let row = Row {
             query: job.query.clone(),
@@ -475,27 +539,34 @@ fn main() {
             t_est_agm_years,
             status: if ok { "ok".into() } else { "FAILED_VERIFY".into() },
         };
-        writeln!(f, "{}", row.to_csv()).unwrap();
-        f.flush().unwrap();
+        if let Some(f) = out.as_mut() {
+            writeln!(f, "{}", row.to_csv()).unwrap();
+            f.flush().unwrap();
+        }
         rows.push(row);
     }
 
-    println!("\nwrote {}\n", out_path);
-    println!(
-        "{:<5} {:<9} {:>9} {:>8} {:>13} {:>8} {:>13}",
-        "query", "dataset", "T_0 (s)", "GC", "T_est (yr)", "GC(agm)", "T_est agm (yr)"
-    );
-    for r in &rows {
+    if verbose {
+        if let Some(p) = &out_path {
+            println!("\nwrote {}", p);
+        }
+        println!();
         println!(
-            "{:<5} {:<9} {:>9.2} {:>8} {:>13.2e} {:>8} {:>13.2e}",
-            r.query,
-            r.dataset,
-            r.t0_s,
-            format!("2^{}", r.gc_log2),
-            r.t_est_years,
-            format!("2^{}", r.gc_agm_log2),
-            r.t_est_agm_years
+            "{:<5} {:<9} {:>9} {:>8} {:>13} {:>8} {:>13}",
+            "query", "dataset", "T_0 (s)", "GC", "T_est (yr)", "GC(agm)", "T_est agm (yr)"
         );
+        for r in &rows {
+            println!(
+                "{:<5} {:<9} {:>9.2} {:>8} {:>13.2e} {:>8} {:>13.2e}",
+                r.query,
+                r.dataset,
+                r.t0_s,
+                format!("2^{}", r.gc_log2),
+                r.t_est_years,
+                format!("2^{}", r.gc_agm_log2),
+                r.t_est_agm_years
+            );
+        }
     }
     let bad = rows.iter().filter(|r| r.status != "ok").count();
     if bad > 0 {
@@ -539,8 +610,11 @@ mod tests {
             for &levels in &[3usize, 4] {
                 let naive = worst_case_rows(m, levels);
                 let agm = worst_case_rows_agm(m, levels);
-                assert_eq!(naive, pow_sat(m, levels as u32) + 1);
-                assert_eq!(agm, pow_sat(m, levels as u32 - 1) + 1);
+                // +2 per `pone_baseline::circuit_rows`: the tallest column
+                // group carries the indexed view's appended PAD entry and the
+                // chip's sentinel row.
+                assert_eq!(naive, pow_sat(m, levels as u32) + 2);
+                assert_eq!(agm, pow_sat(m, levels as u32 - 1) + 2);
                 assert!(agm < naive);
             }
         }

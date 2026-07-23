@@ -216,7 +216,8 @@ fn main() {
     }
 
     // Privacy regime for the queries that materialize intermediates (Q5, GQ3,
-    // GQ4), same knobs as vpjoin_bench. Q5 supports rjs/legacy only.
+    // GQ4), same knobs as vpjoin_bench. Use rjs for Q5 here: this binary
+    // fixes TPC-H at k=16, and Q5's dp capacities need k>=17 below eps=1.
     let privacy = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("dp") {
         "rjs" => Privacy::Rjs,
         "legacy" => Privacy::Legacy,

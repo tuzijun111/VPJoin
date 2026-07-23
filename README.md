@@ -43,7 +43,11 @@ src/
   commitment.rs   # [revision] database-commitment layer: canonical layout, Commit(D), per-proof binding
   input_binding.rs# [revision] in-circuit binding of query inputs to the published commitments
   dp_noise.rs     # [revision] DP capacity generation (Rust twin of dp/noise_generator.py)
+  dp_lane.rs      # [revision] shared plan/run records for the DP lane circuits
   graph_sql/pone_baseline.rs  # [revision] PoneglyphDB-style binary-join-chain baselines for GQ1-GQ4
+  sql/q5_obj_dp.rs            # [revision] multi-lane DP variant of Q5 (fixed k, capacity in c lanes)
+  graph_sql/g_sql3_obj_dp.rs  # [revision] multi-lane DP variant of GQ3
+  graph_sql/g_sql4_obj_dp.rs  # [revision] multi-lane DP variant of GQ4 (see the caveat in section 5)
   bin/            # [revision] benchmark harnesses (see "Revision Experiments" below)
 ```
 
@@ -87,6 +91,60 @@ export RUST_MIN_STACK=33554432
 ```bash
 cargo build --release
 ```
+
+### Reproducing the Paper (the whole command set)
+
+Every command below prints its results to stdout; none of them writes a results file.
+(`vpjoin_bench` does still persist each proof to `src/proof/bench/` as an auditable
+artifact — `commit-diff`'s commit mode reads those back — but no measurement leaves
+the terminal.)  `cargo run` without `--release` is the **debug** profile, which is the
+profile the paper's proving times use — do not mix the two in one comparison.
+
+```bash
+# 1-2. VPJoin proving time, all queries x datasets, without and with the commitment layer
+cargo run --bin vpjoin_bench -- baseline
+cargo run --bin vpjoin_bench -- full
+
+# 3-4. Additional in-circuit cost of binding to a committed database
+cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
+VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
+
+# 5-6. DP-guided padding for the three cyclic queries, and its no-privacy lower bound
+cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+VPJOIN_PRIVACY=rjs cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+
+# 7. PoneglyphDB-style graph baselines (measured anchors; extrapolation is derived)
+PONE_K0=17 cargo run --bin pone_graph_bench
+```
+
+One point of the epsilon sweep behind Figure "various epsilon" (vary `VPJOIN_DP_SEED=1..10`
+for the paper's 10 rounds, and repeat per epsilon):
+
+```bash
+VPJOIN_EPS=0.01 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+```
+
+Preview any run's geometry — degrees, lane counts, released capacities, pads — without
+proving anything:
+
+```bash
+VPJOIN_PLAN_ONLY=1 cargo run --bin dp_lane_bench
+VPJOIN_PLAN_ONLY=1 cargo run --bin vpjoin_bench -- baseline
+PONE_PLAN_ONLY=1 cargo run --bin pone_graph_bench
+```
+
+Each command is documented in full below: `vpjoin_bench` under
+[Running Everything](#running-everything-two-commands), `commit-diff` under
+[In-circuit binding cost](#in-circuit-binding-cost-cargo-commit-diff), `dp_lane_bench`
+under [DP-guided padding](#5-dp-guided-padding-mechanism-lane-circuits-and-the-epsilon-sweep),
+and `pone_graph_bench` under
+[PoneglyphDB-style graph baselines](#4-poneglyphdb-style-graph-baselines-section-81-estimation-methodology).
+
+**Not yet covered by any command.**  The fully oblivious (worst-case padding) bars for Q5,
+GQ3 and GQ4 have no `Privacy` arm, and the 120K/240K scalability figure has no scale knob
+in the query loaders — the scaled tables (`src/data/lineitem_120K.tbl`, `lineitem_240K.tbl`)
+exist and are reachable from `commitment_bench`, but `bench_queries` always reads
+`lineitem.tbl`.
 
 ### Running TPC-H Query Proofs
 
@@ -141,17 +199,24 @@ an empty table.
 
 `vpjoin_bench` rebuilds exactly the circuit instances the per-query tests build, but
 drives all of them from one command: the 5 TPC-H queries plus the 4 graph queries on
-**each** of the 3 SNAP datasets (17 rows), writing one CSV.
+**each** of the 3 SNAP datasets (17 rows).  Results are printed as an aligned summary
+table on stdout; nothing is written to disk unless you ask for it.
 
 ```bash
 # (A) BASELINE -- the pure query circuits, i.e. what the submission reports.
-cargo run --release --bin vpjoin_bench -- baseline results/vpjoin_baseline.csv
+cargo run --bin vpjoin_bench -- baseline
 
 # (B) FULL -- the same circuits plus the complete commitment layer: published
 #     per-column Pedersen commitments to the dataset, the in-circuit check that the
 #     query's witness columns equal the committed data, and the column openings.
-cargo run --release --bin vpjoin_bench -- full results/vpjoin_full.csv
+cargo run --bin vpjoin_bench -- full
 ```
+
+Omitting `--release` builds the **debug** profile, which is the profile the paper's
+proving times use (see the profile table below).  Append an argument ending in `.csv`
+to additionally write the full per-row schema to a file; without one, no file is
+created and `VPJOIN_RESUME` has nothing to resume from (the binary says so and
+continues).
 
 Both modes use the **real proving pipeline** — `keygen_vk` / `keygen_pk` / `create_proof` /
 `verify_proof` over IPA on the Pasta curves, exactly like the `generate_and_verify_proof`
@@ -175,21 +240,18 @@ byte-identical 28,448-byte proof:
 | prove | ~117s (by subtraction) | 24.25s |
 | end-to-end | 142.1s (`finished in`) | 28.9s + load |
 
-Neither is "wrong" — they are the same computation under two compilers. Every CSV row
+Neither is "wrong" — they are the same computation under two compilers. Every row
 records a `profile` column (`debug`/`release`) and the binary prints the profile at startup,
 so a mixed comparison is visible rather than silent. **Use one profile for both commands.**
-To reproduce the `cargo test` timings with this harness, just drop `--release`:
+The commands above already omit `--release`, matching the `cargo test` timings; add it only
+when you want the optimized numbers, and then add it to *both*.
 
-```bash
-cargo run --bin vpjoin_bench -- baseline results/vpjoin_baseline_debug.csv q3
-```
-
-The CSV also reports `vk_s` and `pk_s` separately, which line up 1:1 with the
+The table reports `vk_s` and `pk_s` separately, which line up 1:1 with the
 `Time to generate vk` / `Time to generate pk` lines the tests print, plus `load_s` (data
 parsing) and `wall_s` (end-to-end, comparable to the test's `finished in ...` line).
 
-The difference between the two CSVs is exactly the cost of making a proof bind to a
-committed database instead of to an unauthenticated input. Both write the same schema
+The difference between the two modes is exactly the cost of making a proof bind to a
+committed database instead of to an unauthenticated input. Both carry the same schema
 (`query,dataset,k,input_rows,n_columns,public_output,keygen_s,prove_s,verify_s,proof_bytes,
 commit_setup_s,published_bytes,bind_*,open_*,total_prove_s,total_proof_bytes,status`);
 in `baseline` the commitment columns are zero.
@@ -198,14 +260,20 @@ Useful variations:
 
 ```bash
 # a subset of queries (graph queries still expand over all 3 datasets)
-cargo run --release --bin vpjoin_bench -- baseline results/tpch.csv q3 q5 q8 q9 q18
-cargo run --release --bin vpjoin_bench -- full    results/graph.csv gq1 gq2 gq3 gq4
+cargo run --bin vpjoin_bench -- baseline q3 q5 q8 q9 q18
+cargo run --bin vpjoin_bench -- full     gq1 gq2 gq3 gq4
+
+# also write the full per-row schema to a file (any argument ending in .csv)
+cargo run --bin vpjoin_bench -- baseline results/vpjoin_baseline.csv
 
 # point at a different data root (must contain data/ graph_data/ proof/)
-VPJOIN_DATA=/path/to/src cargo run --release --bin vpjoin_bench -- baseline out.csv
+VPJOIN_DATA=/path/to/src cargo run --bin vpjoin_bench -- baseline
 
 # cap the degree the k-fitter may try (default 21)
-VPJOIN_MAX_K=19 cargo run --release --bin vpjoin_bench -- baseline out.csv
+VPJOIN_MAX_K=19 cargo run --bin vpjoin_bench -- baseline
+
+# print the planned degrees and DP capacities, then stop before any proving
+VPJOIN_PLAN_ONLY=1 cargo run --bin vpjoin_bench -- baseline
 ```
 
 Notes:
@@ -222,9 +290,13 @@ Notes:
   `VPJOIN_MAX_K=22` to actually measure them (expect a long run and high memory).
 * A failure in any single row is recorded in `status` rather than aborting the sweep,
   and rows are flushed as they complete, so an interrupted run is still usable.
-* Q5 keeps the DP padding knobs at the values currently set in its test
-  (`nr/co/ls_pad_extra = 0 / 32*89 / 668*89`, see `dp/legacy_capacities.md`), and GQ3's
-  bag padding is applied per dataset rather than fixed at the lastfm constant.
+* The padding of the three bag-materializing queries (Q5, GQ3, GQ4) comes from
+  `bench_queries::q5_pads` / `graph_pads`, selected by `VPJOIN_PRIVACY`
+  (`rjs` | `legacy` | `dp`, default `dp` with `VPJOIN_EPS=0.1 VPJOIN_DELTA=1e-5`).
+  Nothing is hard-coded in a test any more; `legacy` replays the constants in
+  `dp/legacy_capacities.md`.  Under `dp` the released capacity can exceed `2^k`, so
+  `degree_for` raises `k` accordingly — use `dp_lane_bench` (below) to hold `k` fixed
+  and absorb the capacity in parallel lanes instead.
 
 ### Baseline vs bound circuit files (where to look when debugging)
 
@@ -403,9 +475,14 @@ separate large setup and cannot be matched to circuit columns without reindexing
 Two-stage one-sided mechanism: noisy truncation thresholds for the max join-key
 frequencies (sensitivity 1 each), then the capacity calibrated to the released thresholds
 (their *sum* for self-join bags such as Edge|x|Edge).  Every release is a single draw;
-total budget by basic composition.  Replace the legacy hard-coded `*_pad_extra` constants
-(recorded in `dp/legacy_capacities.md`) by these outputs, or call
-`halo2_experiments::dp_noise::dp_join_capacity` directly at witness-generation time.
+total budget by basic composition.  This binary is the standalone reference calculator; the
+benches no longer need it, since `bench_queries::q5_pads` / `graph_pads` release the
+capacities from the circuits' own bag derivations at witness-generation time (section 5),
+and the legacy hard-coded `*_pad_extra` constants it was written to replace are gone from
+the harnesses (they survive only as `VPJOIN_PRIVACY=legacy`, recorded in
+`dp/legacy_capacities.md`).  Note that the two-stage form below is what the *graph* queries
+use; Q5's fan-out bounds come from unprotected relations and so are released exactly, with
+no threshold stage — see section 5.
 
 ```bash
 python3 dp/noise_generator.py          # reference implementation + self-check
@@ -437,17 +514,33 @@ measured under the same unoptimized profile as the paper's other proving times
 the ratio by roughly 5x:
 
 ```bash
-cargo run --bin pone_graph_bench -- results/pone_graph_debug.csv
+PONE_K0=17 cargo run --bin pone_graph_bench
 ```
 
-Check the plan without proving anything (instant), or restrict to a subset:
+The default output is deliberately minimal — one header line plus one line per
+(query, dataset) with the measured anchor proving time:
+
+```
+query dataset    anchor_prove_s
+gq1   lastfm             105.32
+```
+
+Everything else (banner, plan table, per-level true intermediate sizes, the
+extrapolation arithmetic and the trailing summary) is behind `PONE_VERBOSE=1`.
+Check the plan without proving anything (instant), restrict to a subset, or add a
+`.csv` argument to also write the full row (anchor shape, worst-case bounds, both
+extrapolations) to a file:
 
 ```bash
-PONE_PLAN_ONLY=1 cargo run --bin pone_graph_bench -- /dev/null
+PONE_PLAN_ONLY=1 cargo run --bin pone_graph_bench
 ```
 
 ```bash
-cargo run --bin pone_graph_bench -- results/pone_gq3.csv gq3 gq4 wiki
+PONE_VERBOSE=1 cargo run --bin pone_graph_bench -- gq3 gq4 wiki
+```
+
+```bash
+cargo run --bin pone_graph_bench -- gq3 wiki results/pone_gq3.csv
 ```
 
 The anchor **must** subsample: `|P_3|` is 79M rows on Facebook and 202M on Wiki, so the
@@ -511,50 +604,85 @@ and the closure gate only marks the non-closed ones as dummies.
 cargo test --release --lib pone_baseline
 ```
 
-### 5. Regenerating the DP experiments with the corrected mechanism
+### 5. DP-guided padding: mechanism, lane circuits, and the epsilon sweep
 
 The originally reported DP runs used hand-chosen constants (recorded in
-`dp/legacy_capacities.md`).  To regenerate with the rigorous mechanism:
-
-1. Obtain each bag's true join size and per-side maximum join-key frequencies (printed by the
-   witness-generation code, or computed offline from the data).
-2. Release the capacities for the whole epsilon sweep at once, dividing the query's total
-   budget across its bags (`self_join = 1` for the Edge-Edge bags of GQ3/GQ4, `0` for Q5's
-   distinct-relation bags):
+`dp/legacy_capacities.md`).  Both the release mechanism and the circuits that host the
+released capacity have since been rebuilt; `dp_lane_bench` drives all of it from one
+command, in the same shape as `cargo commit-diff`:
 
 ```bash
-# GQ3 / GQ4 (two self-join bags), full sweep:
-cargo run --release --bin dp_capacity_gen -- \
-    0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 1e-5 2 \
-    <bag1_size> <mfA> <mfB> 1  <bag2_size> <mfA> <mfB> 1
-# Q5 (two bags over distinct relations), full sweep:
-cargo run --release --bin dp_capacity_gen -- \
-    0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 1e-5 2 \
-    <co_size> <mfO> <mfC> 0  <ls_size> <mfL> <mfS> 0
+# the default budget (eps = 0.1, delta = 1e-5), all three bag-materializing queries
+cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+
+# the no-privacy lower bound, same binary and table
+VPJOIN_PRIVACY=rjs cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+
+# one point of the epsilon sweep; vary VPJOIN_DP_SEED=1..10 for the paper's 10 rounds
+VPJOIN_EPS=0.01 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+
+# geometry only (degrees, lane counts, released capacities, pads) -- nothing is proved
+VPJOIN_PLAN_ONLY=1 cargo run --bin dp_lane_bench
 ```
 
-3. For each epsilon, plug that epsilon's `pad_extra` values into the circuit padding knobs:
-   - GQ3: `bag1_pad_extra` / `bag2_pad_extra` in the test harness of `src/graph_sql/g_sql3_obj.rs`
-   - GQ4: `bag1_pad_extra` / `bag2_pad_extra` in the test harness of `src/graph_sql/g_sql4_obj.rs`
-   - Q5:  `co_pad_extra` / `ls_pad_extra` in the test harness of `src/sql/q5_obj.rs`
-   (or call `halo2_experiments::dp_noise::dp_join_capacity` directly at witness-generation
-   time instead of hard-coding).
-4. Re-run the corresponding query proofs (commands under "Running TPC-H/Graph Query Proofs")
-   once per epsilon value; the proving time scales with the padded circuit size, so one run
-   per epsilon regenerates the privacy--efficiency curve.
+`reps=N` may appear anywhere in the argument list; keys are built once outside the timed
+region, every proof is verified, and nothing is written to disk.  Selectors take an
+optional dataset (`gq3:lastfm`); `q5` always runs on tpch-60K.
 
-NOTE — the paper's originally reported DP figures were produced from the legacy hand-tuned
-constants (`dp/legacy_capacities.md`), not from this mechanism.  The mechanism here is a
-rigorous (epsilon, delta)-DP release: the join-size sensitivity is `max(F_A, F_B)` (with the
-DP-released frequency upper bounds), and the one-sided noise has scale ~ sensitivity *
-ln(1/delta)/epsilon.  The resulting overhead therefore depends on (i) the real ratio of the
-sensitivity to the true bag size and (ii) how the total budget is split across the query's
-bags and the three per-bag releases (thresholds + size); the equal split used by the CLI is
-one choice, not the only one.  Regenerate the curves with the real bag sizes and max
-frequencies before comparing to the submitted figures, and re-check the "2--10% overhead"
-text against the regenerated numbers.  If the overhead at small epsilon is larger than
-desired, options include a less aggressive budget split, a larger delta, the Gaussian
-mechanism, or reporting a larger operating epsilon.
+**The privacy policy is now declared per workload** (`Privacy::Dp`, `src/bench_queries.rs`).
+Q5 uses row-level neighbors with `P = {customer, supplier}`: the fan-out bounds that
+govern its sensitivity (`tau_C = 32` orders per custkey, `tau_S = 668` lineitems per
+suppkey) live in the *unprotected* relations, so they are identical on every neighboring
+instance and are released exactly at no budget cost.  Because a customer row reaches the
+LS bag through `c_nationkey = s_nationkey` as well as through custkey, the LS release
+takes the full epsilon and the CO release takes `eps * (1 - 43/668)`; delta splits in half.
+The graph queries protect one edge tuple, and there the maximum degree *is* a statistic of
+the protected relation, so it must itself be released under the one-sided mechanism before
+it can calibrate the capacity release — the two-stage form the appendix describes.  That
+asymmetry is the whole rule: noise the frequency bound only when it depends on protected
+data.  `cargo test --test freq_noising_cost -- --nocapture` prints what the second stage
+costs (2--4.5x on the graphs).
+
+**Lane circuits keep `k` fixed.**  A released capacity larger than the current domain would
+otherwise force the next power of two, quantizing proving time into 2x jumps.  The `_dp`
+circuits instead host the capacity in `c = ceil(capacity / lane_rows)` parallel column-group
+lanes at the Revealing-Join-Size degree:
+
+| file | query | lanes | growth |
+|---|---|---|---|
+| `src/sql/q5_obj_dp.rs` | Q5 | LS pipeline | linear, ~8% per lane |
+| `src/graph_sql/g_sql3_obj_dp.rs` | GQ3 | Bag1 only (Bag2 is the Edge relation, public size) | linear, +51 advice per lane |
+| `src/graph_sql/g_sql4_obj_dp.rs` | GQ4 | both bags | **quadratic**, see below |
+
+Every lane is a full structural replica with identical gates and lookups, and the lane
+count is a function of the *released* capacity only — never of the true bag size.  A
+cheaper padding-only overflow lane would leak the true size through the circuit shape and
+is deliberately not implemented.  `cargo test --test graph_lane_plan -- --nocapture` prints
+the plan per (query, dataset, epsilon) and `cargo test --test lane_cost_probe -- --nocapture`
+measures how the shape actually grows.
+
+**GQ4 is a known negative result.**  Resolving a private key against private-size tables
+needs one lookup argument per candidate table, so `c2` lane-local message maps force
+`c1 * c2` probe replicas.  At the LastFM eps=0.1 cell (`c1=4, c2=3`) the laned circuit is
+580 advice columns at `2^18` = 152.0M advice cells, against 141 columns at `2^20` = 147.8M
+unlaned: a wash.  `g_sql4_obj_dp.rs` is correct and adversarially reviewed, but it is not
+evidence of linear GQ4 cost, and should not be cited as such.  The linear route is a
+sort-merge redesign that drops the message map (both GQ4 bags have identical row shape);
+that is a different circuit and has not been built.
+
+At eps = 0.1 the released pads fit the existing headroom on Facebook and Wikipedia for both
+graph queries (one lane, no degree change), so DP-guided padding is free there; only LastFM
+pays, at 2 lanes for GQ3 and 4/3 for GQ4.
+
+NOTE — the paper's DP figures were produced from the legacy hand-tuned constants, not from
+this mechanism.  `2848 = 32 * 89` and `59452 = 668 * 89` decompose exactly into Q5's
+sensitivities times a noise multiplier of 89, whereas `(eps, delta) = (0.1, 1e-5)` mandates
+109.2; the legacy pair is therefore a low-tail draw of the current distribution, not its
+mean.  Regenerate every DP curve before comparing, and re-check the "2--10% overhead"
+text: with the corrected pads the graph overhead at eps = 0.1 is 0% on Facebook and
+Wikipedia but substantially larger on LastFM.  `cargo test --test q5_appendix_mechanism --
+--nocapture` shows what the appendix's verbatim two-stage mechanism would cost Q5 instead
+(1.08M rows at eps = 0.1, which exceeds its own worst-case bound below eps ~ 0.03).
 
 ### 6. End-to-end comparison with the commitment layers
 

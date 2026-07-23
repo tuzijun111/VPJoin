@@ -1,38 +1,3 @@
-//! Additive benchmark harness (revision): runs every VPJoin query end to end
-//! and writes the results to CSV.
-//!
-//! This module does **not** modify any circuit.  It rebuilds exactly the
-//! circuit instances that the per-query `#[test]` harnesses build
-//! (`sql::qN_obj::tests::test_1`, `graph_sql::g_sqlN_obj::tests::test`), but
-//! drives them from a single binary so that
-//!
-//!   * all 5 TPC-H queries and all 4 graph queries x 3 SNAP datasets run from
-//!     one command, instead of editing a commented-out line to switch dataset;
-//!   * the *baseline* (pure query circuit, as reported in the submission) and
-//!     the *full* configuration (query circuit + published per-column dataset
-//!     commitment + in-circuit witness-equality check + column openings) are
-//!     measured on the identical circuit instances, so the difference between
-//!     the two CSVs is exactly the cost of the commitment layer.
-//!
-//! The proving pipeline is the REAL one -- keygen_vk / keygen_pk /
-//! create_proof / verify_proof over IPA on the Pasta curves, identical to the
-//! `generate_and_verify_proof` helpers inside the per-query test modules.
-//! MockProver is never used anywhere in this harness.  Every proof is
-//! verified, and the proof bytes are written to
-//! `src/proof/bench/<query>_<dataset>.proof` so each run leaves auditable
-//! artifacts.  Public parameters are the persisted `src/proof/param{k}` files
-//! (param15..param19 ship with the repo); every load is logged, and a missing
-//! degree is generated once, persisted there, and loudly logged.
-//!
-//! Two behaviours differ from the hand-run tests, both deliberate:
-//!
-//!   * data paths are resolved through `crate::paths` (the crate's own `src/`,
-//!     or `$VPJOIN_DATA`) rather than being hard-coded;
-//!   * `k` comes from an explicit per-(query, dataset) table (`degree_for`)
-//!     rather than a single constant, because the graph circuits' materialized
-//!     bags depend on the dataset. It is used as-is, never searched for, so no
-//!     prover time is spent on a degree that is then discarded.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -107,10 +72,12 @@ pub fn params_for(k: u32) -> ParamsIPA<vesta::Affine> {
             p.k(),
             k
         );
-        println!("  [params] loaded {} (degree 2^{})", path.display(), k);
+        // Diagnostics go to stderr: stdout carries results only, so a harness
+        // can print a table without the SRS loads interleaving into it.
+        eprintln!("  [params] loaded {} (degree 2^{})", path.display(), k);
         return p;
     }
-    println!(
+    eprintln!(
         "  [params] {} NOT FOUND -- generating 2^{} params once and persisting them there",
         path.display(),
         k
@@ -274,16 +241,41 @@ pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
     match (query, dataset) {
         // TPC-H: every query includes lineitem (60,175 rows), so k = 16.
         //
-        // Q5 also materializes intermediates, but its padded bags still fit
-        // 2^16 in every supported regime (rjs shrinks them; legacy adds
-        // 2,848 + 59,452 rows on top of |orders| and the LS join). The
-        // assertion in `run_at` fails loudly if that ever stops holding.
-        ("q5", _) => {
-            // Resolve the pads here too, so an unsupported regime (dp) is
-            // rejected during planning rather than hours into a run.
-            let _ = q5_pads(privacy);
-            16
-        }
+        // Q5 also materializes intermediates.  Under rjs/legacy the padded
+        // bags still fit 2^16 (rjs shrinks them; legacy adds 2,848 + 59,452
+        // rows on top of |orders| and the LS join); the assertion in
+        // `run_at` fails loudly if that ever stops holding.  Under dp BOTH
+        // bags carry released capacities that can far exceed 2^16 at small
+        // epsilon, so the degree is computed from the actual padded section
+        // heights (the circuit lays its sections in disjoint column groups,
+        // so the height is their maximum -- the k=16 fit of
+        // lineitem 60,175 + LS 59,515 + CO 17,848 confirms max, not sum).
+        ("q5", _) => match privacy {
+            Privacy::Dp { .. } => {
+                let (_, co_pad, ls_pad) = q5_pads(privacy);
+                let input = tpch_inputs_raw("q5");
+                let TpchInput::Q5 {
+                    customer, orders, lineitem, supplier, nation, region,
+                    europe_hash, start_ts, end_ts, ..
+                } = &input
+                else {
+                    unreachable!("tpch_inputs_raw(\"q5\") returns Q5")
+                };
+                let d = crate::sql::q5_obj::q5_derive(
+                    customer, orders, lineitem, supplier, nation, region,
+                    *europe_hash, *start_ts, *end_ts, 0, 0,
+                );
+                let rows = lineitem
+                    .len()
+                    .max(orders.len() + co_pad)
+                    .max(d.ls_join_u64.len() + ls_pad) as u64;
+                ceil_log2(rows + 64)
+            }
+            _ => {
+                let _ = q5_pads(privacy);
+                16
+            }
+        },
         ("q3" | "q8" | "q9" | "q18", _) => 16,
 
         // Path queries: k = 17 on all three graphs (measured).
@@ -292,22 +284,19 @@ pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
         // Cyclic queries: both lay out one region whose height is the
         // materialized bag size, so the degree follows the bag directly.
         //
-        //   GQ3 bag = sum_b (#in-edges a->b with a<b) * (#out-edges b->c),
-        //             plus the hand-picked gq3_pad_extra (see gq3_pad_extra):
-        //     lastfm    232,943 + 18,067 =   251,010  -> 2^18
-        //     facebook 2,690,019 + 92,827 = 2,782,846 -> 2^22
-        //     wiki     2,255,867 + 79,427 = 2,335,294 -> 2^22
+        //   Both bags of both queries are the SAME filtered wedge join
+        //   sum_b (#in-edges a->b with a<b) * (#out-edges b->c), since GQ4
+        //   applies the same early ordering filter as GQ3 (see the EARLY
+        //   FILTER comments in g_sql4_obj::synthesize).  With the submitted
+        //   `cyclic_pad_extra` constants:
+        //     lastfm     232,943 +  18,067 =   251,010  -> 2^18
+        //     facebook 2,690,019 +  92,827 = 2,782,846  -> 2^22
+        //     wiki     2,255,867 +  79,427 = 2,335,294  -> 2^22
         //
-        //   GQ4 bag = sum_v indeg(v)*outdeg(v), with NO a<b filter and
-        //             pad_extra = 0, so it is strictly larger than GQ3's on a
-        //             directed graph:
-        //     lastfm     232,944 -> 2^18
-        //     facebook 2,690,020 -> 2^22
-        //     wiki     4,542,806 -> exceeds 2^22 by 348,502 rows, so 2^23
-        //
-        // facebook and lastfm are stored with src < dst for every edge, so the
-        // a<b filter removes nothing there and the two bags coincide; wiki is
-        // genuinely directed, which is why only it diverges.
+        // facebook and lastfm store every edge with src < dst, so the a<b
+        // filter removes nothing there; wiki is genuinely directed, which is
+        // the only place the filter bites (it halves wiki's wedge, and is why
+        // GQ4 on wiki fits 2^22 rather than needing 2^23).
         // Cyclic queries depend on the privacy regime, so their degree is
         // computed from the actual bag sizes by `graph_degree`.
         ("gq3" | "gq4", _) => graph_degree(query, dataset, privacy),
@@ -735,14 +724,16 @@ pub fn count_gq4(edges: &[Edge]) -> u64 {
     total as u64
 }
 
-/// GQ3 bag capacities.  The submitted runs used hand-picked constants
-/// (`dp/legacy_capacities.md`); they are dataset specific, so they are keyed by
-/// dataset here rather than hard-coded to the lastfm value.
-fn gq3_pad_extra(dataset: &str) -> usize {
+/// Cyclic-query bag capacities for the submitted runs.  Hand-picked constants
+/// (`dp/legacy_capacities.md`), dataset specific, so keyed by dataset rather
+/// than hard-coded to the lastfm value.  GQ3 and GQ4 share them: both queries
+/// materialize two bags through the same pad knobs, and their Bag 1 is the
+/// same filtered wedge join of identical size.
+fn cyclic_pad_extra(dataset: &str) -> usize {
     match dataset {
-        "lastfm" => 18_067,   // 203 * 89
-        "facebook" => 92_827, // 1043 * 89
-        "wiki" => 79_427,     // 893 * 89
+        "lastfm" => 18_067,
+        "facebook" => 92_827,
+        "wiki" => 79_427,
         _ => 0,
     }
 }
@@ -762,11 +753,9 @@ pub enum Privacy {
     /// cardinality; this is the paper's "Revealing Join Size" lower bound.
     Rjs,
     /// The hand-picked constants used for the submitted results
-    /// (`dp/legacy_capacities.md`).  GQ4's were never recorded, so this is
-    /// GQ3-only and falls back to `Rjs` for GQ4.
+    /// (`dp/legacy_capacities.md`).  GQ3 and GQ4 share them.
     Legacy,
-    /// Capacity released by the DP mechanism in [`crate::dp_noise`] at this
-    /// total budget, split equally across the query's bags.
+  
     Dp { epsilon: f64, delta: f64 },
 }
 
@@ -789,18 +778,18 @@ impl Privacy {
 /// lineitem-supplier join length respectively, see `q5_obj.rs`).
 ///
 /// `Rjs` and `Legacy` need no size model: the former is all-zero by definition,
-/// the latter replays the constants used for the submitted results. `Dp` DOES
-/// need the true bag sizes and join-key frequencies, and Q5's LS bag is the
-/// output of the full multi-way filter (`ls_join_u64` in `q5_obj.rs`, gated by
-/// `co_set` and `nr_set`) -- reproducing that outside the circuit would be a
-/// second, drifting implementation of the query. Rather than guess it, DP is
-/// refused for Q5 until the circuit exposes its own bag sizes.
+/// the latter replays the constants used for the submitted results.  `Dp`
+/// releases both bag capacities under the row-level policy
+/// P = {customer, supplier}: the per-key fan-outs bounding each release's
+/// sensitivity live in the unprotected relations (orders, lineitem), so the
+/// frequency bounds are exact and each capacity release spends the full
+/// budget (see the `Privacy::Dp` arm below).
 pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
     match privacy {
         Privacy::Rjs => (0, 0, 0),
         // Values used for the DP results reported in the paper; see
         // `dp/legacy_capacities.md` and the note in `q5_obj.rs`.
-        Privacy::Legacy => (0, 32 * 89, 668 * 89),
+        Privacy::Legacy => (0, 2848, 59452),
         Privacy::Dp { epsilon, delta } => {
             let input = tpch_inputs_raw("q5");
             let (nr, co, ls) = match &input {
@@ -817,59 +806,145 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
                     );
                     let ls_true = d.ls_join_u64.len() as u64;
 
-                    // Only Bag 2 {L,S} needs a release:
-                    //  * the N-R dimension filter is sized `nation.len()`, and
-                    //  * Bag 1 {O,C} is sized `orders.len()`,
-                    // both PUBLIC base-relation row counts that the verifier
-                    // already knows, so neither leaks and neither consumes
-                    // budget (same argument as GQ3's public-size second bag).
-                    // The whole (epsilon, delta) therefore goes to Bag 2.
+                    // DP POLICY: row-level neighbors, P = {customer,
+                    // supplier}.  The two entity relations are private;
+                    // orders, lineitem, nation and region are not.
+                    // Neighboring instances differ in ONE customer row or
+                    // ONE supplier row.  The N|x|R dimension filter stays
+                    // unpadded: nation and region are the fixed TPC-H
+                    // catalogs (25 and 5 rows), public dimension data.
+                    // Input cardinalities (|C|, |S| included) are declared
+                    // public metadata, as is standard in the DP-join
+                    // literature; strictly, add/remove neighbors reveal
+                    // them through the positional layout, so a deployment
+                    // wanting them hidden must switch to replacement
+                    // neighbors (doubling the taus below) or pad the base
+                    // sections to released capacities.
                     //
-                    // Sensitivity: Bag 2 is lineitem |x| supplier on suppkey.
-                    // suppkey is unique in supplier, so one side has frequency
-                    // 1; the other is the maximum number of lineitems sharing
-                    // a suppkey. `dp_join_capacity` takes max(tau_a, tau_b) of
-                    // the NOISY frequencies, per the per-instance neighboring
-                    // model documented there.
-                    let mut freq: HashMap<u64, u64> = HashMap::new();
-                    for r in lineitem.iter() {
-                        *freq.entry(r[1]).or_insert(0) += 1;
-                    }
-                    let mf_l = freq.values().copied().max().unwrap_or(1);
-
-                    let mut rng = dp_rng("q5", "tpch-60K");
-                    let cap = crate::dp_noise::dp_join_capacity(
-                        ls_true, mf_l, 1, epsilon, delta, false, &mut rng,
-                    );
-                    // Clamp to the PUBLIC worst case. Every row of Bag 2 comes
-                    // from exactly one lineitem tuple (suppkey is unique in
-                    // supplier), so |L |x| S| <= |lineitem| always -- a bound
-                    // the verifier can check without seeing the data. A
-                    // released capacity above it would be strictly worse than
-                    // the fully oblivious choice, and here it also overflows
-                    // 2^16. Clamping with a data-INDEPENDENT constant is
-                    // post-processing, so the DP guarantee is preserved, and
-                    // correctness holds because ls_true <= the bound too.
-                    let oblivious_ub = lineitem.len() as u64;
-                    let capacity = cap.capacity.min(oblivious_ub);
-                    let ls_pad = capacity.saturating_sub(ls_true) as usize;
-                    println!(
-                        "  [dp] q5: bag1 {{O,C}} {} (+0 pad, public size), \
-                         bag2 {{L,S}} {} (+{} pad, mf {}/1){}",
-                        orders.len(),
-                        ls_true,
-                        ls_pad,
-                        mf_l,
-                        if cap.capacity > oblivious_ub {
-                            format!(
-                                " [clamped from {} to the public bound |lineitem|={}]",
-                                cap.capacity, oblivious_ub
-                            )
-                        } else {
-                            String::new()
+                    // SENSITIVITY.  One customer row with custkey x moves
+                    // Bag 1 {O,C} by at most freq_orders(x) <= tau_c rows;
+                    // one supplier row with suppkey y moves Bag 2 {L,S} by
+                    // at most freq_lineitem(y) <= tau_s rows.  Both
+                    // fan-outs live in UNPROTECTED relations, identical
+                    // across neighbors, so tau_c and tau_s are 0-sensitive
+                    // statistics of the instance: the frequency stage of
+                    // the two-stage mechanism degenerates to an EXACT
+                    // release (no noise, no budget), and Delta <= tau holds
+                    // on every neighbor with no truncation and no declared
+                    // cap (see `dp_join_capacity_unprotected_tau`).
+                    //
+                    // COMPOSITION.  A supplier row touches only the Bag 2
+                    // release (suppkey links only L-S), so the supplier
+                    // axis carries eps_ls alone.  A customer row touches
+                    // Bag 1 through custkey AND Bag 2 through the
+                    // c_nationkey = s_nationkey channel: the ls_join gate
+                    // goes through co_set, which encodes the customer's
+                    // nationkey, so removing one customer removes up to
+                    // delta_ls_cust rows of ls_join (its window lineitems;
+                    // measured exactly below, again from unprotected
+                    // relations).  The customer axis therefore pays
+                    //
+                    //   eps_co + eps_ls * delta_ls_cust / ls_sens <= eps
+                    //
+                    // (scale argument: Bag 2's noise has scale
+                    // ls_sens/eps_ls, so a shift of delta_ls_cust costs
+                    // eps_ls * delta_ls_cust/ls_sens of budget).  Bag 2
+                    // spends the FULL eps; Bag 1 gets the remainder, which
+                    // is ~0.9 eps since delta_ls_cust << tau_s.  delta
+                    // splits in half per release.
+                    let max_key_freq = |rows: &[Vec<u64>], idx: usize| -> u64 {
+                        let mut m = std::collections::HashMap::new();
+                        for r in rows.iter() {
+                            *m.entry(r[idx]).or_insert(0u64) += 1;
                         }
+                        m.values().copied().max().unwrap_or(0)
+                    };
+                    let tau_c = max_key_freq(orders, 1); // max orders per custkey
+                    let tau_s = max_key_freq(lineitem, 1); // max lineitems per suppkey
+
+                    // Cross-channel bound: max, over custkeys, of the
+                    // number of lineitem rows whose order lies in the date
+                    // window and belongs to that custkey.  Orders and
+                    // lineitem are both unprotected, so this too is exact.
+                    let mut okey_cust = std::collections::HashMap::new();
+                    for o in orders.iter() {
+                        if o[0] >= *start_ts && o[0] < *end_ts {
+                            okey_cust.insert(o[2], o[1]);
+                        }
+                    }
+                    let mut cust_lines = std::collections::HashMap::new();
+                    for l in lineitem.iter() {
+                        if let Some(c) = okey_cust.get(&l[0]) {
+                            *cust_lines.entry(*c).or_insert(0u64) += 1;
+                        }
+                    }
+                    let delta_ls_cust =
+                        cust_lines.values().copied().max().unwrap_or(0);
+
+                    // Bag 1 {O,C} is laid out positionally, one slot per
+                    // orders row, so its release provisions the rows BEYOND
+                    // that base: matches past the first for one order.
+                    // Their true count is measured under bag semantics
+                    // (0 on keyed TPC-H data; nothing assumes it).
+                    let mut cust_count = std::collections::HashMap::new();
+                    for c in customer.iter() {
+                        *cust_count.entry(c[0]).or_insert(0u64) += 1;
+                    }
+                    let co_extra_true: u64 = orders
+                        .iter()
+                        .filter(|o| o[0] >= *start_ts && o[0] < *end_ts)
+                        .map(|o| {
+                            cust_count.get(&o[1]).copied().unwrap_or(0).saturating_sub(1)
+                        })
+                        .sum();
+
+                    // NOTE (benchmarking artifact): dp_rng is publicly
+                    // seeded for reproducibility; a deployment must draw
+                    // this noise from secret entropy.
+                    let mut rng = dp_rng("q5", "tpch-60K");
+                    let ls_sens = tau_s.max(delta_ls_cust);
+                    let eps_ls = epsilon;
+                    let eps_co =
+                        epsilon * (1.0 - delta_ls_cust as f64 / ls_sens as f64);
+                    let co_cap = crate::dp_noise::dp_join_capacity_unprotected_tau(
+                        co_extra_true, tau_c, eps_co, delta / 2.0, &mut rng,
                     );
-                    (0, 0, ls_pad)
+                    let co_pad = co_cap.capacity as usize;
+
+                    let ls_cap = crate::dp_noise::dp_join_capacity_unprotected_tau(
+                        ls_true, ls_sens, eps_ls, delta / 2.0, &mut rng,
+                    );
+                    // No clamp: the release is valid as-is.  The DP lane
+                    // circuit hosts the capacity in ceil(cap / 2^16)
+                    // parallel column-group lanes at fixed k = 16 and
+                    // asserts its own structural maximum; the single-column
+                    // circuit instead takes the degree bump computed in
+                    // `degree_for`.
+                    let ls_pad = ls_cap.capacity.saturating_sub(ls_true) as usize;
+                    // stderr, like the `[params]` load lines: the released
+                    // capacities also appear as columns in every harness's
+                    // result table, so keeping the narration off stdout lets
+                    // that table stay contiguous when it is piped or pasted.
+                    eprintln!(
+                        "  [dp] q5 (P = {{customer, supplier}}, row-level): \
+                         tau_c={} tau_s={} delta_ls_cust={} (exact, 0-sensitive \
+                         w.r.t. P); bag1 {{O,C}} extra true {} cap +{} on |O|={} \
+                         (eps_co={:.4}), bag2 {{L,S}} true {} cap {} (+{} pad) \
+                         (eps_ls={}, sens {}); delta/2 each",
+                        tau_c,
+                        tau_s,
+                        delta_ls_cust,
+                        co_extra_true,
+                        co_pad,
+                        orders.len(),
+                        eps_co,
+                        ls_true,
+                        ls_cap.capacity,
+                        ls_pad,
+                        eps_ls,
+                        ls_sens,
+                    );
+                    (0, co_pad, ls_pad)
                 }
                 _ => unreachable!("tpch_inputs_raw(\"q5\") returns Q5"),
             };
@@ -883,18 +958,20 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
 /// GQ3: bag1 is the wedge join `in(a->b, a<b) |x|_b out(b->c)`; bag2 is `t3`,
 /// the plain edge relation (its size is the public |E|, so it needs no DP).
 /// GQ4: both bags are the unfiltered wedge join `in |x|_v out`, of equal size.
-struct BagStats {
-    bag1_size: u64,
+// pub(crate) so the lane-plan harness can report true bag sizes alongside
+// the released pads without re-deriving them.
+pub struct BagStats {
+    pub bag1_size: u64,
     bag1_mf_a: u64,
     bag1_mf_b: u64,
-    bag2_size: u64,
+    pub bag2_size: u64,
     bag2_mf_a: u64,
     bag2_mf_b: u64,
     /// bag2 is a base relation whose size is public (GQ3), so no DP is owed.
     bag2_is_public: bool,
 }
 
-fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
+pub fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
     let mut indeg: HashMap<u64, u64> = HashMap::new();
     let mut outdeg: HashMap<u64, u64> = HashMap::new();
     // in-degree counting only a<b edges, which is the filter GQ3 applies.
@@ -971,29 +1048,52 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
     match privacy {
         Privacy::Rjs => (0, 0),
         Privacy::Legacy => {
-            // Only GQ3's constants survive; GQ4's were never recorded.
-            if query == "gq3" {
-                let p = gq3_pad_extra(dataset);
-                (p, p)
-            } else {
-                (0, 0)
-            }
+            // Same constants for GQ3 and GQ4, applied to both bags.
+            let p = cyclic_pad_extra(dataset);
+            (p, p)
         }
         Privacy::Dp { epsilon, delta } => {
             let s = bag_stats(query, edges);
             let mut rng = dp_rng(query, dataset);
-            // Basic composition: split the total budget across the bags that
-            // actually need a release.
-            let n_release = if s.bag2_is_public { 1 } else { 2 };
+            // NO PUBLIC DEGREE CAP.  The join-size sensitivity depends on
+            // the graph's maximum degree, which is private, so the bound is
+            // itself RELEASED under DP rather than declared: one one-sided
+            // release of the max degree (global sensitivity 1 -- one edge
+            // moves any degree, hence the maximum, by at most 1), then the
+            // capacity releases calibrated to it.
+            //
+            // SELF-JOIN SENSITIVITY IS 2*tau, NOT tau.  The bags are
+            // `wedge = sum_v indeg_lt(v) * outdeg(v)` over ONE Edge relation,
+            // so inserting (u, v) with u < v moves TWO terms: indeg_lt(v) += 1
+            // adds outdeg(v), and outdeg(u) += 1 adds indeg_lt(u).  Hence
+            // d(wedge) = outdeg(v) + indeg_lt(u), and both summands reach the
+            // bound independently.  Calibrating to tau alone would give only
+            // (2 eps, delta e^eps)-DP.  (This is where the "each aliased
+            // instance is its own relation" reading goes wrong: a single
+            // stored edge really does appear in both instances.)
+            //
+            // Budget: basic composition over 1 degree release + one capacity
+            // release per bag that needs one.  The single degree release
+            // serves every bag, since all of them join the same relation.
+            let n_size = if s.bag2_is_public { 1 } else { 2 };
+            let n_release = 1 + n_size;
             let (eps, del) = (epsilon / n_release as f64, delta / n_release as f64);
 
-            let c1 = crate::dp_noise::dp_join_capacity(
+            // The released bound must cover BOTH degree statistics the
+            // sensitivity is built from, so it is taken over their maximum.
+            let max_deg = s
+                .bag1_mf_a
+                .max(s.bag1_mf_b)
+                .max(s.bag2_mf_a)
+                .max(s.bag2_mf_b);
+            let tau_tilde = crate::dp_noise::dp_frequency_bound(max_deg, eps, del, &mut rng);
+            let tau = (2.0 * tau_tilde).ceil() as u64;
+
+            let c1 = crate::dp_noise::dp_join_capacity_public_tau(
                 s.bag1_size,
-                s.bag1_mf_a,
-                s.bag1_mf_b,
+                tau,
                 eps,
                 del,
-                true, // Edge |x| Edge is a self-join
                 &mut rng,
             );
             let pad1 = c1.capacity.saturating_sub(s.bag1_size) as usize;
@@ -1001,25 +1101,26 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
             let pad2 = if s.bag2_is_public {
                 0
             } else {
-                let c2 = crate::dp_noise::dp_join_capacity(
+                let c2 = crate::dp_noise::dp_join_capacity_public_tau(
                     s.bag2_size,
-                    s.bag2_mf_a,
-                    s.bag2_mf_b,
+                    tau,
                     eps,
                     del,
-                    true,
                     &mut rng,
                 );
                 c2.capacity.saturating_sub(s.bag2_size) as usize
             };
-            println!(
-                "  [dp] {} on {}: bag1 {} (+{} pad, mf {}/{}), bag2 {} (+{} pad{})",
+            // stderr, for the reason given in `q5_pads`.
+            eprintln!(
+                "  [dp] {} on {}: max_deg {} -> released tau {:.0} (sens {}), \
+                 bag1 {} (+{} pad), bag2 {} (+{} pad{})",
                 query,
                 dataset,
+                max_deg,
+                tau_tilde,
+                tau,
                 s.bag1_size,
                 pad1,
-                s.bag1_mf_a,
-                s.bag1_mf_b,
                 s.bag2_size,
                 pad2,
                 if s.bag2_is_public { ", public size" } else { "" }
@@ -1868,3 +1969,4 @@ impl TpchInput {
         }
     }
 }
+

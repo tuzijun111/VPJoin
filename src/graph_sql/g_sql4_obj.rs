@@ -58,21 +58,166 @@ use crate::data::graph_data_processing::Edge;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
-const NUM_BYTES: usize = 8;
-const PAD_U64: u64 = u64::MAX;
+// `pub(crate)` so the multi-lane DP variant `g_sql4_obj_dp` inherits exactly
+// the same PAD / packing conventions instead of restating them.
+pub(crate) const NUM_BYTES: usize = 8;
+pub(crate) const PAD_U64: u64 = u64::MAX;
 
 // shift node IDs by +1 so 0 can be reserved for dummy row
 const SHIFT_ID: u64 = 1;
 
 // pack2(hi, lo) using 32-bit lanes (assumes hi,lo < 2^32)
 const PACK_BITS: u32 = 32;
-const PACK_SHIFT: u64 = 1u64 << PACK_BITS;
-fn pack2(hi: u64, lo: u64) -> u64 {
+pub(crate) const PACK_SHIFT: u64 = 1u64 << PACK_BITS;
+pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
     hi * PACK_SHIFT + lo
 }
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
+
+/// ------------------------------
+/// Host-side witness derivation, shared by this circuit and its multi-lane
+/// DP variant `g_sql4_obj_dp`.  Pure function of the edge list: it knows
+/// nothing about padding, degrees or lanes.
+/// ------------------------------
+pub(crate) struct Gq4Derived {
+    /// InByDst input rows (key=dst, val=src, eid); row 0 is the (0,0,0) dummy.
+    pub in_rows: Vec<(u64, u64, u64)>,
+    /// OutBySrc input rows (key=src, val=dst, eid); row 0 is the (0,0,0) dummy.
+    pub out_rows: Vec<(u64, u64, u64)>,
+    /// Bag1 paths A->B->C as (A,B,C,i_r1,j_r2,r1_eid,r2_eid), pre-filtered to A<B.
+    pub t12: Vec<(u64, u64, u64, u64, u64, u64, u64)>,
+    /// Bag2 paths C->D->A as (C,D,A,i_r3,j_r4,r3_eid,r4_eid), pre-filtered to C<D.
+    pub t34: Vec<(u64, u64, u64, u64, u64, u64, u64)>,
+    /// Message table: msg_key = pack2(A,C) -> COUNT(Bag2 rows with C<D).
+    pub msg_map: BTreeMap<u64, u64>,
+    /// Sorted, deduped msg keys plus the 0 and PAD sentinels, for gap witnesses.
+    pub keys: Vec<u64>,
+}
+
+pub(crate) fn gq4_derive(edges: &[Edge]) -> Gq4Derived {
+    // -------------------
+    // Build (eid,src,dst) with dummy row0
+    // -------------------
+    let n_base = edges.len() + 1;
+    let mut base: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base); // (eid,src,dst)
+    base.push((0, 0, 0));
+    for (i, e) in edges.iter().enumerate() {
+        let eid = (i + 1) as u64;
+        base.push((eid, (e.src as u64) + SHIFT_ID, (e.dst as u64) + SHIFT_ID));
+    }
+
+    // -------------------
+    // Build view inputs from base rows
+    // -------------------
+    let mut in_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
+    let mut out_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
+    for (eid, src, dst) in base.iter().copied() {
+        in_rows.push((dst, src, eid)); // key=dst, val=src
+        out_rows.push((src, dst, eid)); // key=src, val=dst
+    }
+
+    // -------------------
+    // Host-side grouping to compute indices (must match sorting by (key,eid))
+    // -------------------
+    let mut in_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*src*/)>> = HashMap::new();
+    let mut out_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*dst*/)>> = HashMap::new();
+    for (eid, src, dst) in base.iter().copied() {
+        if eid == 0 {
+            continue;
+        }
+        in_groups.entry(dst).or_default().push((eid, src));
+        out_groups.entry(src).or_default().push((eid, dst));
+    }
+    for v in in_groups.values_mut() {
+        v.sort_by_key(|(eid, _)| *eid);
+    }
+    for v in out_groups.values_mut() {
+        v.sort_by_key(|(eid, _)| *eid);
+    }
+
+    // -------------------
+    // Materialize Bag1: T12 = r1(A->B) |x| r2(B->C) on B
+    // row = (A,B,C,i_r1,j_r2,r1_eid,r2_eid)
+    // -------------------
+    let mut t12: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
+    for (&b, incoming) in in_groups.iter() {
+        if let Some(outgoing) = out_groups.get(&b) {
+            for (i, (r1_eid, a)) in incoming.iter().enumerate() {
+                // EARLY FILTER: r1.src < r2.src  (A < B), mirroring
+                // `g_sql3_obj`.  The "contrib gate" computes
+                // real * msg_val * [A<B] * [B<C], so a row with A >= B
+                // contributes exactly zero; materializing it only pays for
+                // capacity.  Dropping it here is why GQ4 fits the same domain
+                // as GQ3 on the directed graph (wiki: 4,542,805 -> 2,255,867
+                // rows, i.e. k=23 -> k=22).
+                //
+                // Skip BEFORE the inner loop so `i` keeps its meaning as the
+                // index into `incoming`: it is looked up against
+                // `in_by_dst.idx`, so it must stay the original enumerate index.
+                if *a >= b {
+                    continue;
+                }
+                for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
+                    t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
+                }
+            }
+        }
+    }
+
+    // -------------------
+    // Materialize Bag2: T34 = r3(C->D) |x| r4(D->A) on D
+    // row = (C,D,A,i_r3,j_r4,r3_eid,r4_eid)
+    // -------------------
+    let mut t34: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
+    for (&d, incoming) in in_groups.iter() {
+        if let Some(outgoing) = out_groups.get(&d) {
+            for (i, (r3_eid, c)) in incoming.iter().enumerate() {
+                // EARLY FILTER: r3.src < r3.dst  (C < D).  The
+                // "msg input from bag2" gate sets keep = t34_real * [C<D] and
+                // emits (in_key, in_val) = (PAD, 0) when keep = 0, so a row
+                // with C >= D contributes nothing to the message map.  Same
+                // reasoning and same placement as the Bag1 filter above.
+                if *c >= d {
+                    continue;
+                }
+                for (j, (r4_eid, a)) in outgoing.iter().enumerate() {
+                    t34.push((*c, d, *a, i as u64, j as u64, *r3_eid, *r4_eid));
+                }
+            }
+        }
+    }
+
+    // -------------------
+    // Message map (host-side): msg_key = pack2(A,C),
+    // msg_val = count of Bag2 rows with C<D
+    // -------------------
+    let mut msg_map: BTreeMap<u64, u64> = BTreeMap::new();
+    for (c, d, a, _i, _j, _r3_eid, _r4_eid) in t34.iter().copied() {
+        if c < d {
+            let key = pack2(a, c);
+            *msg_map.entry(key).or_default() += 1;
+        }
+    }
+
+    // Sorted key list for gap witnesses (host-side).
+    // IMPORTANT: must include 0 and PAD
+    let mut keys: Vec<u64> = msg_map.keys().copied().collect();
+    keys.push(0);
+    keys.push(PAD_U64);
+    keys.sort();
+    keys.dedup();
+
+    Gq4Derived {
+        in_rows,
+        out_rows,
+        t12,
+        t34,
+        msg_map,
+        keys,
+    }
+}
 
 /// ------------------------------
 /// AggSumByKey: group-by SUM(val) over key (used for counting)
@@ -135,6 +280,24 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
     }
 
     pub fn configure(meta: &mut ConstraintSystem<F>) -> AggSumByKeyConfig<F> {
+        let u8_key = meta.fixed_column();
+        let u8_out_key = meta.fixed_column();
+        Self::configure_with_u8(meta, u8_key, u8_out_key)
+    }
+
+    /// Same replica as [`AggSumByKeyChip::configure`], but with the two u8
+    /// range columns supplied by the caller.
+    ///
+    /// `g_sql4_obj_dp` builds one aggregator replica per Bag2 lane.  `load`
+    /// writes 256 fixed rows through a region of its own, so a fresh u8 column
+    /// per lane would make the range-table preamble grow with the lane count.
+    /// Sharing one column keeps it constant.  It does not change the number of
+    /// lookup arguments, which are per diff-byte column.
+    pub fn configure_with_u8(
+        meta: &mut ConstraintSystem<F>,
+        u8_key: Column<Fixed>,
+        u8_out_key: Column<Fixed>,
+    ) -> AggSumByKeyConfig<F> {
         let in_key = meta.advice_column();
         let in_val = meta.advice_column();
         meta.enable_equality(in_key);
@@ -157,8 +320,9 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
 
         // sorted_key nondecreasing
         let q_sort = meta.selector();
-        let lt_key = LtChip::<F, NUM_BYTES>::configure(
+        let lt_key = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
+            u8_key,
             |m| m.query_selector(q_sort),
             |m| m.query_advice(sorted_key, Rotation::cur()),
             |m| m.query_advice(sorted_key, Rotation::next()),
@@ -268,8 +432,9 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
 
         // out nondecreasing
         let q_out_sort = meta.selector();
-        let lt_out_key = LtChip::<F, NUM_BYTES>::configure(
+        let lt_out_key = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
+            u8_out_key,
             |m| m.query_selector(q_out_sort),
             |m| m.query_advice(out_key, Rotation::cur()),
             |m| m.query_advice(out_key, Rotation::next()),
@@ -932,18 +1097,63 @@ impl<F: Field + Ord> MapLookupChip<F> {
     ) -> MapLookupConfig<F> {
         let q_flag = meta.selector();
         let q_complex = meta.complex_selector();
+        let u8_low = meta.fixed_column();
+        let u8_high = meta.fixed_column();
+        Self::configure_with(
+            meta,
+            map_key,
+            map_val,
+            map_key_next,
+            q_tbl,
+            q_flag,
+            q_complex,
+            u8_low,
+            u8_high,
+            true,
+        )
+    }
 
+    /// Same replica as [`MapLookupChip::configure`], but with the two probe
+    /// selectors and the two u8 range columns supplied by the caller.
+    ///
+    /// `g_sql4_obj_dp` builds one MapLookup replica per (Bag1 lane, Bag2 lane)
+    /// pair.  All of them are active on the same rows, so they share one
+    /// `q_flag` / `q_complex` pair, and they share one u8 column so the number
+    /// of 256-row `load` regions does not grow with the lane counts.
+    ///
+    /// `probe_equality` puts the five probe columns into the permutation
+    /// argument.  halo2 charges for every column in the permutation whether or
+    /// not a copy constraint ever touches it, and NOTHING copies a probe cell,
+    /// so a replicated caller passes `false`: otherwise the permutation cost
+    /// would grow as `5 * c1 * c2` for nothing.  [`MapLookupChip::configure`]
+    /// passes `true` to keep the single-group circuits byte-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_with(
+        meta: &mut ConstraintSystem<F>,
+        map_key: Column<Advice>,
+        map_val: Column<Advice>,
+        map_key_next: Column<Advice>,
+        q_tbl: Selector, // must be complex
+        q_flag: Selector,
+        q_complex: Selector, // must be complex
+        u8_low: Column<Fixed>,
+        u8_high: Column<Fixed>,
+        probe_equality: bool,
+    ) -> MapLookupConfig<F> {
         let key = meta.advice_column();
         let in_set = meta.advice_column();
         let low = meta.advice_column();
         let high = meta.advice_column();
         let val = meta.advice_column();
-        for c in [key, in_set, low, high, val] {
-            meta.enable_equality(c);
+        if probe_equality {
+            for c in [key, in_set, low, high, val] {
+                meta.enable_equality(c);
+            }
         }
 
-        let lt_low = LtChip::<F, NUM_BYTES>::configure(
+        let lt_low = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
+            u8_low,
             |m| {
                 let q = m.query_selector(q_flag);
                 let inside = m.query_advice(in_set, Rotation::cur());
@@ -952,8 +1162,9 @@ impl<F: Field + Ord> MapLookupChip<F> {
             |m| m.query_advice(low, Rotation::cur()),
             |m| m.query_advice(key, Rotation::cur()),
         );
-        let lt_high = LtChip::<F, NUM_BYTES>::configure(
+        let lt_high = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
+            u8_high,
             |m| {
                 let q = m.query_selector(q_flag);
                 let inside = m.query_advice(in_set, Rotation::cur());
@@ -1489,111 +1700,22 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 }
 
                 // -------------------
-                // Build view inputs from base rows
+                // Host-side derivation: view inputs, both bags, message map.
+                // Shared verbatim with `g_sql4_obj_dp`.
                 // -------------------
-                let mut base: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base); // (eid,src,dst)
-                base.push((0, 0, 0));
-                for (i, e) in edges.iter().enumerate() {
-                    let eid = (i + 1) as u64;
-                    base.push((eid, (e.src as u64) + SHIFT_ID, (e.dst as u64) + SHIFT_ID));
-                }
-
-                let mut in_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
-                let mut out_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
-                for (eid, src, dst) in base.iter().copied() {
-                    in_rows.push((dst, src, eid)); // key=dst, val=src
-                    out_rows.push((src, dst, eid)); // key=src, val=dst
-                }
+                let derived = gq4_derive(&edges);
+                let Gq4Derived {
+                    in_rows,
+                    out_rows,
+                    t12,
+                    t34,
+                    msg_map,
+                    keys,
+                } = derived;
 
                 // Assign indexed views
                 in_view_chip.assign(&mut region, n_base, &in_rows)?;
                 out_view_chip.assign(&mut region, n_base, &out_rows)?;
-
-                // -------------------
-                // Host-side grouping to compute indices (must match sorting by (key,eid))
-                // -------------------
-                let mut in_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*src*/)>> = HashMap::new();
-                let mut out_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*dst*/)>> = HashMap::new();
-                for (eid, src, dst) in base.iter().copied() {
-                    if eid == 0 {
-                        continue;
-                    }
-                    in_groups.entry(dst).or_default().push((eid, src));
-                    out_groups.entry(src).or_default().push((eid, dst));
-                }
-                for v in in_groups.values_mut() {
-                    v.sort_by_key(|(eid, _)| *eid);
-                }
-                for v in out_groups.values_mut() {
-                    v.sort_by_key(|(eid, _)| *eid);
-                }
-
-                // -------------------
-                // Materialize Bag1: T12 = r1(A->B) ⋈ r2(B->C) on B
-                // row = (A,B,C,i_r1,j_r2,r1_eid,r2_eid)
-                // -------------------
-                let mut t12: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
-                for (&b, incoming) in in_groups.iter() {
-                    if let Some(outgoing) = out_groups.get(&b) {
-                        for (i, (r1_eid, a)) in incoming.iter().enumerate() {
-                            // EARLY FILTER: r1.src < r2.src  (A < B), mirroring
-                            // `g_sql3_obj`.  The "contrib gate" computes
-                            // real * msg_val * [A<B] * [B<C], so a row with
-                            // A >= B contributes exactly zero; materializing it
-                            // only pays for capacity.  Dropping it here is why
-                            // GQ4 fits the same domain as GQ3 on the directed
-                            // graph (wiki: 4,542,805 -> 2,255,867 rows, i.e.
-                            // k=23 -> k=22).
-                            //
-                            // Skip BEFORE the inner loop so `i` keeps its
-                            // meaning as the index into `incoming`: it is
-                            // looked up against `in_by_dst.idx`, so it must
-                            // stay the original enumerate index.
-                            if *a >= b {
-                                continue;
-                            }
-                            for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
-                                t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
-                            }
-                        }
-                    }
-                }
-
-                // -------------------
-                // Materialize Bag2: T34 = r3(C->D) ⋈ r4(D->A) on D
-                // row = (C,D,A,i_r3,j_r4,r3_eid,r4_eid)
-                // -------------------
-                let mut t34: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
-                for (&d, incoming) in in_groups.iter() {
-                    if let Some(outgoing) = out_groups.get(&d) {
-                        for (i, (r3_eid, c)) in incoming.iter().enumerate() {
-                            // EARLY FILTER: r3.src < r3.dst  (C < D).  The
-                            // "msg input from bag2" gate sets
-                            // keep = t34_real * [C<D] and emits
-                            // (in_key, in_val) = (PAD, 0) when keep = 0, so a
-                            // row with C >= D contributes nothing to the
-                            // message map.  Same reasoning and same placement
-                            // as the Bag1 filter above.
-                            if *c >= d {
-                                continue;
-                            }
-                            for (j, (r4_eid, a)) in outgoing.iter().enumerate() {
-                                t34.push((*c, d, *a, i as u64, j as u64, *r3_eid, *r4_eid));
-                            }
-                        }
-                    }
-                }
-
-                // -------------------
-                // Message map (host-side): msg_key = pack2(A,C), msg_val = count of Bag2 rows with C<D
-                // -------------------
-                let mut msg_map: BTreeMap<u64, u64> = BTreeMap::new();
-                for (c, d, a, _i, _j, _r3_eid, _r4_eid) in t34.iter().copied() {
-                    if c < d {
-                        let key = pack2(a, c);
-                        *msg_map.entry(key).or_default() += 1;
-                    }
-                }
 
                 // -------------------
                 // Assign Bag2 rows + build agg inputs (key,value)
@@ -1754,13 +1876,8 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // proving, so this fired several times per measured row.
                 // println!("The length of n12 is: {}", t12.len());
 
-                // Prepare sorted key list for gap witness (host-side)
-                // IMPORTANT: must include 0 and PAD
-                let mut keys: Vec<u64> = msg_map.keys().copied().collect();
-                keys.push(0);
-                keys.push(PAD_U64);
-                keys.sort();
-                keys.dedup();
+                // `keys`, the sorted gap-witness key list (with the 0 and PAD
+                // sentinels), comes from `gq4_derive` above.
 
                 let lt_ab_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone());
                 let lt_bc_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone());
@@ -2184,46 +2301,46 @@ mod tests {
 
     #[test]
     fn test() {
-        let base_path = &crate::paths::graph_dir();
-
-        // let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
-
-        // let mut edges =
-        //     read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
-
-        let mut edges =
-            read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
-
-        // edges.truncate(10000);
-
+        let dataset = std::env::var("VPJOIN_DATASET").unwrap_or_else(|_| "lastfm".into());
+        let edges = crate::bench_queries::load_graph(&dataset);
         let cnt = expected_cnt(&edges);
 
-        // ---------------------------------------------------------------
-        // PADDING CONSTANTS (GQ4).
-        //
-        // As checked in, both knobs are 0, i.e. capacity = the true bag size.
-        // That is the paper's "Revealing Join Size" baseline, NOT its
-        // "VPJoin + DP" configuration.
-        //
-        // The non-zero values used for the reported GQ4 + DP runs were edited
-        // in place per run and were NOT preserved anywhere -- see
-        // `dp/legacy_capacities.md`. GQ4 therefore has no recoverable legacy
-        // DP constants, unlike Q5 (`q5_obj.rs`) and GQ3 (`g_sql3_obj.rs`).
-        // Regenerate them with the corrected mechanism instead:
-        // VPJOIN_PRIVACY=dp in the benchmark harness releases capacities via
-        // `bench_queries::graph_pads` -> `dp_noise::dp_join_capacity`, which
-        // applies to BOTH bags here (both are genuine self-joins, unlike GQ3
-        // whose second bag is the public-size edge relation).
-        // ---------------------------------------------------------------
+        let privacy = match std::env::var("VPJOIN_PRIVACY")
+            .as_deref()
+            .unwrap_or("legacy")
+        {
+            "rjs" => crate::bench_queries::Privacy::Rjs,
+            "dp" => crate::bench_queries::Privacy::Dp {
+                epsilon: std::env::var("VPJOIN_EPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.1),
+                delta: std::env::var("VPJOIN_DELTA")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1e-5),
+            },
+            _ => crate::bench_queries::Privacy::Legacy,
+        };
+        let (bag1_pad_extra, bag2_pad_extra) =
+            crate::bench_queries::graph_pads("gq4", &dataset, &edges, privacy);
+        println!(
+            "[gq4 test] dataset={} privacy={} pads: bag1={} bag2={}",
+            dataset,
+            privacy.label(),
+            bag1_pad_extra,
+            bag2_pad_extra
+        );
+
         let circuit = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra: 0,
-            bag2_pad_extra: 0,
+            bag1_pad_extra,
+            bag2_pad_extra,
             _marker: PhantomData,
         };
 
         let public_input = vec![Fp::from(cnt)];
-        let k = 18;
+        let k = crate::bench_queries::degree_for("gq4", &dataset, privacy);
 
         // let test = true;
         let test = false;

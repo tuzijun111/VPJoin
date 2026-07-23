@@ -43,22 +43,147 @@ use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
 // IMPORTANT: pack2(A,C) can exceed 5 bytes. Use 8 bytes to avoid LT gate failures.
-const NUM_BYTES: usize = 8;
+// `pub(crate)` so the multi-lane DP variant `g_sql3_obj_dp` inherits exactly the
+// same PAD / packing conventions instead of restating them.
+pub(crate) const NUM_BYTES: usize = 8;
 
-const PAD_U64: u64 = u64::MAX;
+pub(crate) const PAD_U64: u64 = u64::MAX;
 
 // shift node IDs by +1 so 0 can be reserved for dummy row
 const SHIFT_ID: u64 = 1;
 
 // pack2(hi, lo) using 32-bit lanes (assumes hi,lo < 2^32)
 const PACK_BITS: u32 = 32;
-const PACK_SHIFT: u64 = 1u64 << PACK_BITS;
-fn pack2(hi: u64, lo: u64) -> u64 {
+pub(crate) const PACK_SHIFT: u64 = 1u64 << PACK_BITS;
+pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
     hi * PACK_SHIFT + lo
 }
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
+
+/// ------------------------------
+/// Host-side witness derivation, shared by this circuit and its multi-lane
+/// DP variant `g_sql3_obj_dp`. Pure function of the edge list: it knows
+/// nothing about padding, degrees or lanes.
+/// ------------------------------
+pub(crate) struct Gq3Derived {
+    /// InByDst input rows (key=dst, val=src, eid); row 0 is the (0,0,0) dummy.
+    pub in_rows: Vec<(u64, u64, u64)>,
+    /// OutBySrc input rows (key=src, val=dst, eid); row 0 is the (0,0,0) dummy.
+    pub out_rows: Vec<(u64, u64, u64)>,
+    /// Bag1 wedges A->B->C as (A,B,C,i_r1,j_r2,r1_eid,r2_eid), pre-filtered to A<B.
+    pub t12: Vec<(u64, u64, u64, u64, u64, u64, u64)>,
+    /// Bag2 closing edges C->A as (C,A,j_r3,r3_eid).
+    pub t3: Vec<(u64, u64, u64, u64)>,
+    /// Message table: msg_key = pack2(A,C) -> COUNT(edges C->A).
+    pub msg_map: BTreeMap<u64, u64>,
+    /// Sorted, deduped msg keys plus the 0 and PAD sentinels, for gap witnesses.
+    pub keys: Vec<u64>,
+}
+
+pub(crate) fn gq3_derive(edges: &[Edge]) -> Gq3Derived {
+    // -------------------
+    // Build (eid,src,dst) with dummy row0
+    // -------------------
+    let n_base = edges.len() + 1;
+    let mut base: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base); // (eid,src,dst)
+    base.push((0, 0, 0));
+    for (i, e) in edges.iter().enumerate() {
+        let eid = (i + 1) as u64;
+        base.push((eid, (e.src as u64) + SHIFT_ID, (e.dst as u64) + SHIFT_ID));
+    }
+
+    // -------------------
+    // Build view inputs
+    // InByDst: key=dst, val=src
+    // OutBySrc: key=src, val=dst
+    // -------------------
+    let mut in_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
+    let mut out_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
+    for (eid, src, dst) in base.iter().copied() {
+        in_rows.push((dst, src, eid));
+        out_rows.push((src, dst, eid));
+    }
+
+    // -------------------
+    // Host-side grouping by key with eid-sorted order (to match IndexedView sorting)
+    // -------------------
+    let mut in_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*src*/)>> = HashMap::new();
+    let mut out_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*dst*/)>> = HashMap::new();
+
+    for (eid, src, dst) in base.iter().copied() {
+        if eid == 0 {
+            continue;
+        }
+        in_groups.entry(dst).or_default().push((eid, src));
+        out_groups.entry(src).or_default().push((eid, dst));
+    }
+    for v in in_groups.values_mut() {
+        v.sort_by_key(|(eid, _)| *eid);
+    }
+    for v in out_groups.values_mut() {
+        v.sort_by_key(|(eid, _)| *eid);
+    }
+
+    // -------------------
+    // Bag1: wedges A->B->C from join on B
+    // row = (A,B,C,i_r1,j_r2,r1_eid,r2_eid)
+    // ✅ Filter early: only keep wedges with A < B  (i.e., r1.src < r2.src)
+    // -------------------
+    let mut t12: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
+    for (&b, incoming) in in_groups.iter() {
+        if let Some(outgoing) = out_groups.get(&b) {
+            for (i, (r1_eid, a)) in incoming.iter().enumerate() {
+                // EARLY FILTER: r1.src < r2.src  (A < B)
+                // Note: a and b are already SHIFT_ID-shifted, inequality is preserved.
+                if *a >= b {
+                    continue;
+                }
+                for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
+                    t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
+                }
+            }
+        }
+    }
+
+    // -------------------
+    // Bag2: edges C->A (r3) from OutBySrc grouped by C
+    // row = (C,A,j_r3,r3_eid)
+    // -------------------
+    let mut t3: Vec<(u64, u64, u64, u64)> = vec![];
+    for (&c, outs) in out_groups.iter() {
+        for (j, (r3_eid, a)) in outs.iter().enumerate() {
+            // edge is c -> a
+            t3.push((c, *a, j as u64, *r3_eid));
+        }
+    }
+
+    // -------------------
+    // Message map: msg_key = pack2(A,C), msg_val = count of edges C->A
+    // -------------------
+    let mut msg_map: BTreeMap<u64, u64> = BTreeMap::new();
+    for (c, a, _j, _eid) in t3.iter().copied() {
+        let key = pack2(a, c);
+        *msg_map.entry(key).or_default() += 1;
+    }
+
+    // key list for gap witnesses
+    let mut keys: Vec<u64> = msg_map.keys().copied().collect();
+    keys.push(0);
+    keys.push(PAD_U64);
+    keys.sort();
+    keys.dedup();
+
+    Gq3Derived {
+        in_rows,
+        out_rows,
+        t12,
+        t3,
+        msg_map,
+        keys,
+    }
+}
 
 /// ------------------------------
 /// AggSumByKey: group-by SUM(val) over key
@@ -76,7 +201,7 @@ pub struct AggSumByKeyConfig<F: Field + Ord> {
     perm_sort: PermAnyConfig,
 
     q_sort: Selector,
-    lt_key: LtConfig<F, NUM_BYTES>,
+    pub(crate) lt_key: LtConfig<F, NUM_BYTES>,
     iz_eq_key: IsZeroConfig<F>,
 
     q_first: Selector,
@@ -94,7 +219,7 @@ pub struct AggSumByKeyConfig<F: Field + Ord> {
     perm_out: PermAnyConfig,
 
     q_out_sort: Selector,
-    lt_out_key: LtConfig<F, NUM_BYTES>,
+    pub(crate) lt_out_key: LtConfig<F, NUM_BYTES>,
     iz_out_eq: IsZeroConfig<F>,
 
     pub map_key: Column<Advice>,
@@ -609,7 +734,7 @@ pub struct IndexedViewConfig<F: Field + Ord> {
     perm: PermAnyConfig,
 
     q_sort: Selector,
-    lt_key: LtConfig<F, NUM_BYTES>,
+    pub(crate) lt_key: LtConfig<F, NUM_BYTES>,
     iz_eq_key: IsZeroConfig<F>,
 
     pub idx: Column<Advice>,
@@ -893,18 +1018,64 @@ impl<F: Field + Ord> MapLookupChip<F> {
     ) -> MapLookupConfig<F> {
         let q_flag = meta.selector();
         let q_complex = meta.complex_selector();
+        let u8_low = meta.fixed_column();
+        let u8_high = meta.fixed_column();
+        Self::configure_with(
+            meta,
+            map_key,
+            map_val,
+            map_key_next,
+            q_tbl,
+            q_flag,
+            q_complex,
+            u8_low,
+            u8_high,
+            true,
+        )
+    }
 
+    /// Same replica as [`MapLookupChip::configure`], but with the two probe
+    /// selectors and the two u8 range columns supplied by the caller.
+    ///
+    /// `g_sql3_obj_dp` builds one MapLookup replica per lane. All lanes are
+    /// active on the same rows, so they share one `q_flag` / `q_complex` pair,
+    /// and they share one u8 column so the number of 256-row `load` regions
+    /// does not grow with the lane count.
+    ///
+    /// `probe_equality` decides whether the five probe columns join the
+    /// permutation argument. Nothing in this circuit family ever copies them,
+    /// so the replicated (per-lane) call passes `false`: halo2 pays for every
+    /// column that has equality enabled, whether or not a copy constraint
+    /// actually touches it, and that cost would otherwise scale with the lane
+    /// count. `configure` passes `true` to leave the single-group layout of
+    /// `g_sql3_obj` byte-for-byte as it was.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_with(
+        meta: &mut ConstraintSystem<F>,
+        map_key: Column<Advice>,
+        map_val: Column<Advice>,
+        map_key_next: Column<Advice>,
+        q_tbl: Selector,
+        q_flag: Selector,
+        q_complex: Selector,
+        u8_low: Column<Fixed>,
+        u8_high: Column<Fixed>,
+        probe_equality: bool,
+    ) -> MapLookupConfig<F> {
         let key = meta.advice_column();
         let in_set = meta.advice_column();
         let low = meta.advice_column();
         let high = meta.advice_column();
         let val = meta.advice_column();
-        for c in [key, in_set, low, high, val] {
-            meta.enable_equality(c);
+        if probe_equality {
+            for c in [key, in_set, low, high, val] {
+                meta.enable_equality(c);
+            }
         }
 
-        let lt_low = LtChip::<F, NUM_BYTES>::configure(
+        let lt_low = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
+            u8_low,
             |m| {
                 let q = m.query_selector(q_flag);
                 let inside = m.query_advice(in_set, Rotation::cur());
@@ -913,8 +1084,9 @@ impl<F: Field + Ord> MapLookupChip<F> {
             |m| m.query_advice(low, Rotation::cur()),
             |m| m.query_advice(key, Rotation::cur()),
         );
-        let lt_high = LtChip::<F, NUM_BYTES>::configure(
+        let lt_high = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
+            u8_high,
             |m| {
                 let q = m.query_selector(q_flag);
                 let inside = m.query_advice(in_set, Rotation::cur());
@@ -1332,92 +1504,21 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             || "triangle_path_closer witness",
             |mut region| {
                 // -------------------
-                // Build (eid,src,dst) with dummy row0
+                // Host-side derivation (views, Bag1, Bag2, message map)
                 // -------------------
-                let n_base = edges.len() + 1;
-                let mut base: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base); // (eid,src,dst)
-                base.push((0, 0, 0));
-                for (i, e) in edges.iter().enumerate() {
-                    let eid = (i + 1) as u64;
-                    base.push((eid, (e.src as u64) + SHIFT_ID, (e.dst as u64) + SHIFT_ID));
-                }
+                let derived = gq3_derive(&edges);
+                let Gq3Derived {
+                    ref in_rows,
+                    ref out_rows,
+                    ref t12,
+                    ref t3,
+                    ref msg_map,
+                    ref keys,
+                } = derived;
+                let n_base = in_rows.len();
 
-                // -------------------
-                // Build view inputs
-                // InByDst: key=dst, val=src
-                // OutBySrc: key=src, val=dst
-                // -------------------
-                let mut in_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
-                let mut out_rows: Vec<(u64, u64, u64)> = Vec::with_capacity(n_base);
-                for (eid, src, dst) in base.iter().copied() {
-                    in_rows.push((dst, src, eid));
-                    out_rows.push((src, dst, eid));
-                }
-
-                in_view_chip.assign(&mut region, n_base, &in_rows)?;
-                out_view_chip.assign(&mut region, n_base, &out_rows)?;
-
-                // -------------------
-                // Host-side grouping by key with eid-sorted order (to match IndexedView sorting)
-                // -------------------
-                let mut in_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*src*/)>> = HashMap::new();
-                let mut out_groups: HashMap<u64, Vec<(u64 /*eid*/, u64 /*dst*/)>> = HashMap::new();
-
-                for (eid, src, dst) in base.iter().copied() {
-                    if eid == 0 {
-                        continue;
-                    }
-                    in_groups.entry(dst).or_default().push((eid, src));
-                    out_groups.entry(src).or_default().push((eid, dst));
-                }
-                for v in in_groups.values_mut() {
-                    v.sort_by_key(|(eid, _)| *eid);
-                }
-                for v in out_groups.values_mut() {
-                    v.sort_by_key(|(eid, _)| *eid);
-                }
-
-                // -------------------
-                // Bag1: wedges A->B->C from join on B
-                // row = (A,B,C,i_r1,j_r2,r1_eid,r2_eid)
-                // ✅ Filter early: only keep wedges with A < B  (i.e., r1.src < r2.src)
-                // -------------------
-                let mut t12: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
-                for (&b, incoming) in in_groups.iter() {
-                    if let Some(outgoing) = out_groups.get(&b) {
-                        for (i, (r1_eid, a)) in incoming.iter().enumerate() {
-                            // EARLY FILTER: r1.src < r2.src  (A < B)
-                            // Note: a and b are already SHIFT_ID-shifted, inequality is preserved.
-                            if *a >= b {
-                                continue;
-                            }
-                            for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
-                                t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
-                            }
-                        }
-                    }
-                }
-
-                // -------------------
-                // Bag2: edges C->A (r3) from OutBySrc grouped by C
-                // row = (C,A,j_r3,r3_eid)
-                // -------------------
-                let mut t3: Vec<(u64, u64, u64, u64)> = vec![];
-                for (&c, outs) in out_groups.iter() {
-                    for (j, (r3_eid, a)) in outs.iter().enumerate() {
-                        // edge is c -> a
-                        t3.push((c, *a, j as u64, *r3_eid));
-                    }
-                }
-
-                // -------------------
-                // Message map: msg_key = pack2(A,C), msg_val = count of edges C->A
-                // -------------------
-                let mut msg_map: BTreeMap<u64, u64> = BTreeMap::new();
-                for (c, a, _j, _eid) in t3.iter().copied() {
-                    let key = pack2(a, c);
-                    *msg_map.entry(key).or_default() += 1;
-                }
+                in_view_chip.assign(&mut region, n_base, in_rows)?;
+                out_view_chip.assign(&mut region, n_base, out_rows)?;
 
                 // -------------------
                 // Assign Bag2 + build agg inputs
@@ -1505,13 +1606,6 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 // Debug print, silenced: `assign` runs during keygen as well as
                 // proving, so this fired several times per measured row.
                 // println!("The length of n12 is: {}", t12.len());
-
-                // key list for gap witnesses
-                let mut keys: Vec<u64> = msg_map.keys().copied().collect();
-                keys.push(0);
-                keys.push(PAD_U64);
-                keys.sort();
-                keys.dedup();
 
                 let lt_ab_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone());
                 let lt_bc_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone());
@@ -1749,8 +1843,6 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::graph_data_processing::read_edges;
-    use crate::data::graph_data_processing::read_edges_csv;
     use halo2_proofs::dev::MockProver;
 
     use halo2_proofs::{
@@ -1888,53 +1980,46 @@ mod tests {
 
     #[test]
     fn test() {
-        let base_path = &crate::paths::graph_dir();
-
-        let mut edges =
-            read_edges_csv(&format!("{}/last/lastfm_asia_edges.csv", base_path)).unwrap();
-        // The length of n12 is: 232943
-        // 203 * 89 = 18067
-
-        // let mut edges =
-        //     read_edges(&format!("{}/facebook/facebook_combined.txt", base_path)).unwrap();
-        // The length of n12 is: 2690019
-        // 1043 * 89 = 92827
-
-        // let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
-        // The length of n12 is: 2255867
-        // 893 * 89 = 79427
-
-        // edges.truncate(200);
+        let dataset = std::env::var("VPJOIN_DATASET").unwrap_or_else(|_| "lastfm".into());
+        let privacy = match std::env::var("VPJOIN_PRIVACY")
+            .as_deref()
+            .unwrap_or("legacy")
+        {
+            "rjs" => crate::bench_queries::Privacy::Rjs,
+            "dp" => crate::bench_queries::Privacy::Dp {
+                epsilon: std::env::var("VPJOIN_EPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.1),
+                delta: std::env::var("VPJOIN_DELTA")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1e-5),
+            },
+            _ => crate::bench_queries::Privacy::Legacy,
+        };
+        let edges = crate::bench_queries::load_graph(&dataset);
 
         let cnt = expected_cnt(&edges);
 
-        // ---------------------------------------------------------------
-        // PAPER-REPORTED PADDING CONSTANTS (VPJoin + DP, GQ3 on LastFM).
-        //
-        // Hand-chosen capacity behind the GQ3 "VPJoin + DP" numbers in the
-        // paper; NOT an output of the DP mechanism in
-        // `dp/noise_generator.py` / `src/dp_noise.rs`. See
-        // `dp/legacy_capacities.md`.
-        //
-        //   18067 = 203 * 89, added to BOTH bags, on top of the true wedge
-        //   size (|n12| = 232,943 on LastFM -- see the comments above).
-        //
-        // The equivalents for the other datasets, recorded from the same
-        // calibration, are facebook 92,827 = 1043*89 and wiki 79,427 = 893*89;
-        // the benchmark harness holds all three in
-        // `bench_queries::gq3_pad_extra` (VPJOIN_PRIVACY=legacy). Setting both
-        // knobs to 0 gives the "Revealing Join Size" baseline (=rjs);
-        // VPJOIN_PRIVACY=dp instead releases capacities from the corrected
-        // mechanism. Keep this test and that function in agreement.
-        // ---------------------------------------------------------------
+        let (bag1_pad_extra, bag2_pad_extra) =
+            crate::bench_queries::graph_pads("gq3", &dataset, &edges, privacy);
+        println!(
+            "[gq3 test] dataset={} privacy={} pads: bag1={} bag2={}",
+            dataset,
+            privacy.label(),
+            bag1_pad_extra,
+            bag2_pad_extra
+        );
+
         let circuit = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra: 18067,
-            bag2_pad_extra: 18067,
+            bag1_pad_extra,
+            bag2_pad_extra,
             _marker: PhantomData,
         };
         let public_input = vec![Fp::from(cnt)];
-        let k = 22;
+        let k = crate::bench_queries::degree_for("gq3", &dataset, privacy);
 
         // let test = true;
         let test = false;

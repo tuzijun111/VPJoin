@@ -59,9 +59,28 @@ pub struct LtChip<F: Field + Ord, const N_BYTES: usize> {
 }
 
 impl<F: Field + Ord, const N_BYTES: usize> LtChip<F, N_BYTES> {
-    /// Configures the Lt chip.
+    /// Configures the Lt chip, allocating a private u8 range column for it.
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
+        q_enable: impl FnOnce(&mut VirtualCells<'_, F>) -> Expression<F>,
+        lhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
+        rhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
+    ) -> LtConfig<F, N_BYTES> {
+        let u8 = meta.fixed_column();
+        Self::configure_with_u8(meta, u8, q_enable, lhs, rhs)
+    }
+
+    /// Same as [`LtChip::configure`], but reuses a caller-supplied u8 range
+    /// column instead of allocating a fresh one.
+    ///
+    /// `load` writes the 256 table rows through a region of its own, so a
+    /// circuit that replicates an Lt chip many times (one per lane, say) pays
+    /// one extra 256-row region per distinct u8 column. Sharing a single
+    /// column keeps that cost constant in the replication factor. It does not
+    /// reduce the number of lookup arguments: those are per diff byte column.
+    pub fn configure_with_u8(
+        meta: &mut ConstraintSystem<F>,
+        u8: Column<Fixed>,
         q_enable: impl FnOnce(&mut VirtualCells<'_, F>) -> Expression<F>,
         lhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
         rhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
@@ -69,7 +88,6 @@ impl<F: Field + Ord, const N_BYTES: usize> LtChip<F, N_BYTES> {
         let lt = meta.advice_column();
         let diff = [(); N_BYTES].map(|_| meta.advice_column());
         let range = pow_of_two(N_BYTES * 8);
-        let u8 = meta.fixed_column();
 
         meta.create_gate("lt gate", |meta| {
             let q_enable = q_enable(meta);

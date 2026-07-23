@@ -3,6 +3,7 @@ pub mod chips;
 pub mod circuits;
 pub mod column_commit; // additive per-column commitments in the circuits' own domain (Appendix A)
 pub mod commitment; // legacy monolithic single-vector layer (Appendix A, first version)
+pub mod dp_lane; // plan/measurement records shared by the three DP lane circuits and dp_lane_bench
 pub mod dp_noise; // additive DP capacity generation (Appendix G.2); Rust twin of dp/noise_generator.py
 pub mod input_binding; // additive in-circuit input binding to the published commitments (Appendix A)
 // pub mod gadgets;

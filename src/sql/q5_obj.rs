@@ -32,15 +32,17 @@ use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
-const NUM_BYTES: usize = 7;
-const MAX_SENTINEL: u64 = (1u64 << (8 * NUM_BYTES)) - 1;
-const PAD_U64: u64 = MAX_SENTINEL;
+// pub(crate) so the multi-lane DP variant (`q5_obj_dp.rs`) shares one
+// definition of the PAD/sentinel discipline instead of copying it.
+pub(crate) const NUM_BYTES: usize = 7;
+pub(crate) const MAX_SENTINEL: u64 = (1u64 << (8 * NUM_BYTES)) - 1;
+pub(crate) const PAD_U64: u64 = MAX_SENTINEL;
 
-const SCALE: u64 = 1000;
-const PAD_REV: u64 = 0;
+pub(crate) const SCALE: u64 = 1000;
+pub(crate) const PAD_REV: u64 = 0;
 
 // pack (orderkey, nationkey_shift)
-const SHIFT_NATION: u64 = 1u64 << 8; // nationkey_shift <= 25+1 fits
+pub(crate) const SHIFT_NATION: u64 = 1u64 << 8; // nationkey_shift <= 25+1 fits
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -162,7 +164,8 @@ impl<F: Field + Ord> Q5Chip<F> {
         Self { config }
     }
 
-    fn assign_table_u64(
+    // pub(crate): reused by the multi-lane DP variant (`q5_obj_dp.rs`).
+    pub(crate) fn assign_table_u64(
         region: &mut Region<'_, F>,
         tag: &'static str,
         cols: &[Column<Advice>],
@@ -180,7 +183,7 @@ impl<F: Field + Ord> Q5Chip<F> {
         Ok(out)
     }
 
-    fn assign_table_f(
+    pub(crate) fn assign_table_f(
         region: &mut Region<'_, F>,
         tag: &'static str,
         cols: &[Column<Advice>],
@@ -194,7 +197,7 @@ impl<F: Field + Ord> Q5Chip<F> {
         Ok(())
     }
 
-    fn assign_part_pad_and_link(
+    pub(crate) fn assign_part_pad_and_link(
         region: &mut Region<'_, F>,
         tag: &'static str,
         part_cols: &[Column<Advice>],
@@ -1004,8 +1007,17 @@ impl<F: Field + Ord> Q5Chip<F> {
             nr_out_pad_u64,
             co_out_pad_u64,
         } = q5_derive(
-            &customer, &orders, &lineitem, &supplier, &nation, &region_file,
-            europe_hash, start_ts, end_ts, nr_pad_extra, co_pad_extra,
+            &customer,
+            &orders,
+            &lineitem,
+            &supplier,
+            &nation,
+            &region_file,
+            europe_hash,
+            start_ts,
+            end_ts,
+            nr_pad_extra,
+            co_pad_extra,
         );
 
         // key vectors for membership+gap
@@ -1773,7 +1785,7 @@ pub struct Q5Derived {
     pub nr_keep_b: Vec<bool>,
     pub nr_pair_u64: Vec<Vec<u64>>,
     pub nr_filtered: Vec<Vec<u64>>,
-    pub nk_to_name: HashMap<u64,u64>,
+    pub nk_to_name: HashMap<u64, u64>,
     pub co_nk_u64: Vec<u64>,
     pub co_ge_b: Vec<bool>,
     pub co_lt_b: Vec<bool>,
@@ -1830,131 +1842,131 @@ pub fn q5_derive(
         out
     }
 
-// ---------- build shifted maps ----------
-// shift nationkey+1, regionkey+1 to keep 0 as sentinel
-let mut cust_to_nk: HashMap<u64, u64> = HashMap::new();
-for r in customer.iter() {
-    cust_to_nk.insert(r[0], r[1] + 1);
-}
-let mut supp_to_nk: HashMap<u64, u64> = HashMap::new();
-for r in supplier.iter() {
-    supp_to_nk.insert(r[0], r[1] + 1);
-}
-let mut reg_to_name: HashMap<u64, u64> = HashMap::new();
-for r in region_file.iter() {
-    reg_to_name.insert(r[0] + 1, r[1]); // regionkey_shift
-}
-
-// ---------- NR derivation (nation ⋈ region, filter EUROPE) ----------
-let mut nr_rname_u64 = vec![0u64; nation.len()];
-let mut nr_keep_b = vec![false; nation.len()];
-let mut nr_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; nation.len()];
-
-for i in 0..nation.len() {
-    let nk_shift = nation[i][0] + 1;
-    let nm_hash = nation[i][1];
-    let rk_shift = nation[i][2] + 1;
-    let rname = *reg_to_name.get(&rk_shift).unwrap_or(&0);
-    nr_rname_u64[i] = rname;
-    nr_keep_b[i] = rname == europe_hash;
-    nr_pair_u64[i] = vec![nk_shift, nm_hash];
-}
-let nr_filtered: Vec<Vec<u64>> = nr_pair_u64
-    .iter()
-    .cloned()
-    .zip(nr_keep_b.iter())
-    .filter(|(_, &k)| k)
-    .map(|(r, _)| r)
-    .collect();
-
-let pad2 = vec![PAD_U64; 2];
-let nr_filt_pad_u64 = pad_filter_u64(&nr_pair_u64, &nr_keep_b, &pad2);
-
-// NEW: allow NR to be padded beyond nation.len()
-let nr_total = nation.len().saturating_add(nr_pad_extra).max(1);
-let mut nr_filt_pad_u64_ext = nr_filt_pad_u64.clone();
-while nr_filt_pad_u64_ext.len() < nr_total {
-    nr_filt_pad_u64_ext.push(pad2.clone());
-}
-let nr_out_pad_u64 = pad_out_u64(&nr_filtered, nr_total, &pad2);
-
-// map nk_shift -> name_hash for filtered NR
-let mut nk_to_name: HashMap<u64, u64> = HashMap::new();
-for r in nr_filtered.iter() {
-    nk_to_name.insert(r[0], r[1]);
-}
-
-// ---------- CO derivation (orders ⋈ customer, filter by date range) ----------
-let mut co_nk_u64 = vec![0u64; orders.len()];
-let mut co_ge_b = vec![false; orders.len()];
-let mut co_lt_b = vec![false; orders.len()];
-let mut co_keep_b = vec![false; orders.len()];
-let mut co_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; orders.len()];
-
-for i in 0..orders.len() {
-    let odate = orders[i][0];
-    let cust = orders[i][1];
-    let okey = orders[i][2];
-
-    let nk_shift = *cust_to_nk.get(&cust).unwrap_or(&0);
-    co_nk_u64[i] = nk_shift;
-
-    co_ge_b[i] = start_ts <= odate;
-    co_lt_b[i] = odate < end_ts;
-    co_keep_b[i] = co_ge_b[i] && co_lt_b[i];
-
-    co_pair_u64[i] = vec![okey, nk_shift];
-}
-
-let co_filtered: Vec<Vec<u64>> = co_pair_u64
-    .iter()
-    .cloned()
-    .zip(co_keep_b.iter())
-    .filter(|(_, &k)| k)
-    .map(|(r, _)| r)
-    .collect();
-
-let co_filt_pad_u64 = pad_filter_u64(&co_pair_u64, &co_keep_b, &pad2);
-
-// NEW: allow CO to be padded beyond orders.len()
-let co_total = orders.len().saturating_add(co_pad_extra).max(1);
-let mut co_filt_pad_u64_ext = co_filt_pad_u64.clone();
-while co_filt_pad_u64_ext.len() < co_total {
-    co_filt_pad_u64_ext.push(pad2.clone());
-}
-let co_out_pad_u64 = pad_out_u64(&co_filtered, co_total, &pad2);
-
-// build key sets for join
-let co_set: HashSet<u64> = co_filtered
-    .iter()
-    .map(|r| r[0] * SHIFT_NATION + r[1])
-    .collect();
-
-let nr_set: HashSet<u64> = nr_filtered.iter().map(|r| r[0]).collect();
-
-// ---------- LS materialization (lineitem ⋈ supplier) ----------
-let mut ls_mat_u64: Vec<Vec<u64>> = vec![vec![0, 0, 0, 0]; lineitem.len()];
-for i in 0..lineitem.len() {
-    let okey = lineitem[i][0];
-    let supp = lineitem[i][1];
-    let ext = lineitem[i][2];
-    let disc = lineitem[i][3];
-    let nk_shift = *supp_to_nk.get(&supp).unwrap_or(&0);
-    ls_mat_u64[i] = vec![okey, nk_shift, ext, disc];
-}
-
-// ---------- partition LS into join/disjoin (relative to CO and NR) ----------
-let mut ls_join_u64 = vec![];
-let mut ls_dis_u64 = vec![];
-for r in ls_mat_u64.iter() {
-    let packed = r[0] * SHIFT_NATION + r[1];
-    let ok = co_set.contains(&packed) && nr_set.contains(&r[1]);
-    if ok {
-        ls_join_u64.push(r.clone());
-    } else {
-        ls_dis_u64.push(r.clone());
+    // ---------- build shifted maps ----------
+    // shift nationkey+1, regionkey+1 to keep 0 as sentinel
+    let mut cust_to_nk: HashMap<u64, u64> = HashMap::new();
+    for r in customer.iter() {
+        cust_to_nk.insert(r[0], r[1] + 1);
     }
-}
+    let mut supp_to_nk: HashMap<u64, u64> = HashMap::new();
+    for r in supplier.iter() {
+        supp_to_nk.insert(r[0], r[1] + 1);
+    }
+    let mut reg_to_name: HashMap<u64, u64> = HashMap::new();
+    for r in region_file.iter() {
+        reg_to_name.insert(r[0] + 1, r[1]); // regionkey_shift
+    }
+
+    // ---------- NR derivation (nation ⋈ region, filter EUROPE) ----------
+    let mut nr_rname_u64 = vec![0u64; nation.len()];
+    let mut nr_keep_b = vec![false; nation.len()];
+    let mut nr_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; nation.len()];
+
+    for i in 0..nation.len() {
+        let nk_shift = nation[i][0] + 1;
+        let nm_hash = nation[i][1];
+        let rk_shift = nation[i][2] + 1;
+        let rname = *reg_to_name.get(&rk_shift).unwrap_or(&0);
+        nr_rname_u64[i] = rname;
+        nr_keep_b[i] = rname == europe_hash;
+        nr_pair_u64[i] = vec![nk_shift, nm_hash];
+    }
+    let nr_filtered: Vec<Vec<u64>> = nr_pair_u64
+        .iter()
+        .cloned()
+        .zip(nr_keep_b.iter())
+        .filter(|(_, &k)| k)
+        .map(|(r, _)| r)
+        .collect();
+
+    let pad2 = vec![PAD_U64; 2];
+    let nr_filt_pad_u64 = pad_filter_u64(&nr_pair_u64, &nr_keep_b, &pad2);
+
+    // NEW: allow NR to be padded beyond nation.len()
+    let nr_total = nation.len().saturating_add(nr_pad_extra).max(1);
+    let mut nr_filt_pad_u64_ext = nr_filt_pad_u64.clone();
+    while nr_filt_pad_u64_ext.len() < nr_total {
+        nr_filt_pad_u64_ext.push(pad2.clone());
+    }
+    let nr_out_pad_u64 = pad_out_u64(&nr_filtered, nr_total, &pad2);
+
+    // map nk_shift -> name_hash for filtered NR
+    let mut nk_to_name: HashMap<u64, u64> = HashMap::new();
+    for r in nr_filtered.iter() {
+        nk_to_name.insert(r[0], r[1]);
+    }
+
+    // ---------- CO derivation (orders ⋈ customer, filter by date range) ----------
+    let mut co_nk_u64 = vec![0u64; orders.len()];
+    let mut co_ge_b = vec![false; orders.len()];
+    let mut co_lt_b = vec![false; orders.len()];
+    let mut co_keep_b = vec![false; orders.len()];
+    let mut co_pair_u64: Vec<Vec<u64>> = vec![vec![0, 0]; orders.len()];
+
+    for i in 0..orders.len() {
+        let odate = orders[i][0];
+        let cust = orders[i][1];
+        let okey = orders[i][2];
+
+        let nk_shift = *cust_to_nk.get(&cust).unwrap_or(&0);
+        co_nk_u64[i] = nk_shift;
+
+        co_ge_b[i] = start_ts <= odate;
+        co_lt_b[i] = odate < end_ts;
+        co_keep_b[i] = co_ge_b[i] && co_lt_b[i];
+
+        co_pair_u64[i] = vec![okey, nk_shift];
+    }
+
+    let co_filtered: Vec<Vec<u64>> = co_pair_u64
+        .iter()
+        .cloned()
+        .zip(co_keep_b.iter())
+        .filter(|(_, &k)| k)
+        .map(|(r, _)| r)
+        .collect();
+
+    let co_filt_pad_u64 = pad_filter_u64(&co_pair_u64, &co_keep_b, &pad2);
+
+    // NEW: allow CO to be padded beyond orders.len()
+    let co_total = orders.len().saturating_add(co_pad_extra).max(1);
+    let mut co_filt_pad_u64_ext = co_filt_pad_u64.clone();
+    while co_filt_pad_u64_ext.len() < co_total {
+        co_filt_pad_u64_ext.push(pad2.clone());
+    }
+    let co_out_pad_u64 = pad_out_u64(&co_filtered, co_total, &pad2);
+
+    // build key sets for join
+    let co_set: HashSet<u64> = co_filtered
+        .iter()
+        .map(|r| r[0] * SHIFT_NATION + r[1])
+        .collect();
+
+    let nr_set: HashSet<u64> = nr_filtered.iter().map(|r| r[0]).collect();
+
+    // ---------- LS materialization (lineitem ⋈ supplier) ----------
+    let mut ls_mat_u64: Vec<Vec<u64>> = vec![vec![0, 0, 0, 0]; lineitem.len()];
+    for i in 0..lineitem.len() {
+        let okey = lineitem[i][0];
+        let supp = lineitem[i][1];
+        let ext = lineitem[i][2];
+        let disc = lineitem[i][3];
+        let nk_shift = *supp_to_nk.get(&supp).unwrap_or(&0);
+        ls_mat_u64[i] = vec![okey, nk_shift, ext, disc];
+    }
+
+    // ---------- partition LS into join/disjoin (relative to CO and NR) ----------
+    let mut ls_join_u64 = vec![];
+    let mut ls_dis_u64 = vec![];
+    for r in ls_mat_u64.iter() {
+        let packed = r[0] * SHIFT_NATION + r[1];
+        let ok = co_set.contains(&packed) && nr_set.contains(&r[1]);
+        if ok {
+            ls_join_u64.push(r.clone());
+        } else {
+            ls_dis_u64.push(r.clone());
+        }
+    }
 
     Q5Derived {
         nr_rname_u64,
@@ -2242,27 +2254,31 @@ mod tests {
         let start_ts = date_to_timestamp("1997-01-01");
         let end_ts = date_to_timestamp("1998-01-01"); // strict < end
 
-        // ---------------------------------------------------------------
-        // PAPER-REPORTED PADDING CONSTANTS (VPJoin + DP, Q5).
-        //
-        // These are the hand-chosen capacities behind the Q5 "VPJoin + DP"
-        // numbers reported in the paper (Fig. "Impact of privacy constraints"
-        // and the epsilon sweep). They are NOT outputs of the DP mechanism in
-        // `dp/noise_generator.py` / `src/dp_noise.rs`; they predate it. See
-        // `dp/legacy_capacities.md`.
-        //
-        //   nr_pad_extra = 0            NR permutation, |nation| = 25, unpadded
-        //   co_pad_extra = 32  * 89     CO bag, on top of |orders|
-        //   ls_pad_extra = 668 * 89     LS bag, on top of the filtered join
-        //
-        // Setting all three to 0 gives the paper's "Revealing Join Size"
-        // baseline. The benchmark harness selects between the two via
-        // `bench_queries::q5_pads` (VPJOIN_PRIVACY=legacy | rjs); keep this
-        // test and that function in agreement.
-        // ---------------------------------------------------------------
-        let nr_pad_extra = 0usize;
-        let co_pad_extra = (32 * 89) as usize;
-        let ls_pad_extra = (668 * 89) as usize;
+        let privacy = match std::env::var("VPJOIN_PRIVACY")
+            .as_deref()
+            .unwrap_or("legacy")
+        {
+            "rjs" => crate::bench_queries::Privacy::Rjs,
+            "dp" => crate::bench_queries::Privacy::Dp {
+                epsilon: std::env::var("VPJOIN_EPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.1),
+                delta: std::env::var("VPJOIN_DELTA")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1e-5),
+            },
+            _ => crate::bench_queries::Privacy::Legacy,
+        };
+        let (nr_pad_extra, co_pad_extra, ls_pad_extra) = crate::bench_queries::q5_pads(privacy);
+        println!(
+            "[q5 test] privacy={} pads: nr={} co={} ls={}",
+            privacy.label(),
+            nr_pad_extra,
+            co_pad_extra,
+            ls_pad_extra
+        );
 
         let circuit = MyCircuit::<Fp> {
             customer,
@@ -2282,7 +2298,7 @@ mod tests {
 
         let public_input: Vec<Fp> = vec![Fp::from(1u64)];
 
-        let k = 16;
+        let k = crate::bench_queries::degree_for("q5", "tpch-60K", privacy);
 
         // let test = true;
         let test = false;

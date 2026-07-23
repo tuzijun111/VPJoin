@@ -22,18 +22,28 @@
 //! time is spent on a `k` that is then discarded.
 //!
 //! Usage:
-//!   cargo run --release --bin vpjoin_bench -- <baseline|full|commit> <out.csv> [query ...]
+//!   cargo run --release --bin vpjoin_bench -- <baseline|full|commit> [query ...]
+//!   cargo run --release --bin vpjoin_bench -- <baseline|full|commit> [out.csv] [query ...]
+//!
+//!   Every result is printed to stdout, and the run ends with an aligned
+//!   summary table of all completed rows, so the terminal output alone is a
+//!   complete result.  An argument ending in `.csv` is taken as an output file
+//!   and additionally writes the same rows there; with no such argument no
+//!   file is written at all.
 //!
 //!   queries:  q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4     (default: all)
 //!   env:      VPJOIN_DATA   root holding data/ graph_data/ proof/
 //!                           (default: <crate>/src)
 //!             VPJOIN_RESUME =1 to keep the rows already in <out.csv> and only
 //!                           run the ones that are missing or previously
-//!                           FAILED, appending results in place.
+//!                           FAILED, appending results in place.  Requires an
+//!                           <out.csv> argument; ignored without one.
 //!             VPJOIN_PRIVACY  how the queries that MATERIALIZE intermediates
 //!                           (Q5, GQ3, GQ4) size their bags:
 //!                             dp (default) | rjs | legacy
-//!                           Q5 supports rjs and legacy only (see q5_pads).
+//!                           Q5 supports all three; under dp BOTH bags get a
+//!                           release and k grows with the capacities (k=20
+//!                           at eps=0.1, k=16 at eps>=1; see q5_pads).
 //!                           The other queries materialize nothing and ignore it.
 //!             VPJOIN_EPS / VPJOIN_DELTA   total DP budget (default 0.1 / 1e-5)
 //!             VPJOIN_DP_SEED  fixes the capacity-release randomness so a
@@ -74,14 +84,101 @@ fn load_completed(path: &str) -> HashMap<String, String> {
     done
 }
 
+fn usage() -> String {
+    format!(
+        "usage: vpjoin_bench <baseline|full|commit> [out.csv] [query ...]\n  \
+         queries: {}\n  \
+         results are always printed to stdout; an argument ending in .csv also\n  \
+         writes them to that file (and enables VPJOIN_RESUME=1).",
+        ALL_QUERIES.join(" ")
+    )
+}
+
+/// Aligned stdout table of every completed row, built from the same CSV fields
+/// the file carries so the terminal output is self-sufficient.
+fn print_summary(jobs: &[(String, String)], results: &HashMap<String, String>, mode: Mode) {
+    let names: Vec<&str> = Row::header().split(',').collect();
+    // query,dataset,k + the timing columns + status.  The commitment-layer
+    // timings are all zero in baseline mode, so they are only shown when the
+    // mode actually measures them.  Columns are selected BY NAME and resolved
+    // against `Row::header()`, so reordering or inserting a CSV field can
+    // never silently shift the table.
+    const HEAD: &[&str] = &[
+        "query", "dataset", "k", "load_s", "vk_s", "pk_s", "keygen_s", "prove_s", "verify_s",
+        "proof_bytes",
+    ];
+    const COMMIT: &[&str] = &[
+        "bind_prove_s",
+        "open_prove_s",
+        "total_prove_s",
+        "total_proof_bytes",
+    ];
+    const TAIL: &[&str] = &["wall_s", "config", "status"];
+
+    let mut wanted: Vec<&str> = HEAD.to_vec();
+    if mode != Mode::Baseline {
+        wanted.extend_from_slice(COMMIT);
+    }
+    wanted.extend_from_slice(TAIL);
+    let cols: Vec<usize> = wanted
+        .iter()
+        .map(|w| {
+            names
+                .iter()
+                .position(|n| n == w)
+                .unwrap_or_else(|| panic!("`{}` is not a column of Row::header()", w))
+        })
+        .collect();
+
+    let mut table: Vec<Vec<String>> = vec![cols.iter().map(|&c| names[c].to_string()).collect()];
+    for (q, d) in jobs {
+        let Some(line) = results.get(&format!("{}/{}", q, d)) else {
+            continue;
+        };
+        let f: Vec<&str> = line.split(',').collect();
+        table.push(
+            cols.iter()
+                .map(|&c| f.get(c).copied().unwrap_or("").to_string())
+                .collect(),
+        );
+    }
+    if table.len() < 2 {
+        return;
+    }
+
+    let widths: Vec<usize> = (0..cols.len())
+        .map(|i| table.iter().map(|r| r[i].len()).max().unwrap_or(0))
+        .collect();
+    println!("\nsummary ({} row(s), all timings in seconds):", table.len() - 1);
+    for (r, row) in table.iter().enumerate() {
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                // identity and text columns left, numbers right
+                if i < 2 || i + 2 >= cols.len() {
+                    format!("{:<w$}", cell, w = widths[i])
+                } else {
+                    format!("{:>w$}", cell, w = widths[i])
+                }
+            })
+            .collect();
+        println!("{}", cells.join("  ").trim_end());
+        if r == 0 {
+            let rule: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+            println!("{}", rule.join("  "));
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() < 2 {
-        eprintln!(
-            "usage: vpjoin_bench <baseline|full|commit> <out.csv> [query ...]\n\
-             queries: {}",
-            ALL_QUERIES.join(" ")
-        );
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", usage());
+        return;
+    }
+    if args.is_empty() {
+        eprintln!("{}", usage());
         std::process::exit(2);
     }
 
@@ -94,18 +191,30 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let out_path = args[1].clone();
-
-    let queries: Vec<String> = if args.len() > 2 {
-        args[2..].to_vec()
-    } else {
-        ALL_QUERIES.iter().map(|s| s.to_string()).collect()
-    };
-    for q in &queries {
-        if !ALL_QUERIES.contains(&q.as_str()) {
-            eprintln!("unknown query `{}` (expected one of {})", q, ALL_QUERIES.join(" "));
+    // The output file is optional and recognised by its `.csv` suffix; every
+    // other argument after the mode is a query name.
+    let mut out_path: Option<String> = None;
+    let mut queries: Vec<String> = Vec::new();
+    for a in &args[1..] {
+        if a.ends_with(".csv") {
+            if out_path.is_some() {
+                eprintln!("at most one <out.csv> argument (got `{}` twice over)", a);
+                std::process::exit(2);
+            }
+            out_path = Some(a.clone());
+        } else if ALL_QUERIES.contains(&a.as_str()) {
+            queries.push(a.clone());
+        } else {
+            eprintln!(
+                "unknown argument `{}` (expected a query {} or a path ending in .csv)",
+                a,
+                ALL_QUERIES.join(" ")
+            );
             std::process::exit(2);
         }
+    }
+    if queries.is_empty() {
+        queries = ALL_QUERIES.iter().map(|s| s.to_string()).collect();
     }
 
     // Privacy regime for the queries that materialize intermediates (Q5, GQ3,
@@ -130,11 +239,17 @@ fn main() {
         }
     };
 
-    let resume = std::env::var("VPJOIN_RESUME").map(|v| v == "1").unwrap_or(false);
-    let existing = if resume {
-        load_completed(&out_path)
-    } else {
-        HashMap::new()
+    let mut resume = std::env::var("VPJOIN_RESUME").map(|v| v == "1").unwrap_or(false);
+    if resume && out_path.is_none() {
+        println!(
+            "note: VPJOIN_RESUME=1 needs an <out.csv> argument to resume from; \
+             continuing without resume."
+        );
+        resume = false;
+    }
+    let existing = match (&out_path, resume) {
+        (Some(p), true) => load_completed(p),
+        _ => HashMap::new(),
     };
 
     let all_jobs = plan(&queries);
@@ -155,8 +270,8 @@ fn main() {
          IPA over Pasta) -- MockProver is NOT used anywhere in this harness"
     );
     println!(
-        "params: {}/proof/param{{k}} (every load is logged per row; proofs are written to \
-         {}/proof/bench/)",
+        "params: {}/proof/param{{k}} (every load is logged per row on stderr; proofs are \
+         written to {}/proof/bench/ as auditable artifacts, independently of any .csv)",
         data_root().display(),
         data_root().display()
     );
@@ -176,7 +291,7 @@ fn main() {
         println!(
             "resume: keeping {} completed row(s) from {}; running {} of {}",
             existing.len(),
-            out_path,
+            out_path.as_deref().unwrap_or(""),
             jobs.len(),
             all_jobs.len()
         );
@@ -217,27 +332,37 @@ fn main() {
         println!("\nVPJOIN_PLAN_ONLY=1 -- stopping before any proving.");
         return;
     }
+    // Every completed row, keyed "query/dataset", printed as a table at the end
+    // whether or not a CSV is being written.
+    let mut results: HashMap<String, String> = existing.clone();
+
     if jobs.is_empty() {
         println!("nothing to do -- every requested row is already present and ok.");
+        print_summary(&all_jobs, &results, mode);
         return;
-    }
-
-    if let Some(dir) = std::path::Path::new(&out_path).parent() {
-        if !dir.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(dir);
-        }
     }
 
     // Rewrite the file with the preserved rows first, then append as we go, so
     // an interrupted resume never loses earlier measurements.
-    let mut f = std::fs::File::create(&out_path).expect("cannot create output csv");
-    writeln!(f, "{}", Row::header()).unwrap();
-    let mut kept: Vec<_> = existing.values().collect();
-    kept.sort();
-    for line in kept {
-        writeln!(f, "{}", line).unwrap();
-    }
-    f.flush().unwrap();
+    let mut out: Option<std::fs::File> = match &out_path {
+        Some(p) => {
+            if let Some(dir) = std::path::Path::new(p).parent() {
+                if !dir.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+            }
+            let mut f = std::fs::File::create(p).expect("cannot create output csv");
+            writeln!(f, "{}", Row::header()).unwrap();
+            let mut kept: Vec<_> = existing.values().collect();
+            kept.sort();
+            for line in kept {
+                writeln!(f, "{}", line).unwrap();
+            }
+            f.flush().unwrap();
+            Some(f)
+        }
+        None => None,
+    };
 
     let total = jobs.len();
     let mut failed: Vec<String> = Vec::new();
@@ -268,15 +393,27 @@ fn main() {
                 String::new()
             }
         );
-        writeln!(f, "{}", row.to_csv()).unwrap();
-        f.flush().unwrap();
+        let csv = row.to_csv();
+        if let Some(f) = out.as_mut() {
+            writeln!(f, "{}", csv).unwrap();
+            f.flush().unwrap();
+        }
+        results.insert(format!("{}/{}", q, d), csv);
     }
 
-    println!("\nwrote {}", out_path);
+    print_summary(&all_jobs, &results, mode);
+
+    if let Some(p) = &out_path {
+        println!("\nwrote {}", p);
+    }
     if failed.is_empty() {
         println!("all {} row(s) ok", total);
     } else {
-        eprintln!("{}/{} rows FAILED (measured rows are still in the CSV):", failed.len(), total);
+        eprintln!(
+            "{}/{} rows FAILED (the measured rows are still in the summary above):",
+            failed.len(),
+            total
+        );
         for x in &failed {
             eprintln!("  {}", x);
         }
