@@ -1,12 +1,4 @@
-//! **Bound GQ2** = baseline GQ2 (see [`super::g_sql2_obj`], file
-//! `g_sql2_obj.rs`) plus the inlined witness-binding check of Appendix A.
-//!
-//! See `src/sql/q3_bound.rs` for the map of the full pipeline. Like GQ1, this
-//! circuit's baseline `configure` adds lookup arguments beyond its chip's
-//! (2 of them), so this file calls
-//! [`g_sql2_obj::configure_path4order_full`] -- the same function the baseline
-//! circuit calls -- rather than the chip's configure alone. Enforced by
-//! `inline_bind::tests::bound_circuits_are_supersets_of_their_base`.
+
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},

@@ -1,28 +1,3 @@
-//! **Bound Q3** = baseline Q3 (see [`super::q3_obj`], file `q3_obj.rs`) plus
-//! the inlined witness-binding check of Appendix A.
-//!
-//! The full pipeline and where each piece lives:
-//!
-//!   1. data commitment       -> `crate::column_commit::commit_column_vectors`
-//!                               (one hiding Pedersen commitment per input
-//!                               column; outside the circuit, published once)
-//!   2. proof binding         -> `crate::column_commit::binding_challenge`
-//!                               (Fiat-Shamir challenge `x` over the
-//!                               commitments AND the query proof; outside)
-//!   3. witness check         -> `crate::inline_bind::{configure_bind,
-//!                               assign_bind}`: Horner-evaluates each witness
-//!                               input column at `x` INSIDE this circuit and
-//!                               exposes the evaluations publicly
-//!   4. column openings       -> `crate::column_commit::open_column_vectors`
-//!                               (IPA openings the verifier checks against
-//!                               the circuit's exposed evaluations; outside)
-//!
-//! This file must differ from the baseline circuit ONLY by the binding
-//! columns/gates and the second instance column `[x, v_0..v_{NC-1}]`.
-//! The guard test
-//! `inline_bind::tests::bound_circuits_are_supersets_of_their_base`
-//! enforces that structurally.
-
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},
     plonk::{Circuit, ConstraintSystem, Error},

@@ -1,14 +1,4 @@
-//! **Bound GQ3** = baseline GQ3 (see [`super::g_sql3_obj`], file
-//! `g_sql3_obj.rs`) plus the inlined witness-binding check of Appendix A.
-//!
-//! See `src/sql/q3_bound.rs` for the map of the full pipeline. GQ3's baseline
-//! `configure` IS a thin chip call (unlike GQ1/GQ2), so the chip's configure
-//! is the correct thing to reuse here. Enforced by
-//! `inline_bind::tests::bound_circuits_are_supersets_of_their_base`.
-//!
-//! The pad knobs size the materialized bags exactly as in the baseline (see
-//! `bench_queries::graph_pads` for the DP / RJS / legacy regimes); the bound
-//! circuit must be built with the SAME pads as the baseline it is compared to.
+
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},

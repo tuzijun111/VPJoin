@@ -1,33 +1,4 @@
-//! Triangle / 3-cycle COUNT(*) with ordering (A<B<C) over a single Edge table.
-//!
-//! SQL:
-//!   SELECT COUNT(*) AS cnt
-//!   FROM Edge r1
-//!   JOIN Edge r2 ON r1.dst = r2.src
-//!   JOIN Edge r3 ON r2.dst = r3.src AND r3.dst = r1.src
-//!   WHERE r1.src < r2.src AND r2.src < r3.src;
-//!
-//! Variables:
-//!   A = r1.src = r3.dst
-//!   B = r1.dst = r2.src
-//!   C = r2.dst = r3.src
-//!
-//! Acyclic decomposition (Path + Closer):
-//!   Bag1 {r1,r2}: materialize wedges A->B->C
-//!   Bag2 {r3}: edges C->A
-//!   Separator: (A,C)
-//!
-//! Message from Bag2 -> Bag1:
-//!   msg_key = pack2(A,C)
-//!   msg_val = COUNT(edges C->A) grouped by msg_key
-//!
-//! Final:
-//!   answer = Σ_{row in Bag1} msg_val(pack2(A,C)) * [A<B] * [B<C]
-//!
-//! Requires your existing chips:
-//!   crate::chips::is_zero::{IsZeroChip, IsZeroConfig}
-//!   crate::chips::less_than::{LtChip, LtConfig, LtInstruction}
-//!   crate::chips::permutation_any::{PermAnyChip, PermAnyConfig}
+
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};

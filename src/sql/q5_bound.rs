@@ -1,13 +1,3 @@
-//! **Bound Q5** = baseline Q5 (see [`super::q5_obj`], file `q5_obj.rs`) plus
-//! the inlined witness-binding check of Appendix A.
-//!
-//! See `q3_bound.rs` for the map of the full pipeline (commitment, challenge,
-//! in-circuit check, openings) and which module implements each piece.
-//! This file must differ from the baseline circuit ONLY by the binding
-//! columns/gates and the second instance column; the guard test
-//! `inline_bind::tests::bound_circuits_are_supersets_of_their_base` enforces
-//! that structurally.
-
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},
     plonk::{Circuit, ConstraintSystem, Error},

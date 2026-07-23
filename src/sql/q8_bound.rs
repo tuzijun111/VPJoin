@@ -1,9 +1,4 @@
-//! **Bound Q8** = baseline Q8 (see [`super::q8_obj`], file `q8_obj.rs`) plus
-//! the inlined witness-binding check of Appendix A.
-//!
-//! See `q3_bound.rs` for the map of the full pipeline; this file must differ
-//! from the baseline ONLY by the binding columns/gates (guard test:
-//! `inline_bind::tests::bound_circuits_are_supersets_of_their_base`).
+
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},

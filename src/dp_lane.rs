@@ -1,16 +1,4 @@
-//! Plan and measurement records shared by the three DP lane circuits
-//! (`sql::q5_obj_dp`, `graph_sql::g_sql3_obj_dp`, `graph_sql::g_sql4_obj_dp`).
-//!
-//! Each of those modules exposes
-//!
-//!   `plan_dp_lanes(..)  -> DpLanePlan`   -- pure sizing, no keygen, no proving
-//!   `run_dp_lanes(..)   -> DpLaneRun`    -- keygen once, then `reps` proofs
-//!
-//! and BOTH the module's own `#[ignore]`d `test_dp_lanes` and
-//! `src/bin/dp_lane_bench.rs` go through them, so the geometry that is proved
-//! is computed in exactly one place.
-//!
-//! Nothing here writes to disk; the binary prints, the tests print.
+
 
 /// Circuit geometry the released capacities imply, before anything is proved.
 #[derive(Clone, Debug)]

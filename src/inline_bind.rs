@@ -1,24 +1,3 @@
-//! The witness-equality check **inlined into the query circuit**, as
-//! Appendix A describes it.
-//!
-//! `column_commit::BoundColumnsCircuit` proves the same statement as a
-//! *separate* circuit, which measures the accumulation work but charges it to
-//! its own (small) domain.  Here the check instead lives in the query
-//! circuit's own region system: the same `ConstraintSystem` gains the binding
-//! advice columns and gates alongside every gate the query already has, and a
-//! single proof establishes both the query result and that the witnessed input
-//! columns equal the published commitments.
-//!
-//! That makes the marginal cost measurable the honest way: prove the query
-//! circuit, prove the query circuit *plus* the inlined check, and subtract.
-//! Both run at the same degree over the same witness, so the difference is
-//! exactly what the binding costs inside the query.
-//!
-//! The check itself is the Horner accumulation from `column_commit`:
-//! `f_j(x) = sum_i col_j[i] * x^i` is evaluated in-circuit and exposed on a
-//! second instance column, to be matched against the IPA openings of the
-//! published per-column commitments.
-
 use halo2_proofs::{
     circuit::{Layouter, Value},
     plonk::{Advice, Column, ConstraintSystem, Error, Expression, Instance, Selector},

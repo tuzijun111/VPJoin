@@ -1,10 +1,3 @@
-//! **Bound GQ4** = baseline GQ4 (see [`super::g_sql4_obj`], file
-//! `g_sql4_obj.rs`) plus the inlined witness-binding check of Appendix A.
-//!
-//! See `src/sql/q3_bound.rs` for the map of the full pipeline, and
-//! `g_sql3_bound.rs` for the pad-knob note (GQ4's baseline `configure` is
-//! likewise a thin chip call). Enforced by
-//! `inline_bind::tests::bound_circuits_are_supersets_of_their_base`.
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner},

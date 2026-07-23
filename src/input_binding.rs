@@ -1,32 +1,3 @@
-//! In-circuit input binding to the published database commitment (Appendix A).
-//!
-//! Complements `src/commitment.rs` (the protocol-level, across-proof binding):
-//! this module supplies the missing *in-circuit* consistency step -- proving,
-//! inside a circuit, that the input columns a query consumes are exactly the
-//! committed database tables.  It is additive: no existing query circuit is
-//! modified; the binding is realized as a standalone circuit whose cost is
-//! measured separately and added to a query's cost (composing the same
-//! columns into a query circuit enforces identical constraints at the same
-//! per-cell price).
-//!
-//! Construction. The committed table is placed in *fixed* columns.  Halo2's
-//! key generation commits every fixed column with `Blind::default()`, so the
-//! per-column IPA commitments inside the verifying key are deterministic
-//! functions of the data; the prover publishes exactly these points at setup
-//! (recomputed standalone via [`column_commitments`]) and any verifier checks
-//! that the published points equal the VK's fixed commitments.  The circuit
-//! then constrains, row by row, `advice[j] = fixed[j]` under a selector: the
-//! advice columns -- the form in which query circuits consume inputs -- are
-//! thereby bound to the committed data.  A cheating prover feeding different
-//! inputs must either break the equality gate or present a different VK,
-//! which no longer matches the published commitments.
-//!
-//! Relationship to `src/commitment.rs`: that module binds each *proof* to one
-//! published Pedersen commitment of the whole canonical vector; this module
-//! binds the *circuit inputs* to per-column commitments reproduced in the VK.
-//! Together they realize the full workflow of Appendix A; the two costs are
-//! reported separately by their respective benches.
-
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{

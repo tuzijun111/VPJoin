@@ -1,15 +1,3 @@
-//! Repository-relative path resolution.
-//!
-//! Source files must never contain absolute paths: they leak the author's
-//! local directory layout and break on every other checkout (the previously
-//! hard-coded prefix pointed at a sibling repository that does not exist in a
-//! fresh clone, so the tests panicked on `File::open(...).unwrap()`).
-//!
-//! Everything here resolves against the crate root, which Cargo provides at
-//! compile time, so no path literal appears in the source.  Set `VPJOIN_DATA`
-//! to relocate the data/params tree (it must contain `data/`, `graph_data/`
-//! and `proof/`).
-
 use std::path::PathBuf;
 
 /// Root holding `data/`, `graph_data/` and `proof/` (the crate's own `src/`
