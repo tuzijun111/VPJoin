@@ -32,16 +32,34 @@
 //! `reps=N` may appear anywhere in the argument list and overrides VPJOIN_REPS;
 //! the default is 3.
 //!
+//! SWEEPS. `VPJOIN_EPS` takes a comma-separated list, so one invocation covers
+//! a whole privacy budget curve:
+//!
+//!   VPJOIN_EPS=0.01,0.02,0.05,0.1 cargo run --bin dp_lane_bench -- gq3 gq4
+//!
+//! The epsilons are visited in the order given and the selected rows within
+//! each, so the table reads top to bottom as the sweep progresses. A row whose
+//! released capacity needs more lanes than the circuit can host, or whose
+//! sections do not fit the pinned degree, is reported as SKIPPED with the
+//! reason and the sweep continues; skipped rows do not change the exit status.
+//! Each dataset is parsed once and reused across epsilons. Keys are NOT reused:
+//! the lane count changes the circuit shape, so keygen belongs to the
+//! configuration. (Two configurations can land on the same shape; caching keys
+//! across them is left alone here.)
+//!
 //! Environment:
 //!   VPJOIN_PRIVACY  dp (default) | rjs | legacy -- the regime that sizes the
 //!                   materialized bags. `rjs` is the Revealing-Join-Size
 //!                   baseline (no pad, exact cardinality leaked) and `legacy`
 //!                   replays the hand-picked constants, so the same binary
 //!                   produces the comparison rows.
-//!   VPJOIN_EPS      total epsilon of the DP release (default 0.1)
+//!   VPJOIN_EPS      total epsilon of the DP release, or a comma-separated list
+//!                   of them to sweep (default 0.1)
 //!   VPJOIN_DELTA    delta of the DP release (default 1e-5)
 //!   VPJOIN_DP_SEED  seed of `bench_queries::dp_rng`, so a re-run reproduces
-//!                   the same released capacities (default 20260721)
+//!                   the same released capacities (default 20260721). The draw
+//!                   depends on the query, the dataset and this seed only, so a
+//!                   row of a sweep is identical to the same row run alone.
 //!   VPJOIN_REPS     repetitions, overridden by `reps=N`
 //!   VPJOIN_PLAN_ONLY=1  print the planned degree, lane counts, released
 //!                   capacities and pads, then exit BEFORE any keygen or
@@ -55,11 +73,30 @@ const ALL: &[&str] = &["q5", "gq3", "gq4"];
 /// Q5's dataset is fixed: the harness proves it over the full TPC-H tables.
 const TPCH: &str = "tpch-60K";
 
+/// One cell of the sweep: the privacy regime to size the bags with, plus the
+/// epsilon to label it by (`None` outside the dp regime, where no budget is
+/// spent and the column is a dash).
+#[derive(Clone, Copy)]
+struct Budget {
+    eps: Option<f64>,
+    privacy: Privacy,
+}
+
+impl Budget {
+    fn eps_str(&self) -> String {
+        match self.eps {
+            Some(e) => format!("{}", e),
+            None => "-".to_string(),
+        }
+    }
+}
+
 fn print_header() {
     println!(
-        "{:<6}{:<10}{:>4}{:>8}{:>16}{:>16}{:>11}{:>18}{:>10}",
+        "{:<6}{:<10}{:>7}{:>4}{:>8}{:>20}{:>20}{:>11}{:>18}{:>10}",
         "query",
         "dataset",
+        "eps",
         "k",
         "lanes",
         "capacity",
@@ -68,14 +105,13 @@ fn print_header() {
         "prove min..max",
         "verify(s)"
     );
-    // 6 + 10 + 4 + 8 + 16 + 16 + 11 + 18 + 10, the widths above.
-    println!("{}", "-".repeat(99));
+    // 6 + 10 + 7 + 4 + 8 + 20 + 20 + 11 + 18 + 10, the widths above.
+    println!("{}", "-".repeat(114));
 }
 
 /// Printed as each row completes, so a long run shows progress and an
 /// interrupted one still yields data. `run` is `None` in plan-only mode.
-fn print_row(plan: &DpLanePlan, run: Option<&DpLaneRun>) {
-    use std::io::Write;
+fn print_row(plan: &DpLanePlan, eps: &str, run: Option<&DpLaneRun>) {
     let (mean, span, verify) = match run {
         Some(r) => (
             format!("{:.2}", r.prove_mean()),
@@ -85,9 +121,10 @@ fn print_row(plan: &DpLanePlan, run: Option<&DpLaneRun>) {
         None => ("-".to_string(), "-".to_string(), "-".to_string()),
     };
     println!(
-        "{:<6}{:<10}{:>4}{:>8}{:>16}{:>16}{:>11}{:>18}{:>10}",
+        "{:<6}{:<10}{:>7}{:>4}{:>8}{:>20}{:>20}{:>11}{:>18}{:>10}",
         plan.query,
         plan.dataset,
+        eps,
         plan.k,
         plan.lanes_str(),
         plan.capacity_str(),
@@ -96,6 +133,21 @@ fn print_row(plan: &DpLanePlan, run: Option<&DpLaneRun>) {
         span,
         verify
     );
+    flush();
+}
+
+/// A configuration that cannot be built keeps its identifying columns, so the
+/// sweep's shape stays readable, and carries the reason inline.
+fn print_skip(query: &str, dataset: &str, eps: &str, reason: &str) {
+    println!(
+        "{:<6}{:<10}{:>7}{:>4}{:>8}{:>20}{:>20}  SKIPPED  {}",
+        query, dataset, eps, "-", "-", "-", "-", reason
+    );
+    flush();
+}
+
+fn flush() {
+    use std::io::Write;
     let _ = std::io::stdout().flush();
 }
 
@@ -107,7 +159,9 @@ fn usage() -> String {
          reps=N may appear anywhere and overrides VPJOIN_REPS (default 3).\n  \
          Results go to stdout, per-row progress to stderr, nothing to disk.\n  \
          VPJOIN_PLAN_ONLY=1 prints the geometry and exits before any keygen.\n  \
-         VPJOIN_PRIVACY=dp|rjs|legacy, VPJOIN_EPS, VPJOIN_DELTA, VPJOIN_DP_SEED.",
+         VPJOIN_PRIVACY=dp|rjs|legacy, VPJOIN_DELTA, VPJOIN_DP_SEED.\n  \
+         VPJOIN_EPS takes one budget or a comma-separated list to sweep,\n  \
+         e.g. VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10.",
         ALL.join(" "),
         GRAPH_DATASETS.join(" "),
         TPCH
@@ -115,11 +169,49 @@ fn usage() -> String {
 }
 
 /// Clean error on stderr and a non-zero exit, matching `vpjoin_bench` and
-/// `pone_graph_bench`; a bad selector is a usage mistake, not a bug.
+/// `pone_graph_bench`; a bad selector is a usage mistake, not a bug. A row that
+/// merely cannot be built is NOT one of these: it is reported and skipped.
 fn die(msg: String) -> ! {
     eprintln!("{}", msg);
     eprintln!("{}", usage());
     std::process::exit(2)
+}
+
+/// `VPJOIN_EPS` as a list. One value is the single-budget case; several sweep,
+/// in the order given.
+fn epsilons() -> Vec<f64> {
+    let raw = std::env::var("VPJOIN_EPS").unwrap_or_else(|_| "0.1".to_string());
+    let mut out = Vec::new();
+    for tok in raw.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            die(format!(
+                "VPJOIN_EPS=`{}` has an empty entry; expected one budget or a \
+                 comma-separated list of positive numbers",
+                raw
+            ));
+        }
+        match t.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => out.push(v),
+            Ok(v) => die(format!(
+                "VPJOIN_EPS entry `{}` must be a positive finite number, got {}",
+                t, v
+            )),
+            Err(e) => die(format!("VPJOIN_EPS entry `{}` is not a number: {}", t, e)),
+        }
+    }
+    out
+}
+
+fn delta() -> f64 {
+    match std::env::var("VPJOIN_DELTA") {
+        Err(_) => 1e-5,
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(v) if v > 0.0 && v < 0.5 => v,
+            Ok(v) => die(format!("VPJOIN_DELTA must lie in (0, 1/2), got {}", v)),
+            Err(e) => die(format!("VPJOIN_DELTA=`{}` is not a number: {}", raw, e)),
+        },
+    }
 }
 
 fn main() {
@@ -176,23 +268,51 @@ fn main() {
             .collect()
     };
 
-    let privacy = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("dp") {
-        "rjs" => Privacy::Rjs,
-        "legacy" => Privacy::Legacy,
-        "dp" => Privacy::Dp {
-            epsilon: std::env::var("VPJOIN_EPS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.1),
-            delta: std::env::var("VPJOIN_DELTA")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1e-5),
-        },
-        other => panic!(
-            "unknown VPJOIN_PRIVACY {} (expected dp | rjs | legacy)",
-            other
+    // Outside the dp regime no budget is spent, so VPJOIN_EPS is not read at
+    // all and the eps column is a dash.
+    let (budgets, regime_label) = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("dp") {
+        "rjs" => (
+            vec![Budget {
+                eps: None,
+                privacy: Privacy::Rjs,
+            }],
+            Privacy::Rjs.label(),
         ),
+        "legacy" => (
+            vec![Budget {
+                eps: None,
+                privacy: Privacy::Legacy,
+            }],
+            Privacy::Legacy.label(),
+        ),
+        "dp" => {
+            let del = delta();
+            let eps = epsilons();
+            let label = format!(
+                "dp(eps={} del={})",
+                eps.iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                del
+            );
+            (
+                eps.iter()
+                    .map(|e| Budget {
+                        eps: Some(*e),
+                        privacy: Privacy::Dp {
+                            epsilon: *e,
+                            delta: del,
+                        },
+                    })
+                    .collect(),
+                label,
+            )
+        }
+        other => die(format!(
+            "unknown VPJOIN_PRIVACY `{}` (expected dp | rjs | legacy)",
+            other
+        )),
     };
 
     // Precedence: reps=N on the command line, else VPJOIN_REPS, else 3.
@@ -217,7 +337,7 @@ fn main() {
         } else {
             "release"
         },
-        privacy.label(),
+        regime_label,
         std::env::var("VPJOIN_DP_SEED").unwrap_or_else(|_| "default".into()),
         reps
     );
@@ -242,31 +362,50 @@ fn main() {
         }
     }
 
-    let plan_for = |q: &str, ds: &str| -> DpLanePlan {
+    // The CHECKED planning path: an infeasible release is an `Err` carrying the
+    // reason, never a panic, so one bad cell cannot take the sweep down.
+    let plan_for = |q: &str, ds: &str, privacy: Privacy| -> Result<DpLanePlan, String> {
         match q {
-            "q5" => halo2_experiments::sql::q5_obj_dp::plan_dp_lanes(privacy),
-            "gq3" => halo2_experiments::graph_sql::g_sql3_obj_dp::plan_dp_lanes(ds, privacy),
-            _ => halo2_experiments::graph_sql::g_sql4_obj_dp::plan_dp_lanes(ds, privacy),
+            "q5" => halo2_experiments::sql::q5_obj_dp::try_plan_dp_lanes(privacy),
+            "gq3" => halo2_experiments::graph_sql::g_sql3_obj_dp::try_plan_dp_lanes(ds, privacy),
+            _ => halo2_experiments::graph_sql::g_sql4_obj_dp::try_plan_dp_lanes(ds, privacy),
         }
     };
 
+    let mut skipped = 0usize;
+
     if plan_only {
         // Release the capacities FIRST: the DP mechanism narrates each release
-        // on stdout, and letting that run before the header keeps the table
-        // contiguous.
-        let plans: Vec<DpLanePlan> = rows.iter().map(|(q, ds)| plan_for(q, ds)).collect();
+        // on stderr, and letting that run before the header keeps the table
+        // contiguous. Planning is cheap, so nothing is lost by batching it.
+        let planned: Vec<(&Budget, &(String, String), Result<DpLanePlan, String>)> = budgets
+            .iter()
+            .flat_map(|b| {
+                rows.iter()
+                    .map(move |r| (b, r, plan_for(&r.0, &r.1, b.privacy)))
+            })
+            .collect();
         println!();
         print_header();
-        for p in &plans {
-            print_row(p, None);
+        for (b, (q, ds), plan) in &planned {
+            match plan {
+                Ok(p) => print_row(p, &b.eps_str(), None),
+                Err(why) => {
+                    skipped += 1;
+                    print_skip(q, ds, &b.eps_str(), why);
+                }
+            }
         }
         print_legend();
         println!("\nlane geometry per row:");
-        for p in &plans {
+        for (b, _, plan) in &planned {
+            let Ok(p) = plan else { continue };
             println!(
-                "  {:<4} {:<9} k={} lane_rows={} lanes={} true={} capacity={} effective={}",
+                "  {:<4} {:<9} eps={:<6} k={} lane_rows={} lanes={} true={} capacity={} \
+                 effective={}",
                 p.query,
                 p.dataset,
+                b.eps_str(),
                 p.k,
                 p.lane_rows,
                 p.lanes_str(),
@@ -279,40 +418,73 @@ fn main() {
                     .join("/")
             );
         }
+        print_skipped(skipped);
         println!("\nVPJOIN_PLAN_ONLY=1 -- stopping before any keygen or proving.");
         return;
     }
 
     print_header();
-    for (q, ds) in &rows {
-        eprint!("  {} on {} ... ", q, ds);
-        // `proof_path = None`: this binary writes nothing to disk.
-        let run: DpLaneRun = match q.as_str() {
-            "q5" => halo2_experiments::sql::q5_obj_dp::run_dp_lanes(privacy, reps, None),
-            "gq3" => {
-                halo2_experiments::graph_sql::g_sql3_obj_dp::run_dp_lanes(ds, privacy, reps, None)
+    for b in &budgets {
+        for (q, ds) in &rows {
+            let eps = b.eps_str();
+            eprint!("  {} on {} (eps={}) ... ", q, ds, eps);
+            // Plan first: a release that cannot be hosted is reported here,
+            // before any SRS is read or any key is built. `run_dp_lanes`
+            // re-derives the same geometry internally -- the release is a
+            // deterministic function of the seed, the query and the dataset --
+            // so a feasible row pays one extra planning pass, which is cheap
+            // next to keygen.
+            if let Err(why) = plan_for(q, ds, b.privacy) {
+                eprintln!("SKIPPED ({})", why);
+                skipped += 1;
+                print_skip(q, ds, &eps, &why);
+                continue;
             }
-            _ => halo2_experiments::graph_sql::g_sql4_obj_dp::run_dp_lanes(ds, privacy, reps, None),
-        };
-        eprintln!(
-            "ok (k={}, lanes={}, keygen {:.2}s, prove {:.2}..{:.2}s, proof {} B)",
-            run.plan.k,
-            run.plan.lanes_str(),
-            run.keygen_s,
-            run.prove_min(),
-            run.prove_max(),
-            run.proof_bytes
-        );
-        print_row(&run.plan, Some(&run));
+            // `proof_path = None`: this binary writes nothing to disk. Keygen
+            // happens inside, per configuration: the lane count is part of the
+            // circuit shape, so keys cannot be hoisted out of this loop.
+            let run: DpLaneRun = match q.as_str() {
+                "q5" => halo2_experiments::sql::q5_obj_dp::run_dp_lanes(b.privacy, reps, None),
+                "gq3" => halo2_experiments::graph_sql::g_sql3_obj_dp::run_dp_lanes(
+                    ds, b.privacy, reps, None,
+                ),
+                _ => halo2_experiments::graph_sql::g_sql4_obj_dp::run_dp_lanes(
+                    ds, b.privacy, reps, None,
+                ),
+            };
+            eprintln!(
+                "ok (k={}, lanes={}, keygen {:.2}s, prove {:.2}..{:.2}s, proof {} B)",
+                run.plan.k,
+                run.plan.lanes_str(),
+                run.keygen_s,
+                run.prove_min(),
+                run.prove_max(),
+                run.proof_bytes
+            );
+            print_row(&run.plan, &eps, Some(&run));
+        }
     }
 
     print_legend();
+    print_skipped(skipped);
+}
+
+/// A skip is information, not a failure: it is counted and reported, and the
+/// exit status stays 0.
+fn print_skipped(skipped: usize) {
+    println!(
+        "\n{} row{} skipped as infeasible.",
+        skipped,
+        if skipped == 1 { "" } else { "s" }
+    );
+    flush();
 }
 
 fn print_legend() {
     println!(
         "\ncapacity = released bag capacity (true size + DP pad), one per laned bag\n\
          pad      = pad_extra per materialized intermediate, in the circuit's own order\n\
-         lanes    = lane count per laned bag; GQ4 lanes two bags, so it probes lanes[0]*lanes[1] times"
+         lanes    = lane count per laned bag; GQ4 lanes two bags, so it probes lanes[0]*lanes[1] times\n\
+         eps      = the VPJOIN_EPS entry this row was released under (dash outside the dp regime)"
     );
 }

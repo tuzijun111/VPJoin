@@ -98,8 +98,7 @@ Datasets: **TPC-H** (60K rows in lineitem), **LastFM** (27,806 edges), **Faceboo
   export RUST_MIN_STACK=33554432
   ```
 
-- Public parameters: `param15` through `param23` ship in `src/proof/`. A degree outside that
-  range is generated and cached on first use.
+- Public parameters: `param15` through `param19` ship in `src/proof/`. Parameters for degrees outside this range are generated and cached on first use because the corresponding files may be too large to upload to GitHub.
 - Memory: the graph queries at `k = 22` need tens of GB. Pin to one NUMA node for stable
   timings (`numactl --cpunodebind=0 --membind=0 ./target/release/<bin> ...`).
 
@@ -145,8 +144,10 @@ cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 VPJOIN_PRIVACY=rjs cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
 
-**7. One point of the privacy budget sweep.** Vary `VPJOIN_EPS` per point and
-`VPJOIN_DP_SEED` for independent rounds:
+**7. The privacy budget sweep.** `VPJOIN_EPS` takes a comma-separated list, so one
+invocation covers every point; vary `VPJOIN_DP_SEED` for independent rounds. A budget
+whose released capacity needs more lanes than the circuit can host is reported as
+SKIPPED with the reason and the sweep continues:
 
 ```bash
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4

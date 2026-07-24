@@ -46,21 +46,29 @@ pub fn lanes_for(n: usize, lane_rows: usize) -> usize {
 }
 
 /// Lane count for a released bag capacity at a caller-supplied base degree,
-/// with the structural cap enforced.
-pub fn lanes_for_capacity(capacity: usize, base_degree: u32) -> usize {
+/// `Err` when the release needs more lanes than the structural cap allows.
+///
+/// A release that does not fit is an INFEASIBLE REQUEST, not a bug: a sweep
+/// must be able to report the cell and move on, so this returns the same
+/// information [`lanes_for_capacity`] aborts with.
+pub fn try_lanes_for_capacity(capacity: usize, base_degree: u32) -> Result<usize, String> {
     let lane_rows = lane_rows_for(base_degree);
     let c = lanes_for(capacity, lane_rows);
-    assert!(
-        c <= MAX_LANES,
-        "released capacity {} needs {} lanes at base degree k={} ({} usable rows per lane), \
-         above MAX_LANES={}",
-        capacity,
-        c,
-        base_degree,
-        lane_rows,
-        MAX_LANES
-    );
-    c
+    if c > MAX_LANES {
+        return Err(format!(
+            "released capacity {} needs {} lanes at base degree k={} ({} usable rows per \
+             lane), above MAX_LANES={}",
+            capacity, c, base_degree, lane_rows, MAX_LANES
+        ));
+    }
+    Ok(c)
+}
+
+/// Lane count for a released bag capacity at a caller-supplied base degree,
+/// with the structural cap enforced. Panics on an infeasible capacity; see
+/// [`try_lanes_for_capacity`].
+pub fn lanes_for_capacity(capacity: usize, base_degree: u32) -> usize {
+    try_lanes_for_capacity(capacity, base_degree).unwrap_or_else(|e| panic!("{}", e))
 }
 
 // `Circuit::configure` has no access to the circuit instance (the
@@ -1258,7 +1266,17 @@ struct Gq4DpSetup {
     plan: crate::dp_lane::DpLanePlan,
 }
 
-fn dp_lane_setup(dataset: &str, privacy: crate::bench_queries::Privacy) -> Gq4DpSetup {
+/// Geometry the two released capacities imply, or an explanation of why this
+/// configuration cannot be built.
+///
+/// `Err` covers every way a row can be rejected BEFORE proving: the lane cap on
+/// EITHER bag, and the structural fit of the tallest column group at the pinned
+/// degree. All three are properties of the request, so a sweep reports them and
+/// continues.
+fn try_dp_lane_setup(
+    dataset: &str,
+    privacy: crate::bench_queries::Privacy,
+) -> Result<Gq4DpSetup, String> {
     let edges = crate::bench_queries::load_graph(dataset);
     let (bag1_pad_extra, bag2_pad_extra) =
         crate::bench_queries::graph_pads("gq4", dataset, &edges, privacy);
@@ -1271,16 +1289,23 @@ fn dp_lane_setup(dataset: &str, privacy: crate::bench_queries::Privacy) -> Gq4Dp
     let stats = crate::bench_queries::bag_stats("gq4", &edges);
     let n12 = stats.bag1_size as usize + bag1_pad_extra;
     let n34 = stats.bag2_size as usize + bag2_pad_extra;
-    let c1 = lanes_for_capacity(n12, k);
-    let c2 = lanes_for_capacity(n34, k);
+    // BOTH bags are laned, so both can be the one that does not fit; name the
+    // bag in the message so a skipped row says which release was too big.
+    let c1 = try_lanes_for_capacity(n12, k).map_err(|e| format!("bag1: {}", e))?;
+    let c2 = try_lanes_for_capacity(n34, k).map_err(|e| format!("bag2: {}", e))?;
 
     let tallest = (edges.len() + 2).max(lane_rows).max(c1);
-    assert!(
-        PREAMBLE_ROWS + tallest + BLINDING_SLACK <= 1usize << k,
-        "tallest column group ({} rows) does not fit k={}",
-        tallest,
-        k
-    );
+    if PREAMBLE_ROWS + tallest + BLINDING_SLACK > 1usize << k {
+        return Err(format!(
+            "tallest column group ({} rows) does not fit k={} ({} rows, of which {} go to \
+             the u8 range-table loads and {} to blinding)",
+            tallest,
+            k,
+            1usize << k,
+            PREAMBLE_ROWS,
+            BLINDING_SLACK
+        ));
+    }
 
     let plan = crate::dp_lane::DpLanePlan {
         query: "gq4".to_string(),
@@ -1292,15 +1317,31 @@ fn dp_lane_setup(dataset: &str, privacy: crate::bench_queries::Privacy) -> Gq4Dp
         true_size: vec![stats.bag1_size as usize, stats.bag2_size as usize],
         pads: vec![bag1_pad_extra, bag2_pad_extra],
     };
-    Gq4DpSetup {
+    Ok(Gq4DpSetup {
         edges,
         bag1_pad_extra,
         bag2_pad_extra,
         plan,
-    }
+    })
+}
+
+/// [`try_dp_lane_setup`] for callers that treat an infeasible release as fatal.
+fn dp_lane_setup(dataset: &str, privacy: crate::bench_queries::Privacy) -> Gq4DpSetup {
+    try_dp_lane_setup(dataset, privacy).unwrap_or_else(|e| panic!("{}", e))
+}
+
+/// Geometry only, `Err` when this release cannot be built: no SRS is read, no
+/// key is built, nothing is proved. Use this from a sweep, which must report an
+/// infeasible cell and carry on.
+pub fn try_plan_dp_lanes(
+    dataset: &str,
+    privacy: crate::bench_queries::Privacy,
+) -> Result<crate::dp_lane::DpLanePlan, String> {
+    try_dp_lane_setup(dataset, privacy).map(|s| s.plan)
 }
 
 /// Geometry only: no SRS is read, no key is built, nothing is proved.
+/// Panics on an infeasible release; see [`try_plan_dp_lanes`].
 pub fn plan_dp_lanes(
     dataset: &str,
     privacy: crate::bench_queries::Privacy,
