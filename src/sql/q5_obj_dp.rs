@@ -18,7 +18,6 @@ use super::q5_obj::{
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
-
 pub const LANE_ROWS: usize = 63_000;
 
 pub const SEG: usize = 32;
@@ -817,13 +816,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let perm_merge = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
-            PermAnyChip::configure(
-                meta,
-                q1,
-                q2,
-                vec![merge_nk, merge_sum],
-                msort.clone(),
-            )
+            PermAnyChip::configure(meta, q1, q2, vec![merge_nk, merge_sum], msort.clone())
         };
 
         let q_m_line = meta.selector();
@@ -1127,8 +1120,17 @@ impl<F: Field + Ord> Q5DpChip<F> {
             nr_out_pad_u64,
             co_out_pad_u64,
         } = q5_derive(
-            &customer, &orders, &lineitem, &supplier, &nation, &region_file,
-            europe_hash, start_ts, end_ts, nr_pad_extra, co_pad_extra,
+            &customer,
+            &orders,
+            &lineitem,
+            &supplier,
+            &nation,
+            &region_file,
+            europe_hash,
+            start_ts,
+            end_ts,
+            nr_pad_extra,
+            co_pad_extra,
         );
 
         // key vectors for membership+gap
@@ -1157,7 +1159,12 @@ impl<F: Field + Ord> Q5DpChip<F> {
         // the assigned structure is a function of the PUBLIC capacity only.
         let c = self.config.lanes.len();
         assert!(lane_rows >= 1, "lane_rows must be positive");
-        assert!(c <= MAX_LANES, "lane count {} exceeds MAX_LANES {}", c, MAX_LANES);
+        assert!(
+            c <= MAX_LANES,
+            "lane count {} exceeds MAX_LANES {}",
+            c,
+            MAX_LANES
+        );
 
         let join_len = ls_join_u64.len();
         let n = join_len.saturating_add(ls_pad_extra).max(1);
@@ -1211,7 +1218,11 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 }
                 run_sum[i] = acc as u64;
 
-                let next_nk = if i + 1 < lane_rows { sorted[i + 1][1] } else { 0 };
+                let next_nk = if i + 1 < lane_rows {
+                    sorted[i + 1][1]
+                } else {
+                    0
+                };
 
                 // don't emit for PAD_U64 groups; keep res_pad as SENTINEL
                 if next_nk != nk && nk != PAD_U64 {
@@ -1286,7 +1297,11 @@ impl<F: Field + Ord> Q5DpChip<F> {
             }
             m_run_sum_u64[i] = acc as u64;
 
-            let next_nk = if i + 1 < m_total { msort_u64[i + 1][0] } else { 0 };
+            let next_nk = if i + 1 < m_total {
+                msort_u64[i + 1][0]
+            } else {
+                0
+            };
             if next_nk != nk && nk != PAD_U64 {
                 let nm = *nk_to_name.get(&nk).unwrap_or(&0);
                 m_res_pad_u64[i] = [nk, nm, m_run_sum_u64[i]];
@@ -1636,8 +1651,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 // Lane l hosts global pipeline rows [l*lane_rows,
                 // (l+1)*lane_rows); cells of REAL join rows are collected in
                 // global order for the block-wise part_pad linkage below.
-                let mut ls_join_cells: Vec<Vec<AssignedCell<F, F>>> =
-                    Vec::with_capacity(join_len);
+                let mut ls_join_cells: Vec<Vec<AssignedCell<F, F>>> = Vec::with_capacity(join_len);
                 for (l, lane) in self.config.lanes.iter().enumerate() {
                     for r in 0..lane_rows {
                         let g = l * lane_rows + r;
@@ -1844,8 +1858,14 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     self.config.q_drain.enable(&mut region, i)?;
                     // every lane shares the same q_perm1/q_perm2 pair, so
                     // enabling through lane 0 covers them all
-                    self.config.lanes[0].perm_lsort.q_perm1.enable(&mut region, i)?;
-                    self.config.lanes[0].perm_lsort.q_perm2.enable(&mut region, i)?;
+                    self.config.lanes[0]
+                        .perm_lsort
+                        .q_perm1
+                        .enable(&mut region, i)?;
+                    self.config.lanes[0]
+                        .perm_lsort
+                        .q_perm2
+                        .enable(&mut region, i)?;
                 }
                 self.config.q_lane_first.enable(&mut region, 0)?;
                 for i in 1..lane_rows {
@@ -1933,12 +1953,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 for (l, lane) in self.config.lanes.iter().enumerate() {
                     for i in 0..m_total {
                         let v = if i / SEG == l { F::ONE } else { F::ZERO };
-                        region.assign_fixed(
-                            || "seg_marker",
-                            lane.seg,
-                            i,
-                            || Value::known(v),
-                        )?;
+                        region.assign_fixed(|| "seg_marker", lane.seg, i, || Value::known(v))?;
                     }
                 }
 
@@ -2012,7 +2027,11 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     iz_m_same_prev_chip.assign(&mut region, i, Value::known(diff))?;
                 }
                 for i in 0..m_total {
-                    let next_nk = if i + 1 < m_total { msort_u64[i + 1][0] } else { 0u64 };
+                    let next_nk = if i + 1 < m_total {
+                        msort_u64[i + 1][0]
+                    } else {
+                        0u64
+                    };
                     let diff = F::from(next_nk) - F::from(msort_u64[i][0]);
                     iz_m_same_next_chip.assign(&mut region, i, Value::known(diff))?;
                 }
@@ -2186,7 +2205,10 @@ const CHIP_LOAD_ROWS: usize = 7 * 256;
 /// must keygen / prove on the thread that called this.
 fn dp_lane_setup(
     privacy: crate::bench_queries::Privacy,
-) -> (MyCircuit<halo2curves::pasta::Fp>, crate::dp_lane::DpLanePlan) {
+) -> (
+    MyCircuit<halo2curves::pasta::Fp>,
+    crate::dp_lane::DpLanePlan,
+) {
     // Tables AND pads from bench_queries: one source of truth with the sweep
     // and the DP release.
     let input = crate::bench_queries::tpch_inputs("q5", privacy);
@@ -2210,8 +2232,17 @@ fn dp_lane_setup(
 
     // lane count from the released capacity (public post-processing)
     let d = crate::sql::q5_obj::q5_derive(
-        &customer, &orders, &lineitem, &supplier, &nation, &region, europe_hash, start_ts, end_ts,
-        0, 0,
+        &customer,
+        &orders,
+        &lineitem,
+        &supplier,
+        &nation,
+        &region,
+        europe_hash,
+        start_ts,
+        end_ts,
+        0,
+        0,
     );
     let ls_true = d.ls_join_u64.len();
     let n = ls_true + ls_pad_extra;
@@ -2457,8 +2488,7 @@ mod tests {
         // and 4-row lanes the pipeline spans 3 lanes and the nation-1 group
         // spans the lane 0 / lane 1 boundary
         let d = crate::sql::q5_obj::q5_derive(
-            &customer, &orders, &lineitem, &supplier, &nation, &region, eur, start_ts, end_ts,
-            0, 0,
+            &customer, &orders, &lineitem, &supplier, &nation, &region, eur, start_ts, end_ts, 0, 0,
         );
         assert_eq!(d.ls_join_u64.len(), 6);
 
@@ -2589,19 +2619,13 @@ mod tests {
         prover.assert_satisfied();
     }
 
-   
-    /// Real k = 16 IPA proving over full TPC-H with the DP release hosted in
-    /// lanes. Hours on the production tables, so it is ignored by default.
-    /// Run it explicitly, for example:
-    ///
-    ///   VPJOIN_PRIVACY=dp VPJOIN_EPS=0.1 VPJOIN_DELTA=1e-5 cargo test \
-    ///     --release sql::q5_obj_dp::tests::test_dp_lanes -- --ignored --nocapture
-    ///
-    /// The same code path is what `cargo run --bin dp_lane_bench -- q5` drives.
     #[test]
     #[ignore = "real k=16 IPA proving over full TPC-H; run explicitly"]
     fn test_dp_lanes() {
-        let privacy = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("legacy") {
+        let privacy = match std::env::var("VPJOIN_PRIVACY")
+            .as_deref()
+            .unwrap_or("legacy")
+        {
             "rjs" => crate::bench_queries::Privacy::Rjs,
             "dp" => crate::bench_queries::Privacy::Dp {
                 epsilon: std::env::var("VPJOIN_EPS")

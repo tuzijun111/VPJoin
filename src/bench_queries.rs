@@ -253,22 +253,14 @@ pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
         ("q5", _) => match privacy {
             Privacy::Dp { .. } => {
                 let (_, co_pad, ls_pad) = q5_pads(privacy);
-                let input = tpch_inputs_raw("q5");
-                let TpchInput::Q5 {
-                    customer, orders, lineitem, supplier, nation, region,
-                    europe_hash, start_ts, end_ts, ..
-                } = &input
+                let TpchInput::Q5 { orders, lineitem, .. } = q5_raw_cached()
                 else {
-                    unreachable!("tpch_inputs_raw(\"q5\") returns Q5")
+                    unreachable!("q5_raw_cached() returns Q5")
                 };
-                let d = crate::sql::q5_obj::q5_derive(
-                    customer, orders, lineitem, supplier, nation, region,
-                    *europe_hash, *start_ts, *end_ts, 0, 0,
-                );
                 let rows = lineitem
                     .len()
                     .max(orders.len() + co_pad)
-                    .max(d.ls_join_u64.len() + ls_pad) as u64;
+                    .max(q5_ls_true() + ls_pad) as u64;
                 ceil_log2(rows + 64)
             }
             _ => {
@@ -585,7 +577,7 @@ fn apply_commitment_layer(cols: &[Vec<u64>], query_k: u32, query_proof: &[u8], r
 
 pub const GRAPH_DATASETS: &[&str] = &["lastfm", "facebook", "wiki"];
 
-pub fn load_graph(dataset: &str) -> Vec<Edge> {
+fn read_graph_file(dataset: &str) -> Vec<Edge> {
     match dataset {
         "lastfm" => read_edges_csv(&crate::paths::graph_file("last/lastfm_asia_edges.csv"))
             .expect("lastfm_asia_edges.csv"),
@@ -596,6 +588,27 @@ pub fn load_graph(dataset: &str) -> Vec<Edge> {
         }
         other => panic!("unknown graph dataset {}", other),
     }
+}
+
+/// Parsed edge lists, memoized per dataset for the life of the process.
+///
+/// An epsilon sweep asks for the same dataset once per epsilon, and parsing the
+/// file dominates the cost of planning a row, so the file is read once and the
+/// list is cloned out of the cache.  The parse is deterministic, so a cached
+/// list is indistinguishable from a fresh one.
+fn graph_cache() -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<Vec<Edge>>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, std::sync::Arc<Vec<Edge>>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub fn load_graph(dataset: &str) -> Vec<Edge> {
+    let mut cache = graph_cache().lock().expect("graph cache poisoned");
+    let edges = cache
+        .entry(dataset.to_string())
+        .or_insert_with(|| std::sync::Arc::new(read_graph_file(dataset)));
+    (**edges).clone()
 }
 
 fn edge_columns(edges: &[Edge]) -> Vec<Vec<u64>> {
@@ -791,20 +804,14 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
         // `dp/legacy_capacities.md` and the note in `q5_obj.rs`.
         Privacy::Legacy => (0, 2848, 59452),
         Privacy::Dp { epsilon, delta } => {
-            let input = tpch_inputs_raw("q5");
-            let (nr, co, ls) = match &input {
+            let (nr, co, ls) = match q5_raw_cached() {
                 TpchInput::Q5 {
-                    customer, orders, lineitem, supplier, nation, region,
-                    europe_hash, start_ts, end_ts, ..
+                    customer, orders, lineitem, start_ts, end_ts, ..
                 } => {
                     // Bag sizes come from the circuit's OWN derivation, so the
                     // released capacity is calibrated to the size the circuit
                     // will actually materialize.
-                    let d = crate::sql::q5_obj::q5_derive(
-                        customer, orders, lineitem, supplier, nation, region,
-                        *europe_hash, *start_ts, *end_ts, 0, 0,
-                    );
-                    let ls_true = d.ls_join_u64.len() as u64;
+                    let ls_true = q5_ls_true() as u64;
 
                     // DP POLICY: row-level neighbors, P = {customer,
                     // supplier}.  The two entity relations are private;
@@ -1705,6 +1712,7 @@ pub fn plan(queries: &[String]) -> Vec<(String, String)> {
 /// This is the single definition of each query's attribute projections; both
 /// the sweep and `commit_diff` build their circuits from it, so the two can
 /// never drift apart.
+#[derive(Clone)]
 pub enum TpchInput {
     Q3 {
         customer: Vec<Vec<u64>>,
@@ -1768,13 +1776,82 @@ pub fn tpch_inputs(query: &str, privacy: Privacy) -> TpchInput {
     tpch_inputs_padded(query, nr_pad_extra, co_pad_extra, ls_pad_extra)
 }
 
-/// Q5's inputs with zero padding, used by the DP path to read the true bag
-/// sizes without recursing through [`q5_pads`].
-fn tpch_inputs_raw(query: &str) -> TpchInput {
-    tpch_inputs_padded(query, 0, 0, 0)
+/// Q5's inputs with zero padding, memoized for the life of the process.
+///
+/// The projections do not depend on the pads at all (the circuit stores them as
+/// separate fields and pads internally), so one parse serves every privacy
+/// regime and every epsilon of a sweep.  Used by the DP path to read the true
+/// bag sizes without recursing through [`q5_pads`].
+fn q5_raw_cached() -> &'static TpchInput {
+    static CACHE: std::sync::OnceLock<TpchInput> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tpch_inputs_uncached("q5", 0, 0, 0))
+}
+
+/// Size of Q5's LS join at zero padding, memoized: it is derived from the
+/// tables alone, and both `q5_pads` and the DP lane plan need it.
+pub fn q5_ls_true() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let TpchInput::Q5 {
+            customer,
+            orders,
+            lineitem,
+            supplier,
+            nation,
+            region,
+            europe_hash,
+            start_ts,
+            end_ts,
+            ..
+        } = q5_raw_cached()
+        else {
+            unreachable!("q5_raw_cached() returns Q5")
+        };
+        crate::sql::q5_obj::q5_derive(
+            customer,
+            orders,
+            lineitem,
+            supplier,
+            nation,
+            region,
+            *europe_hash,
+            *start_ts,
+            *end_ts,
+            0,
+            0,
+        )
+        .ls_join_u64
+        .len()
+    })
 }
 
 fn tpch_inputs_padded(
+    query: &str,
+    nr_pad_extra: usize,
+    co_pad_extra: usize,
+    ls_pad_extra: usize,
+) -> TpchInput {
+    // Q5 is the query a sweep re-requests per epsilon; serve it from the cache
+    // and just stamp the pads, which are plain fields of the returned struct.
+    if query == "q5" {
+        let mut out = q5_raw_cached().clone();
+        if let TpchInput::Q5 {
+            nr_pad_extra: nr,
+            co_pad_extra: co,
+            ls_pad_extra: ls,
+            ..
+        } = &mut out
+        {
+            *nr = nr_pad_extra;
+            *co = co_pad_extra;
+            *ls = ls_pad_extra;
+        }
+        return out;
+    }
+    tpch_inputs_uncached(query, nr_pad_extra, co_pad_extra, ls_pad_extra)
+}
+
+fn tpch_inputs_uncached(
     query: &str,
     nr_pad_extra: usize,
     co_pad_extra: usize,

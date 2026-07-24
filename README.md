@@ -111,9 +111,6 @@ cargo build --release
 
 ## Running the Benchmarks
 
-All harnesses print their results to stdout as an aligned table; none writes a results file.
-`cargo run` **without** `--release` builds the debug profile, which is several times slower
-but is the profile all reported proving times use. Do not mix the two in one comparison.
 
 **1-2. VPJoin proving time**, 5 TPC-H queries plus 4 graph queries on 3 datasets, without
 and with the database-commitment layer:
@@ -152,7 +149,7 @@ VPJOIN_PRIVACY=rjs cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 `VPJOIN_DP_SEED` for independent rounds:
 
 ```bash
-VPJOIN_EPS=0.01 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
 
 **8. PoneglyphDB-style graph baselines.** Runs the binary-join-chain baseline at true
@@ -163,108 +160,3 @@ extrapolation is derived from it:
 PONE_K0=17 cargo run --bin pone_graph_bench
 ```
 
-### Options
-
-Preview any run's geometry -- degrees, lane counts, released capacities, pads -- without
-proving anything:
-
-```bash
-VPJOIN_PLAN_ONLY=1 cargo run --bin dp_lane_bench
-```
-
-| Variable | Applies to | Meaning |
-|---|---|---|
-| `VPJOIN_PRIVACY` | all | `dp` (default), `rjs` (true sizes), `legacy` (fixed constants) |
-| `VPJOIN_EPS` / `VPJOIN_DELTA` | DP runs | privacy budget, default `0.1` / `1e-5` |
-| `VPJOIN_DP_SEED` | DP runs | noise seed; vary it for independent rounds |
-| `VPJOIN_PLAN_ONLY` | `vpjoin_bench`, `dp_lane_bench` | print the plan and exit |
-| `VPJOIN_DATA` | all | data root (must contain `data/`, `graph_data/`, `proof/`) |
-| `VPJOIN_MAX_K` | `vpjoin_bench` | cap on the degree the k-fitter may try (default 21) |
-| `PONE_K0` / `PONE_EDGES` | `pone_graph_bench` | anchor domain exponent / forced subsample |
-| `PONE_VERBOSE` / `PONE_PLAN_ONLY` | `pone_graph_bench` | full diagnostics / plan only |
-
-Every harness accepts a subset of queries, and graph queries accept a dataset suffix:
-
-```bash
-cargo run --bin dp_lane_bench -- reps=3 gq3:lastfm gq4:lastfm
-```
-
-Appending an argument ending in `.csv` to `vpjoin_bench` or `pone_graph_bench` additionally
-writes the full per-row schema to that file.
-
-## DP-Guided Padding
-
-The privacy policy is declared per workload in `bench_queries::q5_pads` and
-`bench_queries::graph_pads`, and the released capacity feeds the circuit as an input.
-
-**Q5** uses row-level neighbors with `P = {customer, supplier}`. The fan-out bounds that
-govern its sensitivity (32 orders per custkey, 668 lineitems per suppkey) live in the
-*unprotected* relations, so they are identical on every neighboring instance and are
-released exactly at no budget cost. Because a customer row also reaches the second bag
-through `c_nationkey = s_nationkey`, that bag's release takes the full epsilon and the first
-bag's takes the remainder; delta splits in half.
-
-**GQ3 and GQ4** protect one edge tuple. There the maximum degree *is* a statistic of the
-protected relation, so it must itself be released under the one-sided mechanism before it can
-calibrate the capacity release. That is the rule: noise the frequency bound only when it
-depends on protected data.
-
-**Lane circuits keep the degree fixed.** A released capacity larger than the current domain
-would otherwise force the next power of two, quantizing proving time into 2x jumps. The
-`_dp` circuits instead host the capacity in `c = ceil(capacity / lane_rows)` parallel
-column-group lanes. Every lane is a full structural replica with identical gates and
-lookups, and the lane count depends only on the *released* capacity, never on the true bag
-size -- a cheaper padding-only overflow lane would leak the true size through the circuit
-shape and is deliberately not implemented.
-
-Cost behaviour differs by query. Q5 and GQ3 grow linearly in the lane count (about 8% and
-51 advice columns per lane). **GQ4 does not**: resolving a private key against private-size
-tables needs one lookup argument per candidate table, so its two laned bags force `c1 * c2`
-probe replicas. At `c1=4, c2=3` the laned circuit is 580 advice columns against 141 unlaned
-at twice the domain, which is a wash. `g_sql4_obj_dp.rs` is correct and reviewed, but it is
-not evidence of linear cost for GQ4.
-
-## Analysis Harnesses
-
-Fast, proof-free checks that print the numbers behind the configuration:
-
-```bash
-cargo test --test graph_lane_plan -- --nocapture
-```
-
-| Test | Reports |
-|---|---|
-| `graph_lane_plan` | released pads, degrees and lane counts per query/dataset/epsilon |
-| `q5_dp_pads` | the same for Q5 across the epsilon sweep |
-| `lane_cost_probe` | how advice columns and lookup arguments grow with the lane count |
-| `freq_noising_cost` | what the frequency-noising stage costs on the graph queries |
-| `q5_appendix_mechanism` | what the two-stage mechanism would cost Q5 instead |
-
-Correctness tests, none of which run a full proof:
-
-```bash
-cargo test --release --lib q5_obj_dp
-cargo test --release --lib g_sql3_obj_dp
-cargo test --release --lib g_sql4_obj_dp
-cargo test --release --lib pone_baseline
-cargo test --release --lib dp_noise
-```
-
-The structural guard `cargo test --lib -- inline_bind` asserts every `_bound` circuit is a
-strict superset of its baseline, so drift between a pair fails the suite instead of silently
-skewing measurements.
-
-## Notes
-
-- **`k` is fitted, not assumed.** Each circuit starts at its natural degree (16 for TPC-H,
-  17 for GQ1/GQ2, 18 for GQ3/GQ4) and `k` rises until the circuit fits, because the graph
-  circuits' intermediate size depends on the dataset. Manually setting `k` in source is
-  supported only under `MockProver`.
-- **GQ3 and GQ4 are much larger on Facebook and Wikipedia** than on LastFM (~2.7M and ~2.3M
-  wedge rows vs ~233K), so those rows need `k = 22` and dominate any sweep. With the default
-  `VPJOIN_MAX_K=21` they are recorded as failures and the sweep continues; raise it to
-  actually measure them.
-- **Every proof is verified**, and `vpjoin_bench` persists proof bytes to
-  `src/proof/bench/` as auditable artifacts. `MockProver` is never used in the benchmark
-  harnesses, only in the correctness tests above.
-- A failure in one row is recorded in its `status` column rather than aborting the sweep.

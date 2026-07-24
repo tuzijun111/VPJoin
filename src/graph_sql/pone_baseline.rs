@@ -1,11 +1,7 @@
-
-
 use ff::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
-    },
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector},
     poly::Rotation,
 };
 use halo2curves::pasta::Fp;
@@ -179,7 +175,11 @@ fn enumerate_paths_inner(
         lvls.push(cur.clone());
     }
     let count = if cyclic {
-        lvls.last().unwrap().iter().filter(|&&(a, _, l)| l == a).count() as u64
+        lvls.last()
+            .unwrap()
+            .iter()
+            .filter(|&&(a, _, l)| l == a)
+            .count() as u64
     } else {
         lvls.last().unwrap().len() as u64
     };
@@ -271,8 +271,9 @@ impl Circuit<Fp> for PoneBaselineCircuit {
         // depend on `levels`.
         let view_in = IndexedViewChip::<Fp>::configure(meta);
         let view_out = IndexedViewChip::<Fp>::configure(meta);
-        let view_lvl: Vec<IndexedViewConfig<Fp>> =
-            (0..n_lvls - 1).map(|_| IndexedViewChip::<Fp>::configure(meta)).collect();
+        let view_lvl: Vec<IndexedViewConfig<Fp>> = (0..n_lvls - 1)
+            .map(|_| IndexedViewChip::<Fp>::configure(meta))
+            .collect();
 
         let mut p_start = Vec::new();
         let mut p_mid = Vec::new();
@@ -478,8 +479,12 @@ impl Circuit<Fp> for PoneBaselineCircuit {
     ) -> Result<(), Error> {
         assert!(self.levels >= 3 && self.levels <= MAX_LEVELS);
         assert_eq!(self.capacities.len(), self.levels - 1);
-        let (lvls, _count) =
-            enumerate_paths_inner(&self.edges, self.levels, self.cyclic, !self.test_drop_ordering);
+        let (lvls, _count) = enumerate_paths_inner(
+            &self.edges,
+            self.levels,
+            self.cyclic,
+            !self.test_drop_ordering,
+        );
 
         // ---- host-side witness preparation --------------------------------
         let m = self.edges.len();
@@ -626,7 +631,12 @@ impl Circuit<Fp> for PoneBaselineCircuit {
                     let cap = self.capacities[t];
                     if is_final {
                         config.q_acc0.enable(&mut region, 0)?;
-                        region.assign_advice(|| "acc0", config.acc, 0, || Value::known(Fp::ZERO))?;
+                        region.assign_advice(
+                            || "acc0",
+                            config.acc,
+                            0,
+                            || Value::known(Fp::ZERO),
+                        )?;
                     }
                     let mut acc = 0u64;
                     let ord = orders(t, self.levels);
@@ -681,12 +691,42 @@ impl Circuit<Fp> for PoneBaselineCircuit {
                                 Value::known(Fp::from(b)),
                             )?;
                         }
-                        region.assign_advice(|| "p_inv", config.p_inv[t], i, || Value::known(inv))?;
-                        region.assign_advice(|| "p_start", config.p_start[t], i, || Value::known(Fp::from(a)))?;
-                        region.assign_advice(|| "p_mid", config.p_mid[t], i, || Value::known(Fp::from(b)))?;
-                        region.assign_advice(|| "p_last", config.p_last[t], i, || Value::known(Fp::from(c)))?;
-                        region.assign_advice(|| "p_i", config.p_i[t], i, || Value::known(Fp::from(vi)))?;
-                        region.assign_advice(|| "p_j", config.p_j[t], i, || Value::known(Fp::from(vj)))?;
+                        region.assign_advice(
+                            || "p_inv",
+                            config.p_inv[t],
+                            i,
+                            || Value::known(inv),
+                        )?;
+                        region.assign_advice(
+                            || "p_start",
+                            config.p_start[t],
+                            i,
+                            || Value::known(Fp::from(a)),
+                        )?;
+                        region.assign_advice(
+                            || "p_mid",
+                            config.p_mid[t],
+                            i,
+                            || Value::known(Fp::from(b)),
+                        )?;
+                        region.assign_advice(
+                            || "p_last",
+                            config.p_last[t],
+                            i,
+                            || Value::known(Fp::from(c)),
+                        )?;
+                        region.assign_advice(
+                            || "p_i",
+                            config.p_i[t],
+                            i,
+                            || Value::known(Fp::from(vi)),
+                        )?;
+                        region.assign_advice(
+                            || "p_j",
+                            config.p_j[t],
+                            i,
+                            || Value::known(Fp::from(vj)),
+                        )?;
                         let d_cell = region.assign_advice(
                             || "p_dummy",
                             config.p_dummy[t],
@@ -821,7 +861,10 @@ mod tests {
         // tiny_graph is two triangles {1,2,3} and {2,3,4} sharing edge 2-3,
         // taken in both directions.  With A<B<C each triangle is counted once.
         assert_eq!(gq3, 2, "expected exactly the two undirected triangles");
-        println!("tiny_graph: gq1={} gq2={} gq3={} gq4={}", gq1, gq2, gq3, gq4);
+        println!(
+            "tiny_graph: gq1={} gq2={} gq3={} gq4={}",
+            gq1, gq2, gq3, gq4
+        );
     }
 
     /// The ordering GATES must have teeth, not just the enumeration.
@@ -889,9 +932,26 @@ mod tests {
         // A directed graph with genuine cycles (the shipped LastFM/Facebook
         // files store every edge as src<dst and so contain none at all).
         let raw: Vec<(u64, u64)> = vec![
-            (1, 2), (2, 3), (3, 4), (4, 1), (1, 3), (3, 6), (6, 1),
-            (2, 4), (4, 5), (5, 2), (5, 1), (6, 2), (4, 2), (3, 1),
-            (2, 5), (1, 6), (3, 5), (5, 6), (2, 6), (1, 4),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 1),
+            (1, 3),
+            (3, 6),
+            (6, 1),
+            (2, 4),
+            (4, 5),
+            (5, 2),
+            (5, 1),
+            (6, 2),
+            (4, 2),
+            (3, 1),
+            (2, 5),
+            (1, 6),
+            (3, 5),
+            (5, 6),
+            (2, 6),
+            (1, 4),
         ];
         let edges: Vec<Edge> = raw.iter().map(|&(s, d)| Edge { src: s, dst: d }).collect();
 
@@ -902,7 +962,11 @@ mod tests {
             ("gq4", 4, true, count_gq4(&edges)),
         ] {
             let (_, got) = enumerate_paths(&raw, levels, cyclic);
-            assert_eq!(got, truth, "{}: baseline {} vs VPJoin ground truth {}", name, got, truth);
+            assert_eq!(
+                got, truth,
+                "{}: baseline {} vs VPJoin ground truth {}",
+                name, got, truth
+            );
             assert!(truth > 0, "{}: degenerate test, ground truth is 0", name);
             println!("{}: {} (matches VPJoin ground truth)", name, truth);
         }

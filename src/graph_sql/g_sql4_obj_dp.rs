@@ -1,124 +1,3 @@
-//! Multi-lane DP-padding variant of the GQ4 4-cycle circuit (`g_sql4_obj`).
-//!
-//! WHY THIS FILE EXISTS
-//! --------------------
-//! GQ4 materializes BOTH of its bags at capacities that, under differential
-//! privacy, are NOISY RELEASES rather than the true bag sizes. The released
-//! capacities are public, but they are not powers of two, and a single column
-//! group must be padded up to the next power of two. On lastfm the true bags
-//! hold 232,943 rows each and Revealing-Join-Size proves at k = 18; the DP
-//! release at (eps,delta) = (0.1,1e-5) is 788,220 rows for Bag1 and 621,070
-//! for Bag2, which alone would push the circuit to k = 20. At eps = 0.01 the
-//! releases are ~50x larger and the degree would reach k = 26. Every step
-//! doubles the prover's work even though the capacity grew by far less.
-//!
-//! This circuit keeps the degree PINNED at the Revealing-Join-Size value and
-//! hosts each released capacity in
-//!
-//!     c = ceil(capacity / lane_rows)
-//!
-//! parallel column-group LANES, so the per-bag cost grows with the released
-//! capacity instead of doubling at each power of two. Same trick, same
-//! conventions, as `sql::q5_obj_dp` does for TPC-H Q5 and `g_sql3_obj_dp` does
-//! for the GQ3 triangle.
-//!
-//! WHAT A LANE IS
-//! --------------
-//! GQ4 has TWO pad-driven pipelines, so it has two kinds of lane, and both are
-//! FULL structural replicas:
-//!
-//!   * A Bag2 lane replicates the T34 column group (the eight t34 columns and
-//!     the C<D comparator) AND a complete AggSumByKey group-by, which turns
-//!     that lane's block of Bag2 rows into a lane-local message map table.
-//!   * A Bag1 lane replicates the T12 column group (the eight t12 columns, the
-//!     A<B and B<C comparators, the contribution column and a prefix sum) plus
-//!     one complete MapLookup probe PER Bag2 lane.
-//!
-//! Lanes of a kind are identical by construction and all of them are assigned
-//! to the full `lane_rows` rows, so the assigned structure is a function of the
-//! PUBLIC released capacities only. It never depends on the true bag sizes. A
-//! cheaper "overflow lane" that only carries padding would leak exactly the
-//! quantity DP is paying to hide, so there is no such thing here.
-//!
-//! WHY LANE-LOCAL AGGREGATION IS SOUND
-//! -----------------------------------
-//! The message a Bag2 row sends is `msg_val(pack2(A,C)) = COUNT(paths C->D->A
-//! with C<D)`, a pure COUNT. Counts ADD across a partition, so splitting Bag2
-//! block-wise over c2 lanes and grouping each block independently is exactly
-//! correct: lane l's map holds `count_l(key)`, and
-//!
-//!     sum_l count_l(key) = count(key).
-//!
-//! A Bag1 row therefore probes all c2 maps and sums the c2 retrieved values.
-//! Keys missing from a given lane's map are proven missing by that lane's gap
-//! bracket and contribute 0, exactly as in the single-group circuit. No
-//! ordering, no sentinel and no carry crosses a Bag2 lane boundary: the Bag2
-//! side needs ZERO stitching.
-//!
-//! COST NOTE (read before scaling this up)
-//! ---------------------------------------
-//! Probing c2 lane-local maps costs c1 * c2 MapLookup replicas, so the Bag1
-//! side grows QUADRATICALLY in the lane counts, not linearly. That is inherent
-//! to resolving a PRIVATE key against a table of private size: with c2 separate
-//! tables a lookup argument can only address one of them at a time. It is fine
-//! when one side collapses to a single lane (facebook and wiki at eps = 0.1
-//! give c1 = c2 = 1) and it is roughly break-even against the k+2 jump at
-//! lastfm eps = 0.1 (c1 = 4, c2 = 3). Getting a genuinely linear GQ4 needs a
-//! different join strategy, namely replacing the message map by an in-circuit
-//! sort-merge of the two bags, which is a different circuit rather than a
-//! laned version of this one. See the report accompanying this file.
-//!
-//! WHAT STAYS SINGLE COPY
-//! ----------------------
-//! Everything whose height is fixed by the PUBLIC edge count: the two indexed
-//! views of the edge multiset (`in_by_dst`, `out_by_src`), which are the table
-//! side of every r1/r2/r3/r4 membership lookup. Their height tracks |E|, which
-//! is public in every privacy regime. The base Edge advice columns of
-//! `g_sql4_obj` (`e_eid`, `e_src`, `e_dst`) carry no gate and no lookup there,
-//! so they are dropped rather than replicated.
-//!
-//! WHERE THE ONLY STITCH IS
-//! ------------------------
-//! The single global accumulator is Bag1's running sum of `contrib`. Following
-//! `q5_obj_dp`, each Bag1 lane is self-contained: it runs its own prefix sum
-//! with its own `q_sum0` at its row 0, so no accumulator ever crosses a lane
-//! boundary. The c1 lane totals are then copied into a c1-row totals stage that
-//! adds them with a degree-2 accumulator, and `out` at row c1-1 goes to the
-//! instance. That is the ONLY cross-lane wiring in the whole circuit: c1 copy
-//! constraints and one small accumulator.
-//!
-//! MEASURED STRUCTURE (ConstraintSystem probe)
-//! -------------------------------------------
-//!   c1=1 c2=1 : advice  141  fixed 3  sel  39  lookups   78  shuf  4  perm  31
-//!   c1=2 c2=1 : advice  192  fixed 3  sel  39  lookups  114  shuf  4  perm  32
-//!   c1=1 c2=2 : advice  215  fixed 3  sel  53  lookups  122  shuf  6  perm  43
-//!   c1=4 c2=3 : advice  580  fixed 3  sel  67  lookups  382  shuf  8  perm  58
-//!   c1=9 c2=10: advice 2871  fixed 3  sel 165  lookups 2058  shuf 22  perm 147
-//! cs.degree() is 7 for every configuration, as in `g_sql4_obj`. At c1=c2=1 the
-//! circuit matches the single-group original (142 advice there: this file drops
-//! the three unconstrained base-Edge columns and adds the two totals columns),
-//! and the fixed-column count falls from 9 to 3 because every lane Lt chip
-//! shares one u8 range column. Each extra Bag1 lane adds 51 advice and 36
-//! lookup arguments PLUS 23 advice / 18 lookups per Bag2 lane it must probe;
-//! each extra Bag2 lane adds 51 advice, 26 lookups and 2 shuffles PLUS the same
-//! per-probe cost in every Bag1 lane. That is the c1*c2 term the cost note
-//! above is about.
-//!
-//! The permutation column count grows by ONE per Bag1 lane and by nothing at
-//! all per Bag2 lane or per probe: lane columns are deliberately kept out of
-//! the permutation argument, since halo2 charges for every column in it whether
-//! or not a copy constraint touches it, and the only lane cell that is ever
-//! copied is a Bag1 lane's last `run_sum`. `lanes_are_structural_replicas`
-//! locks that shape in, and with it the privacy property that every lane costs
-//! exactly the same.
-//!
-//! Row budget per lane, at circuit degree k:
-//!   lane_rows = 2^k - PREAMBLE_ROWS - BLINDING_SLACK
-//! where PREAMBLE_ROWS covers the u8 range-table `load` regions (each is 256
-//! fixed rows in a region of its own, and the floor planner is free to place
-//! them ahead of the witness region) and BLINDING_SLACK covers the blinding
-//! rows halo2 reserves at the bottom of every advice column.
-
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 
@@ -135,12 +14,6 @@ use super::g_sql4_obj::{
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-/// Rows the u8 range-table `load` regions may claim ahead of the witness
-/// region. Three distinct u8 columns are loaded: the sort chip of each indexed
-/// view (2), plus the single column every lane Lt chip shares (1). Each `load`
-/// writes 256 fixed rows. Reserving all three is conservative: the floor
-/// planner places regions per column, so in practice they overlap the witness
-/// region.
 pub const PREAMBLE_ROWS: usize = 3 * 256;
 
 /// Blinding rows halo2 keeps at the bottom of every advice column.
@@ -153,11 +26,6 @@ pub const BASE_DEGREE: u32 = 18;
 /// Usable rows per lane at the default base degree.
 pub const LANE_ROWS: usize = (1usize << BASE_DEGREE) - PREAMBLE_ROWS - BLINDING_SLACK;
 
-/// Public structural cap on either lane count. GQ4 releases at eps = 0.01 run
-/// into the dozens of lanes (gq4-lastfm would need about 145 at k = 18), so
-/// this is deliberately far above q5_obj_dp's cap of 16. Note that the Bag1
-/// side pays c1 * c2 probes, so a config near this cap is sizeable even when
-/// each individual count is legal.
 pub const MAX_LANES: usize = 64;
 
 /// Usable rows per lane at circuit degree `k`.
@@ -820,17 +688,6 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         }
     }
 
-    /// Assign one Bag2 lane's block of the padded Bag2 pipeline and run its
-    /// lane-local aggregation.
-    ///
-    /// `base` is the global index of this lane's row 0, so lane l covers the
-    /// padded rows `[l*lane_rows, (l+1)*lane_rows)`. Rows past `t34.len()` are
-    /// pad rows and are witnessed with exactly the pad convention g_sql4_obj
-    /// uses: all-zero tuple, real 0, agg input (PAD, 0). View row 0 is (0,0,0),
-    /// so a pad row satisfies both membership lookups.
-    ///
-    /// Returns this lane's message map and the sorted key list the Bag1 probes
-    /// need for their gap witnesses.
     #[allow(clippy::too_many_arguments)]
     fn assign_bag2_lane(
         lane: &Bag2LaneConfig<F>,
@@ -1037,9 +894,7 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             // One probe per Bag2 lane; the row's message value is their sum.
             let key = if real == 1 { pack2(a, c) } else { 0 };
             let mut msg_total: u64 = 0;
-            for (p_idx, (probe, (map, keys))) in
-                lane.probes.iter().zip(maps.iter()).enumerate()
-            {
+            for (p_idx, (probe, (map, keys))) in lane.probes.iter().zip(maps.iter()).enumerate() {
                 let inside = if key == 0 || map.contains_key(&key) {
                     1u64
                 } else {
@@ -1064,12 +919,7 @@ impl<F: Field + Ord> Gq4DpChip<F> {
                 };
                 msg_total += val;
 
-                region.assign_advice(
-                    || "msg_key",
-                    probe.key,
-                    r,
-                    || Value::known(F::from(key)),
-                )?;
+                region.assign_advice(|| "msg_key", probe.key, r, || Value::known(F::from(key)))?;
                 region.assign_advice(
                     || "msg_in_set",
                     probe.in_set,
@@ -1401,15 +1251,6 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DP lane run
-//
-// One code path for the `#[ignore]`d `tests::test_dp_lanes` below and for
-// `src/bin/dp_lane_bench.rs`.
-// ---------------------------------------------------------------------------
-
-/// Geometry the two released capacities imply, plus the edges they were
-/// derived from. No SRS is read and no key is built here.
 struct Gq4DpSetup {
     edges: Vec<Edge>,
     bag1_pad_extra: usize,
@@ -1433,17 +1274,6 @@ fn dp_lane_setup(dataset: &str, privacy: crate::bench_queries::Privacy) -> Gq4Dp
     let c1 = lanes_for_capacity(n12, k);
     let c2 = lanes_for_capacity(n34, k);
 
-    // Every column group must fit under the range-table loads plus slack.
-    //
-    // A lane region is `lane_rows + 1` rows (the group-by writes a sentinel at
-    // `lane_rows` for its `Rotation::next()` comparisons), but `lane_rows` is
-    // already `2^k - PREAMBLE_ROWS - BLINDING_SLACK`, and the sentinel plus
-    // halo2's real blinding factors sit well inside the 64-row BLINDING_SLACK
-    // reserve. Counting the sentinel here on TOP of the full reserve
-    // overcounts by exactly one row and rejects every legal configuration, so
-    // this check uses `lane_rows`, matching g_sql3_obj_dp. The authoritative
-    // fit check against the constraint system halo2 actually builds is
-    // `tests::structure_fits_base_degree`.
     let tallest = (edges.len() + 2).max(lane_rows).max(c1);
     assert!(
         PREAMBLE_ROWS + tallest + BLINDING_SLACK <= 1usize << k,
@@ -1478,13 +1308,6 @@ pub fn plan_dp_lanes(
     dp_lane_setup(dataset, privacy).plan
 }
 
-/// Real IPA proving at the Revealing-Join-Size degree with both DP releases
-/// hosted in lanes.
-///
-/// The verifying and proving keys are built ONCE, outside the timed region;
-/// then `reps` proofs are generated and every one of them is verified.
-/// `proof_path` is `Some` only for callers that want the last proof on disk
-/// (the test keeps writing it, `dp_lane_bench` does not).
 pub fn run_dp_lanes(
     dataset: &str,
     privacy: crate::bench_queries::Privacy,
@@ -1730,18 +1553,6 @@ mod tests {
         assert!(lanes_for_capacity(39_114_118, 22) <= MAX_LANES);
     }
 
-    /// PRIVACY AUDIT. Every lane of a kind must be a FULL structural replica:
-    /// no lane may be cheaper than another, or the constraint system would leak
-    /// where the real rows stop, which is exactly what the DP release pays to
-    /// hide. That is equivalent to the circuit shape being EXACTLY BILINEAR in
-    /// (c1, c2) -- constant, plus a fixed cost per Bag1 lane, plus a fixed cost
-    /// per Bag2 lane, plus a fixed cost per (Bag1 lane, Bag2 lane) probe pair.
-    /// Fit that model on the corners and check it on a whole grid.
-    ///
-    /// The same fit also pins down the sharing that keeps the preamble bounded:
-    /// fixed columns, selectors and shuffles must not grow with c1 at all
-    /// (every Bag1 lane is live on the same rows, so they share every selector,
-    /// and they hold no range table and no shuffle of their own).
     #[test]
     fn lanes_are_structural_replicas() {
         use halo2_proofs::plonk::ConstraintSystem;
@@ -1786,11 +1597,7 @@ mod tests {
             assert_eq!(d1[i], 0, "{what} must not grow with the Bag1 lane count");
         }
         assert_eq!(d12[6], 0, "degree must not grow with the probe count");
-        for (i, what) in [
-            (1usize, "fixed columns"),
-            (4, "shuffles"),
-            (6, "degree"),
-        ] {
+        for (i, what) in [(1usize, "fixed columns"), (4, "shuffles"), (6, "degree")] {
             assert_eq!(
                 d12[i], 0,
                 "{what} must not carry a c1*c2 term (probes share them)"
@@ -1842,11 +1649,11 @@ mod tests {
     fn mock_lane_geometries() {
         // (lane_rows, bag1_pad_extra, bag2_pad_extra, expected c1, expected c2)
         let cases: [(usize, usize, usize, usize, usize); 6] = [
-            (11, 0, 0, 1, 1), // exactly one full lane each, no pad anywhere
-            (6, 0, 0, 2, 2),  // real rows straddle the lane-0/lane-1 boundary
-            (3, 1, 1, 4, 4),  // 12 released rows over 12: one rounding-up pad
-            (5, 3, 0, 3, 3),  // 14 released rows over 15 vs 11 over 15
-            (2, 0, 0, 6, 6),  // the last lane holds a single real row
+            (11, 0, 0, 1, 1),  // exactly one full lane each, no pad anywhere
+            (6, 0, 0, 2, 2),   // real rows straddle the lane-0/lane-1 boundary
+            (3, 1, 1, 4, 4),   // 12 released rows over 12: one rounding-up pad
+            (5, 3, 0, 3, 3),   // 14 released rows over 15 vs 11 over 15
+            (2, 0, 0, 6, 6),   // the last lane holds a single real row
             (1, 0, 0, 11, 11), // one row per lane: q_sum never fires
         ];
         for (lane_rows, p1, p2, want_c1, want_c2) in cases {
@@ -2033,11 +1840,6 @@ mod tests {
         prover.assert_satisfied();
     }
 
-    /// A released capacity large enough that the LAST Bag2 lane holds no real
-    /// row at all. Its lane-local aggregator then sees an all-PAD input, emits
-    /// nothing, and its map table degenerates to the single (0,0) row followed
-    /// by PAD. Every Bag1 row must still be able to prove absence in it, which
-    /// is the one gap bracket (0, PAD) that lane offers.
     #[test]
     fn mock_all_pad_bag2_lane() {
         let lane_rows = LANE_ROWS_SMALL; // 4
@@ -2099,15 +1901,6 @@ mod tests {
         prover.assert_satisfied();
     }
 
-    /// Real IPA proving at the Revealing-Join-Size degree with both DP releases
-    /// hosted in lanes. Multi-hour on the production datasets, so it is ignored
-    /// by default. Run it explicitly, for example:
-    ///
-    ///   VPJOIN_DATASET=lastfm VPJOIN_PRIVACY=dp VPJOIN_EPS=0.1 \
-    ///   VPJOIN_DELTA=1e-5 cargo test --release \
-    ///     graph_sql::g_sql4_obj_dp::tests::test_dp_lanes -- --ignored --nocapture
-    ///
-    /// The same code path is what `cargo run --bin dp_lane_bench -- gq4` drives.
     #[test]
     #[ignore = "real IPA proving over a full graph dataset; run explicitly"]
     fn test_dp_lanes() {
