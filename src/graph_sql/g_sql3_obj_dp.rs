@@ -14,6 +14,12 @@ use super::g_sql3_obj::{
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
+/// Rows the u8 range-table `load` regions may claim ahead of the witness
+/// region. Five distinct u8 columns are loaded: the four shared ones (the sort
+/// chip of each indexed view, and AggSumByKey's two sort chips) plus the single
+/// column every lane's four Lt chips share. Each `load` writes 256 fixed rows.
+/// Reserving all five is conservative: the floor planner places regions per
+/// column, so in practice they overlap the witness region.
 pub const PREAMBLE_ROWS: usize = 5 * 256;
 
 /// Blinding rows halo2 keeps at the bottom of every advice column.
@@ -1059,6 +1065,13 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DP lane run
+//
+// One code path for the `#[ignore]`d `tests::test_dp_lanes` below and for
+// `src/bin/dp_lane_bench.rs`.
+// ---------------------------------------------------------------------------
+
 /// Geometry the released Bag1 capacity implies, plus the edges it was derived
 /// from. No SRS is read and no key is built here.
 struct Gq3DpSetup {
@@ -1149,6 +1162,13 @@ pub fn plan_dp_lanes(
     dp_lane_setup(dataset, privacy).plan
 }
 
+/// Real IPA proving at the Revealing-Join-Size degree with the DP release
+/// hosted in lanes.
+///
+/// The verifying and proving keys are built ONCE, outside the timed region;
+/// then `reps` proofs are generated and every one of them is verified.
+/// `proof_path` is `Some` only for callers that want the last proof on disk
+/// (the test keeps writing it, `dp_lane_bench` does not).
 pub fn run_dp_lanes(
     dataset: &str,
     privacy: crate::bench_queries::Privacy,
@@ -1156,9 +1176,8 @@ pub fn run_dp_lanes(
     proof_path: Option<&str>,
 ) -> crate::dp_lane::DpLaneRun {
     use halo2_proofs::poly::{
-        commitment::Params,
         ipa::{
-            commitment::{IPACommitmentScheme, ParamsIPA},
+            commitment::IPACommitmentScheme,
             multiopen::ProverIPA,
             strategy::SingleStrategy,
         },
@@ -1167,7 +1186,7 @@ pub fn run_dp_lanes(
     use halo2_proofs::transcript::{
         Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
     };
-    use halo2curves::pasta::{vesta, EqAffine, Fp};
+    use halo2curves::pasta::{EqAffine, Fp};
     use std::time::Instant;
 
     assert!(reps >= 1, "reps must be at least 1");
@@ -1187,14 +1206,9 @@ pub fn run_dp_lanes(
         _marker: PhantomData,
     };
 
-    let params_path = crate::paths::param_file(k);
-    let mut fd = std::fs::File::open(&params_path).unwrap_or_else(|e| {
-        panic!(
-            "open {}: {} -- generate it with `cargo run --release --bin gen_params -- {}`",
-            params_path, e, k
-        )
-    });
-    let params = ParamsIPA::<vesta::Affine>::read(&mut fd).expect("read params");
+    // Shared loader: reads the persisted SRS, and generates and persists a
+    // degree that is not shipped rather than aborting the sweep on it.
+    let params = crate::bench_queries::params_for(k);
 
     let t = Instant::now();
     let vk = keygen_vk(&params, &build()).expect("keygen_vk should not fail");
@@ -1340,6 +1354,12 @@ mod tests {
         prover.assert_satisfied();
     }
 
+    /// PRIVACY REGRESSION GUARD. Every lane must be a FULL structural replica,
+    /// so the constraint system has to grow by exactly the same amount for each
+    /// added lane and by nothing else. A cheap "padding-only overflow lane"
+    /// (the leak this design exists to avoid) would show up here immediately as
+    /// a non-constant increment, and so would a lane that quietly drops a gate,
+    /// a lookup or a permutation column.
     #[test]
     fn lanes_are_structural_replicas() {
         use halo2_proofs::plonk::ConstraintSystem;

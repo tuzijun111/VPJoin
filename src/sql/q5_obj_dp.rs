@@ -2353,9 +2353,8 @@ pub fn run_dp_lanes(
     proof_path: Option<&str>,
 ) -> crate::dp_lane::DpLaneRun {
     use halo2_proofs::poly::{
-        commitment::Params,
         ipa::{
-            commitment::{IPACommitmentScheme, ParamsIPA},
+            commitment::IPACommitmentScheme,
             multiopen::ProverIPA,
             strategy::SingleStrategy,
         },
@@ -2364,20 +2363,15 @@ pub fn run_dp_lanes(
     use halo2_proofs::transcript::{
         Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
     };
-    use halo2curves::pasta::{vesta, EqAffine, Fp};
+    use halo2curves::pasta::{EqAffine, Fp};
     use std::time::Instant;
 
     assert!(reps >= 1, "reps must be at least 1");
     let (circuit, plan) = dp_lane_setup(privacy);
 
-    let params_path = crate::paths::param_file(DP_LANE_K);
-    let mut fd = std::fs::File::open(&params_path).unwrap_or_else(|e| {
-        panic!(
-            "open {}: {} -- generate it with `cargo run --release --bin gen_params -- {}`",
-            params_path, e, DP_LANE_K
-        )
-    });
-    let params = ParamsIPA::<vesta::Affine>::read(&mut fd).expect("read params");
+    // Shared loader: reads the persisted SRS, and generates and persists a
+    // degree that is not shipped rather than aborting the sweep on it.
+    let params = crate::bench_queries::params_for(DP_LANE_K);
 
     let t = Instant::now();
     let vk = keygen_vk(&params, &circuit).expect("keygen_vk should not fail");
@@ -2654,6 +2648,14 @@ mod tests {
         prover.assert_satisfied();
     }
 
+    /// Real k = 16 IPA proving over full TPC-H with the DP release hosted in
+    /// lanes. Hours on the production tables, so it is ignored by default.
+    /// Run it explicitly, for example:
+    ///
+    ///   VPJOIN_PRIVACY=dp VPJOIN_EPS=0.1 VPJOIN_DELTA=1e-5 cargo test \
+    ///     --release sql::q5_obj_dp::tests::test_dp_lanes -- --ignored --nocapture
+    ///
+    /// The same code path is what `cargo run --bin dp_lane_bench -- q5` drives.
     #[test]
     #[ignore = "real k=16 IPA proving over full TPC-H; run explicitly"]
     fn test_dp_lanes() {

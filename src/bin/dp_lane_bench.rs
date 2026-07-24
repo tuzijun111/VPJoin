@@ -472,6 +472,9 @@ fn main() {
 /// A skip is information, not a failure: it is counted and reported, and the
 /// exit status stays 0.
 fn print_skipped(skipped: usize) {
+    if skipped == 0 {
+        return;
+    }
     println!(
         "\n{} row{} skipped as infeasible.",
         skipped,

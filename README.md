@@ -57,7 +57,7 @@ src/
   graph_sql/      # Graph pattern query circuits (GQ1--GQ4)
   data/           # TPC-H dataset files and parsing utilities
   graph_data/     # Network dataset files and parsing
-  proof/          # Persisted public parameters (param15..param23) and proof artifacts
+  proof/          # Persisted public parameters (param15..param19) and some proof artifacts
   bench_queries.rs  # Shared query/dataset/privacy plumbing for every harness
   dp_noise.rs       # DP capacity release (one-sided noise mechanism)
   dp_lane.rs        # Plan/run records shared by the DP lane circuits
@@ -66,9 +66,7 @@ src/
   bin/              # Benchmark harnesses (see Running the Benchmarks)
 ```
 
-Each cyclic query has three circuit files: the baseline (`q5_obj.rs`, `g_sql3_obj.rs`,
-`g_sql4_obj.rs`), a `_bound` variant with the witness-binding check inlined, and a `_dp`
-variant that holds the degree fixed and hosts the DP-released capacity in parallel lanes.
+
 
 ## Benchmarks
 
@@ -132,12 +130,17 @@ cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
 VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
-**5. DP-guided padding** for the three cyclic queries:
-
+**5. DP-guided padding** for the three cyclic queries. `VPJOIN_EPS` takes one budget or a
+comma-separated list, so a single invocation sweeps the whole privacy budget curve:
 
 ```bash
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
+
+A released capacity that needs more lanes than the circuit can host is reported as `SKIPPED`
+with the reason and the sweep continues. The released capacities depend on `VPJOIN_DP_SEED`,
+the query and the dataset only, so a row of a sweep is identical to the same row run alone.
+`VPJOIN_PLAN_ONLY=1` prints the geometry and exits before any keygen.
 
 **6. PoneglyphDB-style graph baselines.** Runs the binary-join-chain baseline at true
 intermediate sizes (the measured anchor) and reports its proving time; the worst-case
