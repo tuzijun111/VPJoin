@@ -99,8 +99,7 @@ Datasets: **TPC-H** (60K rows in lineitem), **LastFM** (27,806 edges), **Faceboo
   ```
 
 - Public parameters: `param15` through `param19` ship in `src/proof/`. Parameters for degrees outside this range are generated and cached on first use because the corresponding files may be too large to upload to GitHub.
-- Memory: the graph queries at `k = 22` need tens of GB. Pin to one NUMA node for stable
-  timings (`numactl --cpunodebind=0 --membind=0 ./target/release/<bin> ...`).
+
 
 ### Build
 
