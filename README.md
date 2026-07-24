@@ -132,27 +132,14 @@ cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
 VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
-**5-6. DP-guided padding** for the three cyclic queries, and its no-privacy lower bound
-(capacities set to the true bag sizes):
+**5. DP-guided padding** for the three cyclic queries:
 
-```bash
-cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
-```
-
-```bash
-VPJOIN_PRIVACY=rjs cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
-```
-
-**7. The privacy budget sweep.** `VPJOIN_EPS` takes a comma-separated list, so one
-invocation covers every point; vary `VPJOIN_DP_SEED` for independent rounds. A budget
-whose released capacity needs more lanes than the circuit can host is reported as
-SKIPPED with the reason and the sweep continues:
 
 ```bash
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
 
-**8. PoneglyphDB-style graph baselines.** Runs the binary-join-chain baseline at true
+**6. PoneglyphDB-style graph baselines.** Runs the binary-join-chain baseline at true
 intermediate sizes (the measured anchor) and reports its proving time; the worst-case
 extrapolation is derived from it:
 
