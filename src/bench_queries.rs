@@ -1432,7 +1432,16 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         dataset: dataset.to_string(),
         public_output: 1,
         profile: build_profile(),
-        config: format!("oblivious{}", obj_variant_tag()),
+        // Q5 is the one TPC-H query that materializes bags, so its capacities,
+        // and hence its degree, follow the privacy regime. Record the regime for
+        // it exactly as the graph path does for GQ3 and GQ4, so an rjs row and a
+        // dp row are distinguishable inside the file and not only by its name.
+        // The other four materialize nothing and are unaffected by the regime.
+        config: if query == "q5" {
+            format!("{}{}", privacy.label(), obj_variant_tag())
+        } else {
+            format!("oblivious{}", obj_variant_tag())
+        },
         ..Default::default()
     };
     let one = [Fp::from(1u64)];
