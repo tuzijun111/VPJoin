@@ -29,6 +29,32 @@
 //! occurrences that went to `R^c`. Clean and residual live in one group, so
 //! Non-Membership is structural.
 //!
+//! Condition (3), Pairwise Consistency, is two mutual Membership Checks per
+//! edge of that tree over the CLEAN sections of the two partitions:
+//!
+//!   pi_K_ij(R_i^c) == pi_K_ij(R_j^c)     for every edge (R_i, R_j)
+//!
+//! Seven edges, so fourteen `pw: ` lookups, each looking one clean key column
+//! up directly in the adjacent relation's clean key column. There is no
+//! intermediate key table: an earlier version routed each direction through a
+//! `pw_tbl` advice column holding the deduplicated key set, but nothing bound
+//! that column to the relation it claimed to enumerate, so a prover could put
+//! `pi_K(R_i^c)` into the table `R_i^c` looks into and `pi_K(R_j^c)` into the
+//! other and satisfy both directions for an arbitrary partition. Looking the two
+//! columns up in each other leaves no free advice to forge, and the two
+//! containments together are the set equality. The key column always comes from
+//! the partition group, never from the base relation: a lookup over the base
+//! rows would only certify membership in `R_j`, which is the weaker statement
+//! `q8_obj.rs` already made. Every key is shifted by `SHIFT_ID` on both sides of
+//! every lookup, because a `lookup_any` expression is evaluated on every row of
+//! the circuit and is `0` wherever its selector is off, so `0` is always in the
+//! table and an unshifted key `0` would be accepted for free. Without condition
+//! (3) condition (4) has a trivial
+//! escape: the all-clean partition conserves every relation and makes both
+//! channels of the Cardinality Preservation Check agree on every row, so a
+//! dangling tuple left in `R_i^c` needs the key sets of an edge to disagree
+//! before anything sees it.
+//!
 //! Condition (4) is then the Cardinality Preservation Check of
 //! `crate::circuits::card_preserve`: one traversal of the tree above carrying
 //! two multiplicities per tuple,
@@ -106,9 +132,12 @@ const PAD_YEAR: u64 = MAX_SENTINEL;
 const PAD_PKEY: u64 = MAX_SENTINEL;
 const PAD_PTYPE: u64 = MAX_SENTINEL;
 
-// Orders (filtered table used for lookup): [o_orderkey, o_year]
+// Orders (filtered table used for lookup): [o_orderkey, o_year, o_custkey]
+// o_custkey rides along because the orders -> customer edge of condition (3)
+// needs the key on the partition side, not on the base rows.
 const PAD_OKEY: u64 = MAX_SENTINEL;
 const PAD_OYEAR: u64 = PAD_YEAR;
+const PAD_OCUST: u64 = MAX_SENTINEL;
 
 // Lineitem join pad: [l_orderkey,l_partkey,l_suppkey,l_ext,l_disc]
 const PAD_LOKEY: u64 = MAX_SENTINEL;
@@ -147,6 +176,15 @@ const SHIFT_ID: u64 = 1;
 /// negative test in this module is what shows the Cardinality Preservation
 /// Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple clean, so the
+/// residual section of every relation stays empty. Conservation still holds and
+/// both channels of condition (4) then agree on every row, so `sum_cln ==
+/// sum_all` passes for free. This is exactly the escape that Pairwise
+/// Consistency has to close, and the third direction of the test in this module
+/// is what shows it does.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -214,8 +252,8 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     q_orders_keep_gate: Selector, // enforces o_keep
     // filtered orders table used for lineitem lookup
     q_orders_filt_gate: Selector,
-    o_filt_pad: Vec<Column<Advice>>, // 3 (keep? [okey,oyear,c] : PAD)
-    o_join_pad: Vec<Column<Advice>>, // 3 ([clean | residual | pad]) length=orders.len()
+    o_filt_pad: Vec<Column<Advice>>, // 4 (keep? [okey,oyear,ckey,c] : PAD)
+    o_join_pad: Vec<Column<Advice>>, // 4 ([clean | residual | pad]) length=orders.len()
     perm_orders: PermAnyConfig,
 
     // ---------- lineitem reorder: clean rows then residual then PAD ----------
@@ -301,6 +339,17 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     // clean/residual flag on the partition side of every Conservation Check
     q_cln_flag: Vec<Selector>, // 8, rows of R^c: flag == 1
     q_res_flag: Vec<Selector>, // 8, rows of R^r: flag == 0
+
+    // ---------------- Pairwise Consistency (condition (3)) ----------------
+    // Two mutual Membership Checks per join-tree edge, both over the clean
+    // sections of the two partition groups. One input selector per relation,
+    // enabled over the rows [0, n_cln) of its partition group, in the same
+    // relation order as q_cln_flag: [region, n1, n2, customer, orders, part,
+    // supplier, lineitem].
+    // The same eight selectors are also the table selectors: a direction of an
+    // edge reads the input out of one relation's clean section and the table out
+    // of the other's, so there is no separate key table and nothing to forge.
+    q_pw_in: Vec<Selector>, // 8
 
     // ---------------- Cardinality Preservation Check (condition (4)) ----------------
     // shifted copies of the two keys that can be 0
@@ -659,15 +708,17 @@ impl<F: Field + Ord> TestChip<F> {
             vec![q * (ok - yk * ck)]
         });
 
-        // filtered orders tables (okey, oyear, keep*c) for lookup
+        // filtered orders tables (okey, oyear, ckey, keep*c) for lookup. o_custkey
+        // is carried on the partition side because the orders -> customer edge of
+        // condition (3) has to read that key out of the clean section.
         let q_orders_filt_gate = meta.selector();
-        let o_filt_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let o_join_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let o_filt_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let o_join_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
         for &c in o_filt_pad.iter().chain(o_join_pad.iter()) {
             meta.enable_equality(c);
         }
 
-        // o_filt_pad = keep? [o_orderkey, o_year, c] : PAD
+        // o_filt_pad = keep? [o_orderkey, o_year, o_custkey, c] : PAD
         meta.create_gate("o_filt_pad = keep? order : PAD", |m| {
             let q = m.query_selector(q_orders_filt_gate);
             let keep = m.query_advice(o_keep, Rotation::cur());
@@ -676,19 +727,23 @@ impl<F: Field + Ord> TestChip<F> {
 
             let pad0 = Expression::Constant(F::from(PAD_OKEY));
             let pad1 = Expression::Constant(F::from(PAD_OYEAR));
+            let pad2 = Expression::Constant(F::from(PAD_OCUST));
 
             let b0 = m.query_advice(orders[0], Rotation::cur());
             let b1 = m.query_advice(orders[2], Rotation::cur());
-            let b2 = m.query_advice(cflag[4], Rotation::cur());
+            let b2 = m.query_advice(orders[1], Rotation::cur());
+            let b3 = m.query_advice(cflag[4], Rotation::cur());
 
             let f0 = m.query_advice(o_filt_pad[0], Rotation::cur());
             let f1 = m.query_advice(o_filt_pad[1], Rotation::cur());
             let f2 = m.query_advice(o_filt_pad[2], Rotation::cur());
+            let f3 = m.query_advice(o_filt_pad[3], Rotation::cur());
 
             vec![
                 q.clone() * (f0 - (keep.clone() * b0 + dropv.clone() * pad0)),
-                q.clone() * (f1 - (keep.clone() * b1 + dropv * pad1)),
-                q * (f2 - keep * b2),
+                q.clone() * (f1 - (keep.clone() * b1 + dropv.clone() * pad1)),
+                q.clone() * (f2 - (keep.clone() * b2 + dropv * pad2)),
+                q * (f3 - keep * b3),
             ]
         });
 
@@ -1225,6 +1280,162 @@ impl<F: Field + Ord> TestChip<F> {
             });
         }
 
+        // ============ Pairwise Consistency (condition (3)) ============
+        // pi_K_ij(R_i^c) == pi_K_ij(R_j^c) on every edge of the join tree, as two
+        // mutual Membership Checks. Both sides read the key out of the relation's
+        // partition group restricted to its clean section, which the Conservation
+        // Check above ties to the base relation, so this really is a statement
+        // about R^c and not about R.
+        //
+        // The selectors have to be complex: a simple selector may not appear in a
+        // lookup expression, so the q_cln_flag selectors of the block above cannot
+        // be reused. One per relation is enough, since every lookup out of a
+        // relation runs over the same clean row range, and the same selector then
+        // serves as the table selector of the opposite direction.
+        //
+        // There is no intermediate key table any more. Routing each direction
+        // through a pw_tbl advice column holding the deduplicated key set left
+        // that column unbound to the relation it claimed to enumerate: a prover
+        // could store pi_K(R_i^c) in the table R_i^c looks into and pi_K(R_j^c)
+        // in the other, and both directions would pass for an arbitrary
+        // partition. Looking the two clean key columns up in each other leaves no
+        // free advice, and the two containments are the set equality.
+        let q_pw_in = (0..8).map(|_| meta.complex_selector()).collect::<Vec<_>>();
+
+        // Every key is shifted by SHIFT_ID on both sides of every lookup, which
+        // preserves the containment. A lookup_any expression is evaluated on every
+        // row of the circuit and both sides are 0 wherever their selector is off,
+        // so 0 is always a member of the table; without the shift a genuine key 0
+        // (n_nationkey and r_regionkey start at 0 in TPC-H) would be accepted
+        // whether or not it is in R_j^c.
+        let mut pw_edge = |name: &'static str,
+                           q_in: Selector,
+                           key_col: Column<Advice>,
+                           q_t: Selector,
+                           tbl_col: Column<Advice>| {
+            meta.lookup_any(name, move |m| {
+                let q_in = m.query_selector(q_in);
+                let q_t = m.query_selector(q_t);
+                let shift = Expression::Constant(F::from(SHIFT_ID));
+                vec![(
+                    q_in * (m.query_advice(key_col, Rotation::cur()) + shift.clone()),
+                    q_t * (m.query_advice(tbl_col, Rotation::cur()) + shift),
+                )]
+            });
+        };
+
+        // edge lineitem -- part on l_partkey = p_partkey
+        pw_edge(
+            "pw: lineitem^c partkey in part^c",
+            q_pw_in[7],
+            l_join_pad[1],
+            q_pw_in[5],
+            p_join_pad[0],
+        );
+        pw_edge(
+            "pw: part^c partkey in lineitem^c",
+            q_pw_in[5],
+            p_join_pad[0],
+            q_pw_in[7],
+            l_join_pad[1],
+        );
+
+        // edge lineitem -- orders on l_orderkey = o_orderkey
+        pw_edge(
+            "pw: lineitem^c orderkey in orders^c",
+            q_pw_in[7],
+            l_join_pad[0],
+            q_pw_in[4],
+            o_join_pad[0],
+        );
+        pw_edge(
+            "pw: orders^c orderkey in lineitem^c",
+            q_pw_in[4],
+            o_join_pad[0],
+            q_pw_in[7],
+            l_join_pad[0],
+        );
+
+        // edge lineitem -- supplier on l_suppkey = s_suppkey
+        pw_edge(
+            "pw: lineitem^c suppkey in supplier^c",
+            q_pw_in[7],
+            l_join_pad[2],
+            q_pw_in[6],
+            s_part_pad[0],
+        );
+        pw_edge(
+            "pw: supplier^c suppkey in lineitem^c",
+            q_pw_in[6],
+            s_part_pad[0],
+            q_pw_in[7],
+            l_join_pad[2],
+        );
+
+        // edge supplier -- nation as n2 on s_nationkey = n_nationkey
+        pw_edge(
+            "pw: supplier^c nationkey in nation2^c",
+            q_pw_in[6],
+            s_part_pad[1],
+            q_pw_in[2],
+            n2_part_pad[0],
+        );
+        pw_edge(
+            "pw: nation2^c nationkey in supplier^c",
+            q_pw_in[2],
+            n2_part_pad[0],
+            q_pw_in[6],
+            s_part_pad[1],
+        );
+
+        // edge orders -- customer on o_custkey = c_custkey
+        pw_edge(
+            "pw: orders^c custkey in customer^c",
+            q_pw_in[4],
+            o_join_pad[2],
+            q_pw_in[3],
+            c_part_pad[0],
+        );
+        pw_edge(
+            "pw: customer^c custkey in orders^c",
+            q_pw_in[3],
+            c_part_pad[0],
+            q_pw_in[4],
+            o_join_pad[2],
+        );
+
+        // edge customer -- nation as n1 on c_nationkey = n_nationkey
+        pw_edge(
+            "pw: customer^c nationkey in nation1^c",
+            q_pw_in[3],
+            c_part_pad[1],
+            q_pw_in[1],
+            n1_part_pad[0],
+        );
+        pw_edge(
+            "pw: nation1^c nationkey in customer^c",
+            q_pw_in[1],
+            n1_part_pad[0],
+            q_pw_in[3],
+            c_part_pad[1],
+        );
+
+        // edge nation as n1 -- region on n_regionkey = r_regionkey
+        pw_edge(
+            "pw: nation1^c regionkey in region^c",
+            q_pw_in[1],
+            n1_part_pad[1],
+            q_pw_in[0],
+            r_part_pad[0],
+        );
+        pw_edge(
+            "pw: region^c regionkey in nation1^c",
+            q_pw_in[0],
+            r_part_pad[0],
+            q_pw_in[1],
+            n1_part_pad[1],
+        );
+
         // ============ Cardinality Preservation Check (condition (4)) ============
         // Two of the seven edges are keyed on a 0-based id, so both of their
         // sides get a shifted copy of the key: key 0 is reserved for the dummy
@@ -1366,7 +1577,7 @@ impl<F: Field + Ord> TestChip<F> {
             let (mu_all, mu_cln) = (cp_mu_ord[0], cp_mu_ord[1]);
             let (s_all, s_cln) = (cp_join_cust.s_all, cp_join_cust.s_cln);
             let pred = o_keep;
-            let cln = o_filt_pad[2];
+            let cln = o_filt_pad[3];
             meta.create_gate("cp: multiplicities of orders", move |m| {
                 let q = m.query_selector(q_cp_ord);
                 vec![
@@ -1600,6 +1811,8 @@ impl<F: Field + Ord> TestChip<F> {
             q_cln_flag,
             q_res_flag,
 
+            q_pw_in,
+
             q_nation_cp,
             q_cust_cp,
             q_supp_cp,
@@ -1772,6 +1985,7 @@ impl<F: Field + Ord> TestChip<F> {
         // The honest prover's `R^c` is the fully reduced instance, so at the
         // root it is exactly the set of joinable rows.
         let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
         let mut cln_l = l_ok_u64.clone();
         if tamper {
             if let Some(i) = cln_l.iter().position(|&x| x == 1) {
@@ -1836,6 +2050,27 @@ impl<F: Field + Ord> TestChip<F> {
             .map(|i| (r_keep_u64[i] == 1 && cl_nrkeys.contains(&region_t[i][0])) as u64)
             .collect();
 
+        // Test hook: skip the reduction and declare every real tuple clean, so
+        // that the residual section of every relation stays empty. The indicator
+        // is then keep, which is what the link gates pad to on dropped rows, so
+        // Conservation still holds and both channels of condition (4) agree on
+        // every row. Only Pairwise Consistency can see that this partition is not
+        // the reduced instance.
+        let (cln_l, cln_p, cln_o, cln_s, cln_n2, cln_c, cln_n1, cln_r) = if all_clean {
+            (
+                vec![1u64; lineitem_t.len()],
+                p_keep_u64.clone(),
+                o_keep_u64.clone(),
+                vec![1u64; supplier_t.len()],
+                vec![1u64; nation_t.len()],
+                vec![1u64; customer_t.len()],
+                vec![1u64; nation_t.len()],
+                r_keep_u64.clone(),
+            )
+        } else {
+            (cln_l, cln_p, cln_o, cln_s, cln_n2, cln_c, cln_n1, cln_r)
+        };
+
         // ---------- the two sides of every Conservation Check ----------
         // input side: keep? [row..., c] : PAD, which the link gates force.
         let filt_side = |rows: &[Vec<u64>],
@@ -1893,8 +2128,11 @@ impl<F: Field + Ord> TestChip<F> {
         let (p_join_pad_u64, p_n_cln, p_n_res) =
             part_side(&part_t, &p_keep_u64, &cln_p, &pad_p);
 
-        let orders_proj: Vec<Vec<u64>> = orders_t.iter().map(|r| vec![r[0], r[2]]).collect();
-        let pad_o = vec![PAD_OKEY, PAD_OYEAR, 0];
+        // [o_orderkey, o_year, o_custkey]: the custkey rides along so that the
+        // orders -> customer edge of condition (3) can read it out of the clean
+        // section of this partition group.
+        let orders_proj: Vec<Vec<u64>> = orders_t.iter().map(|r| vec![r[0], r[2], r[1]]).collect();
+        let pad_o = vec![PAD_OKEY, PAD_OYEAR, PAD_OCUST, 0];
         let o_filt_pad_u64 = filt_side(&orders_proj, &o_keep_u64, &cln_o, &pad_o);
         let (o_join_pad_u64, o_n_cln, o_n_res) =
             part_side(&orders_proj, &o_keep_u64, &cln_o, &pad_o);
@@ -1924,6 +2162,11 @@ impl<F: Field + Ord> TestChip<F> {
         let (l_join_pad_u64, join_len, _l_n_res) =
             part_side(&lineitem_t, &ones(lineitem_t.len()), &cln_l, &pad_l);
 
+        // Pairwise Consistency needs no host-side key table: each direction looks
+        // one clean key column up directly in the adjacent clean key column, so
+        // the only witness it consumes is the partition groups already built
+        // above and the q_pw_in row ranges enabled over their clean sections.
+
         // build all_nations (aligned to l_join_pad rows): join rows real, others PAD
         let mut all_nations_u64: Vec<[u64; 3]> =
             vec![[PAD_AN_YEAR, PAD_AN_VOL, PAD_AN_NAT]; lineitem_t.len()];
@@ -1938,9 +2181,12 @@ impl<F: Field + Ord> TestChip<F> {
             let ext = r[3];
             let disc = r[4];
 
-            let year = orders_year[&okey];
-            let nkey = supp_nat[&skey];
-            let nname = nat_name[&nkey];
+            // Under the MARK_ALL_CLEAN hook the clean section holds every lineitem
+            // row, so these attaches can miss; on the honest witness they never
+            // do, because a clean row is joinable by construction.
+            let year = *orders_year.get(&okey).unwrap_or(&PAD_YEAR);
+            let nkey = *supp_nat.get(&skey).unwrap_or(&PAD_YEAR);
+            let nname = *nat_name.get(&nkey).unwrap_or(&PAD_AN_NAT);
 
             let vol_u64 = ((ext as u128) * ((SCALE - disc) as u128) % (u64::MAX as u128)) as u64;
 
@@ -2469,7 +2715,7 @@ impl<F: Field + Ord> TestChip<F> {
                     )?;
 
                     // filtered orders tables, the last column being keep * c
-                    for j in 0..3 {
+                    for j in 0..4 {
                         region.assign_advice(
                             || "o_filt",
                             self.config.o_filt_pad[j],
@@ -2521,6 +2767,13 @@ impl<F: Field + Ord> TestChip<F> {
                     for i in *n_cln..(*n_cln + *n_res) {
                         self.config.q_res_flag[idx].enable(&mut region, i)?;
                     }
+                    // Pairwise Consistency: the clean rows of this relation, and
+                    // only those. The same selector is the input side of every
+                    // lookup out of this relation and the table side of every
+                    // lookup into it.
+                    for i in 0..*n_cln {
+                        self.config.q_pw_in[idx].enable(&mut region, i)?;
+                    }
                 }
 
                 // ---- enable join-only selectors on prefix join_len ----
@@ -2538,9 +2791,9 @@ impl<F: Field + Ord> TestChip<F> {
                         let r = &l_join_pad_u64[i];
                         let okey = r[0];
                         let skey = r[2];
-                        let year = orders_year[&okey];
-                        let nkey = supp_nat[&skey];
-                        let nname = nat_name[&nkey];
+                        let year = *orders_year.get(&okey).unwrap_or(&PAD_YEAR);
+                        let nkey = *supp_nat.get(&skey).unwrap_or(&PAD_YEAR);
+                        let nname = *nat_name.get(&nkey).unwrap_or(&PAD_AN_NAT);
 
                         region.assign_advice(
                             || "l_year",
@@ -2972,7 +3225,7 @@ impl<F: Field + Ord> TestChip<F> {
                         [
                             orders_t[i][0],
                             o_keep_u64[i] * fetched_c[i].0,
-                            o_filt_pad_u64[i][2] * fetched_c[i].1,
+                            o_filt_pad_u64[i][3] * fetched_c[i].1,
                         ]
                     })
                     .collect();
@@ -3089,7 +3342,11 @@ impl<F: Field + Ord> TestChip<F> {
                     cp_mu.push((mu_all, mu_cln));
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
-                if !tamper {
+                // Under either test hook the two root sums are expected to
+                // disagree (HIDE_ONE_CLEAN_TUPLE) or to agree on a partition that
+                // is not the reduced instance (MARK_ALL_CLEAN), so neither
+                // invariant below holds there.
+                if !tamper && !all_clean {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R join|"
@@ -3203,7 +3460,7 @@ mod tests {
     use crate::data::data_processing;
 
     use chrono::{Datelike, NaiveDate};
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
     use halo2curves::pasta::{vesta, EqAffine, Fp};
 
     use halo2_proofs::{
@@ -3518,6 +3775,27 @@ mod tests {
             crate::paths::data_file("lineitem.tbl")
         );
 
+        // Non-vacuity of the third direction: the slice has to contain a dangling
+        // tuple, otherwise the all-clean partition really is the reduced instance
+        // and Pairwise Consistency would accept it for a good reason. A lineitem
+        // row whose l_partkey passes no part predicate is exactly such a tuple on
+        // the lineitem -- part edge, and it is what the first `pw: ` lookup sees.
+        let const_part_type_hash = string_to_u64("PROMO BRUSHED COPPER");
+        let kept_partkeys: std::collections::HashSet<u64> = part
+            .iter()
+            .filter(|r| r[1] == const_part_type_hash)
+            .map(|r| r[0])
+            .collect();
+        let dangling = lineitem
+            .iter()
+            .filter(|r| !kept_partkeys.contains(&r[1]))
+            .count();
+        assert!(
+            dangling > 0,
+            "the slice has no dangling lineitem tuple, so the third direction \
+             would pass vacuously; widen it"
+        );
+
         let circuit = MyCircuit::<Fp> {
             region,
             nation,
@@ -3528,7 +3806,7 @@ mod tests {
             lineitem,
             cond_nation_hash: string_to_u64("EGYPT"),
             const_region_name_hash: string_to_u64("MIDDLE EAST"),
-            const_part_type_hash: string_to_u64("PROMO BRUSHED COPPER"),
+            const_part_type_hash,
             _marker: PhantomData,
         };
 
@@ -3554,6 +3832,35 @@ mod tests {
                 .any(|f| format!("{:?}", f).contains("cardinality preservation")),
             "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
             failures
+        );
+
+        // Third direction: the escape condition (3) closes. Every real tuple is
+        // declared clean and the residual side is empty, so Conservation holds
+        // and both channels of condition (4) compute the same number on every
+        // row, which makes sum_cln == sum_all pass for free. The partition is
+        // nevertheless not the reduced instance, and the dangling tuples asserted
+        // above must now be caught by a `pw: ` lookup.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let all_clean = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        let verdict = all_clean.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
+        let pw: Vec<String> = failures
+            .iter()
+            .filter(|f| matches!(f, VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")))
+            .map(|f| format!("{:?}", f))
+            .collect();
+        assert!(
+            !pw.is_empty(),
+            "the circuit rejected the all-clean partition, but not through a \
+             Pairwise Consistency lookup"
+        );
+        println!(
+            "all-clean partition: {} failures, {} of them Pairwise Consistency, first: {}",
+            failures.len(),
+            pw.len(),
+            pw[0]
         );
     }
 }

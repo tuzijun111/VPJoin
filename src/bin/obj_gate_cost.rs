@@ -128,9 +128,25 @@ fn main() {
     pair!("gq4", g_sql4_obj::MyCircuit<Fp>, g_sql4_obj_test::MyCircuit<Fp>);
 
     println!(
-        "The delta rows are the arithmetization cost of replacing the residual-side\n\
-         condition (4) with the Cardinality Preservation Check. Rows and constraint\n\
-         totals also scale with the relation sizes, which this report does not see:\n\
-         it reports only what the constraint system fixes independently of the data."
+        "Read the delta rows carefully: they are NOT all the same quantity.\n\
+         \n\
+         q3 and q5 already carried a clean/residual partition and a residual-side\n\
+         condition (4), so their delta is close to the swap the paper describes: the\n\
+         old residual-side argument out, the Cardinality Preservation Check in.\n\
+         \n\
+         The other seven never partitioned at all. Their `*_obj.rs` verifies the join\n\
+         with one-directional lookups from a root relation, so the delta there pays for\n\
+         the whole One-Pass OBJ that was missing: the partition, condition (1)\n\
+         Conservation, condition (3) Pairwise Consistency, and both channels of the\n\
+         propagation. It is not the incremental cost of condition (4) alone.\n\
+         \n\
+         gq1 is the one row that isolates the paper's claim that the clean channel costs\n\
+         only its own column, running sum and product: that circuit already ran the\n\
+         single-channel propagation over the inputs, so its delta adds the second channel\n\
+         to machinery that was already there.\n\
+         \n\
+         Rows and constraint totals also scale with the relation sizes, which this report\n\
+         does not see: it reports only what the constraint system fixes independently of\n\
+         the data."
     );
 }

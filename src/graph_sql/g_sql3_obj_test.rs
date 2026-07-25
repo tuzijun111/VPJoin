@@ -34,6 +34,19 @@
 //! equality is what forces the indicator on a bag row to mark exactly the
 //! tuples that went to `R^c`, so the clean channel cannot be inflated.
 //!
+//! On top of that the file carries condition (3), Pairwise Consistency:
+//!
+//!   pi_K(Bag1^c) == pi_K(Bag2^c)      on the packed (A,C) separator
+//!
+//! as two mutual Membership Checks over the CLEAN block of the two partition
+//! groups. Conditions (1) and (4) alone have a trivial escape, the all-clean
+//! partition: it conserves both bags, and with an empty residual side both
+//! channels of the Cardinality Preservation Check compute the same number on
+//! every row, so `sum_cln == sum_all` holds for free while the clean side is
+//! not the reduced instance at all. Condition (3) closes it, because a
+//! dangling wedge left in `Bag1^c` has no closing edge in `Bag2^c` and the two
+//! key sets then differ.
+//!
 //! Everything else, including the message table, the ordering checks and the
 //! COUNT(*) prefix sum, is unchanged from `g_sql3_obj.rs`.
 //!
@@ -110,6 +123,16 @@ pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
 /// cheat a residual-side-only argument misses, so the negative test in this
 /// module is what shows the Cardinality Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple clean, so the
+/// residual side of both bags holds only what the bag's own predicate already
+/// dropped. Conservation still holds, and with the two channels then carrying
+/// the same multiplicity on every row both root sums of condition (4) agree for
+/// free. This is exactly the escape Pairwise Consistency has to close, so the
+/// third direction of the test in this module is what shows condition (3) is
+/// not vacuous.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -1278,6 +1301,20 @@ pub struct TrianglePathCloserConfig<F: Field + Ord> {
     q_cln_flag: Vec<Selector>, // [bag1, bag2] rows of R^c: flag == 1
     q_res_flag: Vec<Selector>, // [bag1, bag2] rows of R^r: flag == 0
 
+    // ---------------- Pairwise Consistency (condition (3)) ----------------
+    // packed (A,C) separator key of each partition group, pinned to that
+    // group's own attribute columns
+    pk12: Column<Advice>,
+    pk3: Column<Advice>,
+    q_pk12: Selector,
+    q_pk3: Selector,
+
+    // one complex selector per group, enabled over exactly the clean block of
+    // that group. Each one is the input selector of one direction and the table
+    // selector of the other, so no free advice is left to forge.
+    q_pw_in_12: Selector,
+    q_pw_in_3: Selector,
+
     // ---------------- Cardinality Preservation Check ----------------
     // condition (4): |Bag1^c |X| Bag2^c| == |Bag1 |X| Bag2|
     cp_agg_msg: CpAggConfig<F, NUM_BYTES>,   // child Bag2, keyed by pack2(A,C)
@@ -1404,6 +1441,85 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
             });
         }
+
+        // ---------------- Pairwise Consistency (condition (3)) ----------------
+        // pi_K(Bag1^c) == pi_K(Bag2^c) on the single edge of the cluster tree,
+        // the packed (A,C) separator, as two mutual Membership Checks.
+        //
+        // Both sides are read off the CLEAN block of the two partition groups,
+        // rows [0, n_cln), never off the bag rows. A lookup over the bag rows
+        // would only certify membership in the whole relation R_i, which is the
+        // weaker statement the message table already makes. A group's tuple
+        // columns are tied to its bag by that group's Conservation Check and the
+        // flag gate above pins flag == 1 on rows [0, n_cln) and 0 after them, so
+        // the group's own packed key restricted to that block is exactly
+        // pi_K(R^c).
+        //
+        // The key is composite, so it is packed with the same pack2 the rest of
+        // the file uses; the packed column is derived from the group's own A and
+        // C columns by one degree-2 gate rather than packed a second time by
+        // hand.
+        let pk12 = meta.advice_column();
+        let pk3 = meta.advice_column();
+        let q_pk12 = meta.selector();
+        let q_pk3 = meta.selector();
+        {
+            let p_a = part12[0];
+            let p_c = part12[2];
+            meta.create_gate("pw: bag1 partition packed key", move |m| {
+                let q = m.query_selector(q_pk12);
+                let key = m.query_advice(p_a, Rotation::cur())
+                    * Expression::Constant(F::from(PACK_SHIFT))
+                    + m.query_advice(p_c, Rotation::cur());
+                vec![q * (m.query_advice(pk12, Rotation::cur()) - key)]
+            });
+        }
+        {
+            let p_c = part3[0];
+            let p_a = part3[1];
+            meta.create_gate("pw: bag2 partition packed key", move |m| {
+                let q = m.query_selector(q_pk3);
+                let key = m.query_advice(p_a, Rotation::cur())
+                    * Expression::Constant(F::from(PACK_SHIFT))
+                    + m.query_advice(p_c, Rotation::cur());
+                vec![q * (m.query_advice(pk3, Rotation::cur()) - key)]
+            });
+        }
+
+        // One complex selector per group, enabled over exactly the clean block
+        // [0, n_cln) of that group. Each one is the input selector of one
+        // direction and the table selector of the other, so the two containments
+        // hold between the two clean key columns themselves. An earlier version
+        // routed each direction through an intermediate advice column holding
+        // the deduplicated key set, but nothing in the circuit bound those
+        // columns to the relation they claimed to enumerate: setting each table
+        // to the key column that looks into it satisfies both lookups for an
+        // arbitrary partition, which made condition (3) vacuous. There is no
+        // free advice left here, so there is nothing to forge. The selectors
+        // must stay complex, since a simple selector may not appear in a lookup
+        // expression, so they are fresh rather than the q_cln_flag pair.
+        //
+        // A lookup input is 0 on every row where its selector is off, and the
+        // table side is 0 on those rows too, so 0 is always in the table and the
+        // gated-off rows cost nothing. Node IDs are SHIFT_ID-shifted, so a real
+        // packed key is at least PACK_SHIFT + 1 and the containment is over the
+        // real keys only.
+        let q_pw_in_12 = meta.complex_selector();
+        let q_pw_in_3 = meta.complex_selector();
+
+        // pi_K(Bag1^c) subset of pi_K(Bag2^c)
+        meta.lookup_any("pw: bag1^c key in bag2^c", |m| {
+            let lhs = m.query_selector(q_pw_in_12) * m.query_advice(pk12, Rotation::cur());
+            let rhs = m.query_selector(q_pw_in_3) * m.query_advice(pk3, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
+
+        // pi_K(Bag2^c) subset of pi_K(Bag1^c)
+        meta.lookup_any("pw: bag2^c key in bag1^c", |m| {
+            let lhs = m.query_selector(q_pw_in_3) * m.query_advice(pk3, Rotation::cur());
+            let rhs = m.query_selector(q_pw_in_12) * m.query_advice(pk12, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
 
         // Bag1 lookups:
         // r1 via InByDst: key=B, idx=i_r1 -> val=A, eid=r1_eid
@@ -1703,6 +1819,12 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             perm_bag2,
             q_cln_flag,
             q_res_flag,
+            pk12,
+            pk3,
+            q_pk12,
+            q_pk3,
+            q_pw_in_12,
+            q_pw_in_3,
             cp_agg_msg,
             cp_join_msg,
             cp_root,
@@ -1775,6 +1897,12 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 // they agree on the packed separator key, so the reduction of
                 // this two-node cluster tree is the intersection of the two key
                 // sets.
+                //
+                // On a two-node tree that single simultaneous pass is already a
+                // fixed point of semijoin reduction, which is what condition (3)
+                // needs: both clean key sets come out as keys12 /\ keys3. On a
+                // deeper tree it would not be, and the reduction would have to
+                // be iterated.
                 let pred12: Vec<bool> = (0..n12)
                     .map(|i| i < real12 && t12[i].0 < t12[i].1 && t12[i].1 < t12[i].2)
                     .collect();
@@ -1807,27 +1935,55 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 // side and re-reduce both bags around it, so Conservation still
                 // holds and the clean sides stay pairwise consistent
                 let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+                let mark_all = MARK_ALL_CLEAN.load(Ordering::Relaxed);
                 if tamper {
                     if let Some(hidden) = (0..n3).find(|&i| cln3[i] == 1) {
                         cln3[hidden] = 0;
-                        let live3: HashSet<u64> = (0..n3)
-                            .filter(|&i| cln3[i] == 1)
-                            .map(|i| pack2(t3[i].1, t3[i].0))
-                            .collect();
-                        for i in 0..n12 {
-                            if cln12[i] == 1 && !live3.contains(&key12[i]) {
-                                cln12[i] = 0;
+                        // iterate the reduction until nothing moves, so the two
+                        // clean key sets are still equal and condition (3) has
+                        // nothing to say about this witness
+                        loop {
+                            let mut moved = false;
+                            let live3: HashSet<u64> = (0..n3)
+                                .filter(|&i| cln3[i] == 1)
+                                .map(|i| pack2(t3[i].1, t3[i].0))
+                                .collect();
+                            for i in 0..n12 {
+                                if cln12[i] == 1 && !live3.contains(&key12[i]) {
+                                    cln12[i] = 0;
+                                    moved = true;
+                                }
+                            }
+                            let live12: HashSet<u64> = (0..n12)
+                                .filter(|&i| cln12[i] == 1)
+                                .map(|i| key12[i])
+                                .collect();
+                            for i in 0..n3 {
+                                if cln3[i] == 1 && !live12.contains(&pack2(t3[i].1, t3[i].0)) {
+                                    cln3[i] = 0;
+                                    moved = true;
+                                }
+                            }
+                            if !moved {
+                                break;
                             }
                         }
-                        let live12: HashSet<u64> = (0..n12)
-                            .filter(|&i| cln12[i] == 1)
-                            .map(|i| key12[i])
-                            .collect();
-                        for i in 0..n3 {
-                            if cln3[i] == 1 && !live12.contains(&pack2(t3[i].1, t3[i].0)) {
-                                cln3[i] = 0;
-                            }
-                        }
+                    }
+                }
+
+                // test hook only: skip the reduction and declare every real tuple
+                // clean. The indicator still has to satisfy its binding gate, so
+                // a Bag1 wedge its own predicate drops stays out; everything the
+                // predicate keeps goes to the clean side and the residual side
+                // holds nothing else. Conservation still holds and both channels
+                // of condition (4) then carry the same multiplicity on every row,
+                // so only Pairwise Consistency can reject this.
+                if mark_all {
+                    for i in 0..n3 {
+                        cln3[i] = (i < real3) as u64;
+                    }
+                    for i in 0..n12 {
+                        cln12[i] = pred12[i] as u64;
                     }
                 }
 
@@ -2180,6 +2336,52 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     cfg.q_res_flag[1].enable(&mut region, i)?;
                 }
 
+                // ===================== PAIRWISE CONSISTENCY =====================
+                // condition (3): pi_K(Bag1^c) == pi_K(Bag2^c) on the packed (A,C)
+                // separator, as two mutual Membership Checks over the clean block
+                // of the two partition groups.
+                //
+                // The packed key of a group is derived from that group's own A
+                // and C columns by the gates "pw: bag1/bag2 partition packed
+                // key", enabled on every row of the group, so it is pinned on the
+                // clean rows and defined everywhere else.
+                for i in 0..n12 {
+                    cfg.q_pk12.enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "pk12",
+                        cfg.pk12,
+                        i,
+                        || {
+                            Value::known(F::from(pack2(
+                                part12_rows[i][0],
+                                part12_rows[i][2],
+                            )))
+                        },
+                    )?;
+                }
+                for i in 0..n3 {
+                    cfg.q_pk3.enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "pk3",
+                        cfg.pk3,
+                        i,
+                        || Value::known(F::from(pack2(part3_rows[i][1], part3_rows[i][0]))),
+                    )?;
+                }
+
+                // Rows [0, n_cln) of each group are exactly pi_K(R^c), because
+                // the flag gate pins flag == 1 there and the group's tuple
+                // columns are tied to the bag by its Conservation Check. One
+                // selector per group serves as the input selector of its own
+                // direction and as the table selector of the other, so the two
+                // containments run directly between the two clean key columns.
+                for i in 0..n_cln12 {
+                    cfg.q_pw_in_12.enable(&mut region, i)?;
+                }
+                for i in 0..n_cln3 {
+                    cfg.q_pw_in_3.enable(&mut region, i)?;
+                }
+
                 // ===================== CARDINALITY PRESERVATION CHECK =====================
                 // condition (4) of the One-Pass OBJ: the two multiplicity
                 // channels are propagated over the cluster tree and their root
@@ -2214,7 +2416,7 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     })
                     .collect();
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &cfg.cp_root, &cp_mu)?;
-                if !tamper {
+                if !tamper && !mark_all {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R join|"
@@ -2290,7 +2492,7 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
     use std::sync::atomic::Ordering;
 
     use halo2_proofs::{
@@ -2510,6 +2712,37 @@ mod tests {
             "the slice has no triangle, so the clean instance is empty and the test is vacuous"
         );
 
+        // Non-vacuity of the third direction below: the slice must contain a
+        // dangling tuple, i.e. the two unreduced key sets on the separator must
+        // differ, otherwise the all-clean partition really is pairwise
+        // consistent and condition (3) would be right to accept it.
+        let derived = gq3_derive(&edges);
+        let keys3: HashSet<u64> = derived
+            .t3
+            .iter()
+            .map(|&(c, a, _, _)| pack2(a, c))
+            .collect();
+        let keys12: HashSet<u64> = derived
+            .t12
+            .iter()
+            .filter(|&&(a, b, c, _, _, _, _)| a < b && b < c)
+            .map(|&(a, _, c, _, _, _, _)| pack2(a, c))
+            .collect();
+        let dangling12 = keys12.difference(&keys3).count();
+        let dangling3 = keys3.difference(&keys12).count();
+        println!(
+            "[gq3 pw] separator keys: bag1={} bag2={} bag1-only={} bag2-only={}",
+            keys12.len(),
+            keys3.len(),
+            dangling12,
+            dangling3
+        );
+        assert!(
+            dangling12 + dangling3 > 0,
+            "the slice has no dangling tuple, so the all-clean partition is pairwise \
+             consistent and the third direction would pass vacuously"
+        );
+
         // a few oblivious pad rows on both bags, so the padding path of the new
         // columns is exercised too
         let circuit = MyCircuit::<Fp> {
@@ -2529,7 +2762,7 @@ mod tests {
         // separator key. Only condition (4) can see this, so the circuit must
         // now reject.
         super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
-        let tampered = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+        let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         let verdict = tampered.verify();
         super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
 
@@ -2539,6 +2772,28 @@ mod tests {
                 .iter()
                 .any(|f| format!("{:?}", f).contains("cardinality preservation")),
             "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: the escape condition (3) closes. With every real tuple
+        // declared clean the partition still conserves both bags, and both
+        // channels of the Cardinality Preservation Check then compute the same
+        // number on every Bag1 row, so sum_cln == sum_all holds for free. Nothing
+        // but Pairwise Consistency notices that the clean side is not the reduced
+        // instance, so the circuit must reject through a "pw: " lookup.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let all_clean = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+        let verdict = all_clean.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("the all-clean partition was accepted");
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected the all-clean partition, but not through a Pairwise \
+             Consistency lookup: {:?}",
             failures
         );
     }

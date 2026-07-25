@@ -93,8 +93,12 @@
 //! weaker statement `g_sql1_obj.rs` already made. The Conservation Check ties
 //! the partition tuples to the base relation, so that restricted column is
 //! exactly pi_K(R^c). Each of r1, r2, r3 is its own relation with its own
-//! partition, so each (relation, key) pair gets its own key table; r2 carries
-//! two of them, one per incident edge.
+//! partition, and each lookup reads one such clean key column directly in the
+//! clean key column on the other end of the edge. There is no intermediate key
+//! table: an advice column holding the deduplicated key set would be unbound to
+//! the relation it claims to enumerate, so a prover could fill the two tables of
+//! an edge with each other's keys and pass all four lookups for an arbitrary
+//! partition, which would make condition (3) vacuous.
 //!
 //! The membership+gap machinery is KEPT: it is the sigma_j(v) = 0 default of
 //! the new check, not part of the old condition (4). A parent key that occurs
@@ -149,6 +153,14 @@ const PAD_VAL: u64 = 0;
 /// test in this module is what shows the Cardinality Preservation Check is not
 /// vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple clean, leaving the
+/// residual section of every partition empty. Conservation still holds and both
+/// channels of condition (4) then agree trivially, so this is exactly the escape
+/// that Pairwise Consistency has to close, and the third direction of the test
+/// in this module is what shows condition (3) closes it.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -259,6 +271,15 @@ pub struct Path3OrdConfig<F: Field + Ord> {
     perm_cons: [PermAnyConfig; 3],
     q_cln_flag: [Selector; 3], // rows of R^c: flag == 1
     q_res_flag: [Selector; 3], // rows of R^r: flag == 0
+
+    // ---------------- condition (3), Pairwise Consistency ----------------
+    // one complex selector per relation, enabled over exactly the clean rows
+    // [0, |R^c|) of that relation's partition group. These are the lookup input
+    // gates, so they cannot be the simple q_cln_flag selectors above, and the
+    // same selector serves as the table gate of the opposite direction: the four
+    // lookups run between the partition key columns themselves, with no
+    // intermediate key table to forge.
+    q_pw_cln: [Selector; 3],
 
     // ordering checks
     q_ord1: Selector,              // enable lt_ab on r1 rows
@@ -947,6 +968,80 @@ impl<F: Field + Ord> Path3OrdChip<F> {
             });
         }
 
+        // ---------------- Pairwise Consistency, condition (3) ----------------
+        // pi_K_ij(R_i^c) == pi_K_ij(R_j^c) on every join-tree edge, as two
+        // mutual Membership Checks per edge over the CLEAN sections of the two
+        // partition groups. Conservation already ties those tuples to the base
+        // relation, so part[i][key] restricted to rows [0, |R_i^c|) is exactly
+        // pi_K(R_i^c); reading the base column r[i][key] instead would only
+        // prove membership in R_i, which is not condition (3).
+        //
+        // The input gates are fresh COMPLEX selectors: a simple selector may not
+        // appear in a lookup expression, so q_cln_flag cannot be reused here.
+        // Each one is also the table gate of the opposite direction on its edge.
+        //
+        // Earlier versions of this file routed every direction through an
+        // intermediate advice column holding the deduplicated key set of the
+        // relation on the other end. Nothing in the circuit bound such a column
+        // to the relation it claimed to enumerate, so a prover could set the
+        // table r1 looks into to pi_dst(R1^c) and the table r2 looks into to
+        // pi_src(R2^c) and satisfy both directions for an ARBITRARY partition:
+        // condition (3) was vacuous, and the all-clean escape it exists to close
+        // was still open. Looking the two clean key columns up in each other
+        // leaves no free advice, so there is nothing left to forge, and the two
+        // containments together are the set equality condition (3) asks for.
+        //
+        // A lookup input is 0 on every row where its selector is off, and the
+        // table side is 0 on those rows too, so 0 is always in the table and the
+        // gated-off rows cost nothing. Every node id is shifted by SHIFT_ID
+        // before it reaches these columns, so a real key is never 0 and the
+        // containment is over the real keys.
+        let q_pw_cln: [Selector; 3] = std::array::from_fn(|_| meta.complex_selector());
+
+        let mut pw_edge = |name: &'static str,
+                           q_in: Selector,
+                           in_col: Column<Advice>,
+                           q_t: Selector,
+                           tbl_col: Column<Advice>| {
+            meta.lookup_any(name, move |m| {
+                let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
+                let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                vec![(lhs, rhs)]
+            });
+        };
+
+        // edge r1.dst = r2.src
+        pw_edge(
+            "pw: r1^c dst in r2^c src",
+            q_pw_cln[0],
+            part[0][1],
+            q_pw_cln[1],
+            part[1][0],
+        );
+        pw_edge(
+            "pw: r2^c src in r1^c dst",
+            q_pw_cln[1],
+            part[1][0],
+            q_pw_cln[0],
+            part[0][1],
+        );
+
+        // edge r2.dst = r3.src
+        pw_edge(
+            "pw: r2^c dst in r3^c src",
+            q_pw_cln[1],
+            part[1][1],
+            q_pw_cln[2],
+            part[2][0],
+        );
+        pw_edge(
+            "pw: r3^c src in r2^c dst",
+            q_pw_cln[2],
+            part[2][0],
+            q_pw_cln[1],
+            part[1][1],
+        );
+
         // Ordering checks
         let q_ord1 = meta.selector();
         let q_ord2 = meta.selector();
@@ -1080,6 +1175,7 @@ impl<F: Field + Ord> Path3OrdChip<F> {
             perm_cons,
             q_cln_flag,
             q_res_flag,
+            q_pw_cln,
             q_ord1,
             q_ord2,
             lt_ab,
@@ -1452,10 +1548,21 @@ impl<F: Field + Ord> Path3OrdChip<F> {
         // test hook once, here, so the whole witness below is consistent with
         // whichever partition is used.
         let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
-        let (cln1, cln2, cln3) = Self::clean_indicators(&edges, tamper);
+        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let (cln1, cln2, cln3) = if all_clean {
+            // no reduction at all: every real tuple is declared clean and the
+            // residual section of every partition stays empty
+            (vec![1u64; n], vec![1u64; n], vec![1u64; n])
+        } else {
+            Self::clean_indicators(&edges, tamper)
+        };
         let (part_r1, n_cln1) = Self::partition_rows(&edges, &cln1);
         let (part_r2, n_cln2) = Self::partition_rows(&edges, &cln2);
         let (part_r3, n_cln3) = Self::partition_rows(&edges, &cln3);
+
+        // The Pairwise Consistency lookups need no witness of their own: both
+        // sides of every direction are partition key columns that the
+        // Conservation Check already assigns below.
 
         // Stage T3 from r3 (same edges), grouped by src: the input channel is
         // 1 per edge (no predicate on the leaf) and the clean channel is c_3.
@@ -1643,6 +1750,11 @@ impl<F: Field + Ord> Path3OrdChip<F> {
                     }
                     for i in 0..n_cln {
                         cfg.q_cln_flag[idx].enable(&mut region, i)?;
+                        // the gate of the Pairwise Consistency lookups of this
+                        // relation, over exactly the same clean row range: input
+                        // side of its own directions, table side of the opposite
+                        // ones
+                        cfg.q_pw_cln[idx].enable(&mut region, i)?;
                     }
                     for i in n_cln..n {
                         cfg.q_res_flag[idx].enable(&mut region, i)?;
@@ -1868,7 +1980,7 @@ impl<F: Field + Ord> Path3OrdChip<F> {
 
                 // condition (4): the two join cardinalities agree
                 cfg.q_card_eq.enable(&mut region, n - 1)?;
-                if !tamper {
+                if !tamper && !all_clean {
                     debug_assert_eq!(
                         running, running_cln,
                         "cardinality preservation: |R^c join| != |R join|"
@@ -2031,7 +2143,7 @@ mod tests {
     use super::*;
     use crate::data::graph_data_processing::read_edges;
     use crate::data::graph_data_processing::read_edges_csv;
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
 
     use halo2_proofs::{
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
@@ -2171,9 +2283,15 @@ mod tests {
         }
     }
 
-    /// Fast correctness check of the Cardinality Preservation Check: a
-    /// truncated slice of the real graph under MockProver, which verifies every
-    /// gate, shuffle and lookup of the circuit without paying for a real proof.
+    /// Fast correctness check of the Pairwise Consistency and Cardinality
+    /// Preservation Checks: a truncated slice of the real graph under
+    /// MockProver, which verifies every gate, shuffle and lookup of the circuit
+    /// without paying for a real proof. Three directions:
+    ///
+    ///   1. the honest, fully reduced partition is accepted,
+    ///   2. hiding one joinable root tuple is rejected by condition (4),
+    ///   3. the all-clean partition, which condition (4) accepts for free, is
+    ///      rejected by condition (3).
     #[test]
     fn test_cardinality_preservation() {
         // a slice small enough for MockProver but large enough that the
@@ -2191,6 +2309,37 @@ mod tests {
         let cnt = dp_expected(&edges);
         assert!(cnt > 0, "the slice has no 3-path, the test would be vacuous");
 
+        // Non-vacuity of the third direction below. Condition (3) rejects the
+        // all-clean partition only if the slice really has dangling tuples, so
+        // check on the host that the reduction drops rows on every tree node and
+        // that the unreduced key sets of at least one join-tree edge differ.
+        {
+            let shifted: Vec<(u64, u64)> = edges
+                .iter()
+                .map(|e| (e.src as u64 + SHIFT_ID, e.dst as u64 + SHIFT_ID))
+                .collect();
+            let (c1, c2, c3) = Path3OrdChip::<Fp>::clean_indicators(&shifted, false);
+            let live = |c: &Vec<u64>| c.iter().filter(|&&x| x == 1).count();
+            assert!(
+                live(&c1) < shifted.len() && live(&c2) < shifted.len() && live(&c3) < shifted.len(),
+                "the slice has no dangling tuple, condition (3) would accept the \
+                 all-clean partition and the third direction would be vacuous: \
+                 |R1^c|={} |R2^c|={} |R3^c|={} of {}",
+                live(&c1),
+                live(&c2),
+                live(&c3),
+                shifted.len()
+            );
+            let all_src: HashSet<u64> = shifted.iter().map(|&(s, _)| s).collect();
+            let all_dst: HashSet<u64> = shifted.iter().map(|&(_, d)| d).collect();
+            assert!(
+                all_src != all_dst,
+                "pi_src(Edge) == pi_dst(Edge) on this slice, so the all-clean \
+                 partition satisfies Pairwise Consistency and the third direction \
+                 would be vacuous"
+            );
+        }
+
         let circuit = Path3OrdCircuit::<Fp> {
             edges,
             _marker: PhantomData,
@@ -2200,14 +2349,14 @@ mod tests {
         let prover = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         prover.assert_satisfied();
 
-        // Negative direction: the same witness with one joinable root tuple
+        // Second direction: the same witness with one joinable root tuple
         // hidden in the residual side, and the two children re-reduced around
         // it so that Conservation, Non-Membership and Pairwise Consistency all
         // still hold and the input channel, hence the public COUNT, is
         // unchanged. Only condition (4) can see this, so the circuit must now
         // reject, and it must reject through the cardinality equality.
         HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
-        let tampered = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+        let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         let verdict = tampered.verify();
         HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
 
@@ -2224,6 +2373,39 @@ mod tests {
                     .all(|f| format!("{:?}", f).contains("cardinality preservation")),
             "expected the Cardinality Preservation Check to be the only failure: {:?}",
             failures
+        );
+
+        // Third direction: the escape condition (3) closes. The prover skips the
+        // reduction and declares every real tuple clean. Conservation still
+        // holds, and with R^c = R both channels of condition (4) compute the
+        // same number on every row, so the cardinality equality is satisfied for
+        // free and cannot see that the partition is not the reduced instance.
+        // Pairwise Consistency does see it: the slice has tuples whose join key
+        // has no partner, so the key sets of an edge differ.
+        MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let unreduced = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+        let verdict = unreduced.verify();
+        MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
+        let names: Vec<String> = failures.iter().map(|f| format!("{:?}", f)).collect();
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "expected a Pairwise Consistency lookup to reject the all-clean \
+             partition, got: {:?}",
+            names
+        );
+        // and condition (4) really is blind to this partition, which is why
+        // condition (3) has to exist
+        assert!(
+            names
+                .iter()
+                .all(|f| !f.contains("cardinality preservation")),
+            "the all-clean partition was expected to satisfy condition (4): {:?}",
+            names
         );
     }
 }

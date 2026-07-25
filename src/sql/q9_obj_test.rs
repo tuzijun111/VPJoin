@@ -1,14 +1,15 @@
 //! TPC-H Q9 under the updated One-Pass OBJ.
 //!
 //! Same query, same aggregation and same ORDER BY proofs as `q9_obj.rs`. What
-//! this file adds is condition (4) of the gate, the one that rules out a
-//! joinable tuple hidden outside the clean instance.
+//! this file adds is conditions (3) and (4) of the gate: the one that forces
+//! the clean side to be the reduced instance, and the one that rules out a
+//! joinable tuple hidden outside it.
 //!
-//! `q9_obj.rs` has no condition (4) at all: it certifies the join by
-//! one-directional lookups from the root relation into its neighbours, and its
-//! `*_join_pad` groups are sorting permutations of the base relations rather
-//! than a certified clean/residual partition. So nothing is replaced here, the
-//! partition and the check are introduced:
+//! `q9_obj.rs` has neither: it certifies the join by one-directional lookups
+//! from the root relation into its neighbours, and its `*_join_pad` groups are
+//! sorting permutations of the base relations rather than a certified
+//! clean/residual partition. So nothing is replaced here, the partition and the
+//! two checks are introduced:
 //!
 //!   * a clean indicator column per base row of all six relations, bound by the
 //!     relation's own Conservation Check (its `PermAnyChip` shuffle carries one
@@ -16,6 +17,15 @@
 //!     on the `R^c` rows and `0` on the `R^r` rows of the partition side, so
 //!     the multiset equality forces the indicator on a base row to mark exactly
 //!     the occurrences that went to `R^c`),
+//!   * condition (3), Pairwise Consistency, `pi_K_ij(R_i^c) == pi_K_ij(R_j^c)`
+//!     on every join tree edge, as two mutual membership lookups per edge. Each
+//!     looks the edge's key column of one endpoint's partition group, restricted
+//!     to its clean rows, up directly in the same key column of the other
+//!     endpoint's partition group, restricted to its clean rows: no intermediate
+//!     key table, so there is no free advice for a prover to choose. Every such
+//!     lookup is named with the `pw: ` prefix. Without it condition (4) has a
+//!     trivial escape: the all-clean partition makes both channels agree on
+//!     every row for free,
 //!   * the Cardinality Preservation Check of `crate::circuits::card_preserve`:
 //!     one traversal of the join tree carrying two multiplicities per tuple,
 //!     one counting join extensions over the inputs and one over the clean
@@ -41,10 +51,12 @@
 //!
 //! `q9_obj.rs` collapses the supplier -> nation edge into a 2-hop lookup off
 //! the lineitem row, against the attached `l_nationkey`. That lookup is kept
-//! untouched, but the propagation above does not copy it: nation is a child of
-//! supplier here, its per-key sums are fetched on supplier's own rows and
-//! folded into supplier's two multiplicities, so both channels follow the
-//! actual join tree.
+//! untouched, but neither new check copies it: nation is a child of supplier
+//! here, so its per-key sums are fetched on supplier's own rows and folded into
+//! supplier's two multiplicities, and the two Pairwise Consistency lookups of
+//! that edge run between the supplier partition group and the nation partition
+//! group. Both checks therefore follow the actual join tree edge by edge and
+//! never read the unconstrained attached `l_nationkey` column.
 //!
 //! Everything else, including the two ORDER BY ladders and the group-by
 //! accumulator, is unchanged from `q9_obj.rs`.
@@ -73,11 +85,22 @@ const SCALE: u64 = 1000;
 // partkey up to ~200k, suppkey up to ~10k -> SHIFT=1<<20 is safe
 const PS_SHIFT: u64 = 1u64 << 20;
 
-// n_nationkey starts at 0 in TPC-H and key 0 is reserved for the dummy row of
-// the key-indexed tables of the Cardinality Preservation Check, so both sides
-// of the supplier -> nation edge are shifted by this constant. Shifting both
-// sides preserves the equijoin.
+// n_nationkey starts at 0 in TPC-H and key 0 is reserved twice over: it is the
+// dummy row of the key-indexed tables of the Cardinality Preservation Check, and
+// it is the value both sides of a Pairwise Consistency lookup take on every row
+// where their selector is off, so a key of 0 would be in the table for free.
+// Both sides of the supplier -> nation edge are therefore shifted by this
+// constant, in the same direction, which preserves the equijoin.
 const NAT_SHIFT: u64 = 1;
+
+// index order of the relations, the one cflag / q_cln_flag / q_res_flag and the
+// input side of the Pairwise Consistency lookups all use
+const R_PART: usize = 0;
+const R_SUPP: usize = 1;
+const R_NAT: usize = 2;
+const R_ORD: usize = 3;
+const R_PS: usize = 4;
+const R_LINE: usize = 5;
 
 /// Test hook, off in every benchmark path: when set, the prover moves one
 /// joinable lineitem tuple to the residual side and re-reduces the neighbours
@@ -86,6 +109,15 @@ const NAT_SHIFT: u64 = 1;
 /// the cheat a residual-side-only argument misses, so the negative test in this
 /// module is what shows the Cardinality Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple clean, leaving the
+/// residual section of every partition empty. Conservation still holds and both
+/// channels of condition (4) then agree on every row, so this is exactly the
+/// escape Pairwise Consistency has to close: a dangling tuple left in `R_i^c`
+/// has no partner in the clean part of the adjacent relation, so the key sets on
+/// that edge differ and a `pw: ` lookup must reject.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 // ----------------- paddings -----------------
 // Part: [p_partkey, p_name_hash]
@@ -270,6 +302,17 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     // clean/residual flag on the partition side of each Conservation Check
     q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1
     q_res_flag: Vec<Selector>, // rows of R^r: flag == 0
+
+    // ---------------- Pairwise Consistency Check ----------------
+    // condition (3): pi_K(R_i^c) == pi_K(R_j^c) on every join tree edge
+    l_pw_pskey: Column<Advice>, // packed partsupp key on the lineitem partition rows
+    s_pw_nkey: Column<Advice>,  // s_nationkey + NAT_SHIFT on the supplier partition rows
+    n_pw_key: Column<Advice>,   // n_nationkey + NAT_SHIFT on the nation partition rows
+
+    // one selector per relation over its clean rows, shared by every edge
+    // incident to it; it gates that relation's key columns on both the input and
+    // the table side of the ten lookups. Indices are R_PART .. R_LINE.
+    q_pw_in: Vec<Selector>, // 6
 }
 
 #[derive(Clone, Debug)]
@@ -522,6 +565,176 @@ impl<F: Field + Ord> TestChip<F> {
                 let f = m.query_advice(flag_col, Rotation::cur());
                 vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
             });
+        }
+
+        // -------- condition (3): Pairwise Consistency on every tree edge --------
+        // pi_K(R_i^c) == pi_K(R_j^c), as two mutual membership lookups per edge,
+        // each looking one endpoint's clean key column up directly in the other
+        // endpoint's clean key column. Both sides of every lookup are columns of
+        // a *partition* group, restricted to the clean rows [0, n_cln), and the
+        // Conservation Check ties those groups to the base relations, so the
+        // statement really is about R^c. A lookup over the base rows would only
+        // certify membership in R_i, which is the weaker statement q9_obj.rs
+        // already makes.
+        //
+        // An earlier version routed each direction through an intermediate
+        // advice column holding [0] ++ uniq(key) over the clean rows of the other
+        // endpoint. Nothing in the circuit bound those ten columns to the
+        // relations they claimed to enumerate, so a prover could set each table
+        // to the key set of the relation looking into it and every lookup would
+        // pass for an arbitrary partition, leaving condition (3) vacuous. Looking
+        // the two clean key columns up in each other removes the free advice, and
+        // with it the escape, at one fewer column and one fewer selector per
+        // direction.
+        //
+        // One selector per relation, enabled over that relation's clean rows and
+        // shared by every edge incident to it. The same selector gates that
+        // relation's key column on the input side of its own lookups and on the
+        // table side of the reverse lookups, so both sides of every lookup
+        // evaluate to 0 on a row where the selector is off: 0 is then in each
+        // table for free and the gated-off rows cost nothing. Real partkeys,
+        // orderkeys and suppkeys are at least 1 in TPC-H, the two composite
+        // partsupp keys are at least PS_SHIFT, and the two nation keys carry
+        // NAT_SHIFT, so no key is ever 0 and the containment is over the real
+        // keys. The selectors are complex both because a simple selector may
+        // not appear in a lookup expression and because the three derived key
+        // columns below are pinned by the same selector.
+        let q_pw_in = (0..6).map(|_| meta.complex_selector()).collect::<Vec<_>>();
+
+        // The partsupp edge key is a composite and the nation edge key can be 0,
+        // which every gated-off lookup expression also evaluates to, so three key
+        // columns are derived on the partition rows. Each is pinned by the clean
+        // selector of its own relation, which is what keeps them as unforgeable as
+        // the raw key columns. The lineitem group already carries a packed key in
+        // l_ps_key, but that one is pinned by q_amount, which also drives the
+        // attach lookups and the amount formula, so it is only available on the
+        // rows those need.
+        let l_pw_pskey = meta.advice_column();
+        meta.create_gate("pw: ps_key packing on the lineitem partition rows", |m| {
+            let q = m.query_selector(q_pw_in[R_LINE]);
+            let lp = m.query_advice(l_join_pad[1], Rotation::cur());
+            let ls = m.query_advice(l_join_pad[2], Rotation::cur());
+            let key = m.query_advice(l_pw_pskey, Rotation::cur());
+            let shift = Expression::Constant(F::from(PS_SHIFT));
+            vec![q * (key - (lp * shift + ls))]
+        });
+        let s_pw_nkey = meta.advice_column();
+        meta.create_gate("pw: shifted nation key on the supplier partition rows", |m| {
+            let q = m.query_selector(q_pw_in[R_SUPP]);
+            let k = m.query_advice(s_pw_nkey, Rotation::cur());
+            let b = m.query_advice(s_join_pad[1], Rotation::cur());
+            vec![q * (k - (b + Expression::Constant(F::from(NAT_SHIFT))))]
+        });
+        let n_pw_key = meta.advice_column();
+        meta.create_gate("pw: shifted nation key on the nation partition rows", |m| {
+            let q = m.query_selector(q_pw_in[R_NAT]);
+            let k = m.query_advice(n_pw_key, Rotation::cur());
+            let b = m.query_advice(n_join_pad[0], Rotation::cur());
+            vec![q * (k - (b + Expression::Constant(F::from(NAT_SHIFT))))]
+        });
+
+        // The ten lookups, two per join tree edge. `q_in`/`in_col` is the clean
+        // key column being contained, `q_t`/`tbl_col` the clean key column of the
+        // other endpoint that has to contain it. The two directions of an edge are
+        // the same pair with the roles swapped, and together they give the set
+        // equality condition (3) asks for.
+        {
+            let mut pw_edge = |name: &'static str,
+                               q_in: Selector,
+                               in_col: Column<Advice>,
+                               q_t: Selector,
+                               tbl_col: Column<Advice>| {
+                meta.lookup_any(name, move |m| {
+                    let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
+                    let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                    vec![(lhs, rhs)]
+                });
+            };
+
+            // edge lineitem - part, on l_partkey = p_partkey
+            pw_edge(
+                "pw: lineitem^c partkey in part^c",
+                q_pw_in[R_LINE],
+                l_join_pad[1],
+                q_pw_in[R_PART],
+                p_join_pad[0],
+            );
+            pw_edge(
+                "pw: part^c partkey in lineitem^c",
+                q_pw_in[R_PART],
+                p_join_pad[0],
+                q_pw_in[R_LINE],
+                l_join_pad[1],
+            );
+
+            // edge lineitem - orders, on l_orderkey = o_orderkey
+            pw_edge(
+                "pw: lineitem^c orderkey in orders^c",
+                q_pw_in[R_LINE],
+                l_join_pad[0],
+                q_pw_in[R_ORD],
+                o_join_pad[0],
+            );
+            pw_edge(
+                "pw: orders^c orderkey in lineitem^c",
+                q_pw_in[R_ORD],
+                o_join_pad[0],
+                q_pw_in[R_LINE],
+                l_join_pad[0],
+            );
+
+            // edge lineitem - partsupp, on the packed (partkey, suppkey)
+            pw_edge(
+                "pw: lineitem^c ps_key in partsupp^c",
+                q_pw_in[R_LINE],
+                l_pw_pskey,
+                q_pw_in[R_PS],
+                ps_join_pad[0],
+            );
+            pw_edge(
+                "pw: partsupp^c ps_key in lineitem^c",
+                q_pw_in[R_PS],
+                ps_join_pad[0],
+                q_pw_in[R_LINE],
+                l_pw_pskey,
+            );
+
+            // edge lineitem - supplier, on l_suppkey = s_suppkey
+            pw_edge(
+                "pw: lineitem^c suppkey in supplier^c",
+                q_pw_in[R_LINE],
+                l_join_pad[2],
+                q_pw_in[R_SUPP],
+                s_join_pad[0],
+            );
+            pw_edge(
+                "pw: supplier^c suppkey in lineitem^c",
+                q_pw_in[R_SUPP],
+                s_join_pad[0],
+                q_pw_in[R_LINE],
+                l_join_pad[2],
+            );
+
+            // edge supplier - nation, on the shifted s_nationkey = n_nationkey.
+            // This is the edge q9_obj.rs collapses into a 2-hop lookup off the
+            // lineitem row; condition (3) follows the real tree edge instead, so
+            // it runs between the supplier and nation partition groups. The
+            // NAT_SHIFT of both derived columns cancels, so the containment is
+            // still the one on the raw nation keys.
+            pw_edge(
+                "pw: supplier^c nationkey in nation^c",
+                q_pw_in[R_SUPP],
+                s_pw_nkey,
+                q_pw_in[R_NAT],
+                n_pw_key,
+            );
+            pw_edge(
+                "pw: nation^c nationkey in supplier^c",
+                q_pw_in[R_NAT],
+                n_pw_key,
+                q_pw_in[R_SUPP],
+                s_pw_nkey,
+            );
         }
 
         // ---------- attach cols ----------
@@ -1175,6 +1388,11 @@ impl<F: Field + Ord> TestChip<F> {
 
             q_cln_flag,
             q_res_flag,
+
+            l_pw_pskey,
+            s_pw_nkey,
+            n_pw_key,
+            q_pw_in,
         }
     }
 
@@ -1286,6 +1504,20 @@ impl<F: Field + Ord> TestChip<F> {
             }
         }
 
+        // test hook only: skip the reduction and declare every real tuple clean.
+        // The partition groups keep the row order they have below, only the
+        // boundary between the clean and the residual section moves to the end
+        // of the real rows and every real row's flag becomes 1. Conservation
+        // still holds, and with c == pred on every row the clean channel of
+        // condition (4) equals its input channel row by row, so the two root
+        // sums agree for free. Only condition (3) can see this.
+        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        if all_clean {
+            for f in l_cln.iter_mut() {
+                *f = 1;
+            }
+        }
+
         // 3) contributing orders/suppliers/partsupp/nation subsets (for join_pad tables)
         let l_okeys: HashSet<u64> = l_join.iter().map(|r| r[0]).collect();
         let l_skeys: HashSet<u64> = l_join.iter().map(|r| r[2]).collect();
@@ -1377,26 +1609,29 @@ impl<F: Field + Ord> TestChip<F> {
         // A base row is clean iff it passes its predicate and its tuple went to
         // the clean side above, so the indicator marks exactly the occurrences
         // of R^c.
+        // Under the all-clean hook every real tuple is declared clean. On part
+        // that still means keep * 1, because the link gate pads the indicator
+        // with 0 and so forces a row dropped by the predicate to stay dirty.
         let cln_p: Vec<u64> = part
             .iter()
             .zip(p_keep.iter())
-            .map(|(r, &k)| (k == 1 && l_pkeys.contains(&r[0])) as u64)
+            .map(|(r, &k)| (k == 1 && (all_clean || l_pkeys.contains(&r[0]))) as u64)
             .collect();
         let cln_s: Vec<u64> = supplier
             .iter()
-            .map(|r| l_skeys.contains(&r[0]) as u64)
+            .map(|r| (all_clean || l_skeys.contains(&r[0])) as u64)
             .collect();
         let cln_n: Vec<u64> = nation
             .iter()
-            .map(|r| s_nkeys.contains(&r[0]) as u64)
+            .map(|r| (all_clean || s_nkeys.contains(&r[0])) as u64)
             .collect();
         let cln_o: Vec<u64> = orders
             .iter()
-            .map(|r| l_okeys.contains(&r[0]) as u64)
+            .map(|r| (all_clean || l_okeys.contains(&r[0])) as u64)
             .collect();
         let cln_ps: Vec<u64> = partsupp
             .iter()
-            .map(|r| l_pskeys.contains(&r[0]) as u64)
+            .map(|r| (all_clean || l_pskeys.contains(&r[0])) as u64)
             .collect();
 
         // the indicator rides along as the last column of each relation, so the
@@ -1427,46 +1662,89 @@ impl<F: Field + Ord> TestChip<F> {
             })
             .collect();
 
+        // The flag the rows of the residual section carry. It is 0 except under
+        // the all-clean hook, which declares those same rows clean without
+        // moving them.
+        let res_flag: u64 = all_clean as u64;
+
         // Build p_join_pad (length = part.len()): clean, residual, then PADs
         let p_join_pad_u64 = pad_join_pad(
             &with_flag(&p_cln, 1),
-            &with_flag(&p_res, 0),
+            &with_flag(&p_res, res_flag),
             part.len(),
             &[PAD_PKEY, PAD_PNAME, 0],
         );
 
         let o_join_pad_u64 = pad_join_pad(
             &with_flag(&o_join, 1),
-            &with_flag(&o_dis, 0),
+            &with_flag(&o_dis, res_flag),
             orders.len(),
             &[PAD_OKEY, PAD_OYEAR, 0],
         );
         let s_join_pad_u64 = pad_join_pad(
             &with_flag(&s_join, 1),
-            &with_flag(&s_dis, 0),
+            &with_flag(&s_dis, res_flag),
             supplier.len(),
             &[PAD_SKEY, PAD_SNAT, 0],
         );
         let n_join_pad_u64 = pad_join_pad(
             &with_flag(&n_join, 1),
-            &with_flag(&n_dis, 0),
+            &with_flag(&n_dis, res_flag),
             nation.len(),
             &[PAD_NKEY, PAD_NNAME, 0],
         );
         let ps_join_pad_u64 = pad_join_pad(
             &with_flag(&ps_join, 1),
-            &with_flag(&ps_dis, 0),
+            &with_flag(&ps_dis, res_flag),
             partsupp.len(),
             &[PAD_PSKEY, PAD_PSCOST, 0],
         );
         let l_join_pad_u64 = pad_join_pad(
             &with_flag(&l_join, 1),
-            &with_flag(&l_dis, 0),
+            &with_flag(&l_dis, res_flag),
             lineitem.len(),
             &[
                 PAD_LOKEY, PAD_LPKEY, PAD_LSKEY, PAD_LQTY, PAD_LEXT, PAD_LDISC, 0,
             ],
         );
+
+        // ---------------- sections of each partition group ----------------
+        // Every group is laid out [clean rows | residual rows | pad rows], in
+        // the relation order R_PART .. R_LINE. This is the boundary the two
+        // indicator selectors and the whole Pairwise Consistency Check read.
+        let mut pw_sect: [(usize, usize); 6] = [
+            (p_cln.len(), p_res.len()),
+            (s_join.len(), s_dis.len()),
+            (n_join.len(), n_dis.len()),
+            (o_join.len(), o_dis.len()),
+            (ps_join.len(), ps_dis.len()),
+            (l_join.len(), l_dis.len()),
+        ];
+        if all_clean {
+            for s in pw_sect.iter_mut() {
+                *s = (s.0 + s.1, 0);
+            }
+        }
+
+        // ---------------- derived key columns of condition (3) ----------------
+        // The seven raw key columns of the ten lookups are columns of the
+        // partition groups already, so the only witnesses left to build are the
+        // three derived ones: the packed partsupp key on the lineitem rows and the
+        // shifted nation key on the supplier and nation rows. Each covers the
+        // clean section of its group, which is the only section its selector
+        // enables, so together they state exactly pi_K(R^c).
+        let pw_s_nkey: Vec<u64> = s_join_pad_u64[..pw_sect[R_SUPP].0]
+            .iter()
+            .map(|r| r[1] + NAT_SHIFT)
+            .collect();
+        let pw_n_key: Vec<u64> = n_join_pad_u64[..pw_sect[R_NAT].0]
+            .iter()
+            .map(|r| r[0] + NAT_SHIFT)
+            .collect();
+        let pw_l_pskey: Vec<u64> = l_join_pad_u64[..pw_sect[R_LINE].0]
+            .iter()
+            .map(|r| r[1] * PS_SHIFT + r[2])
+            .collect();
 
         // 4) build profit table aligned to l_join_pad rows
         // On non-join rows (disjoin/pad), set profit row to PAD_* so later perms/sorts don’t require valid attachments.
@@ -1657,17 +1935,7 @@ impl<F: Field + Ord> TestChip<F> {
                     }
                 }
                 // partition side: 1 on the clean rows, 0 on the residual rows
-                for (idx, (n_cln, n_res)) in [
-                    (p_cln.len(), p_res.len()),
-                    (s_join.len(), s_dis.len()),
-                    (n_join.len(), n_dis.len()),
-                    (o_join.len(), o_dis.len()),
-                    (ps_join.len(), ps_dis.len()),
-                    (l_join.len(), l_dis.len()),
-                ]
-                .iter()
-                .enumerate()
-                {
+                for (idx, (n_cln, n_res)) in pw_sect.iter().enumerate() {
                     for i in 0..*n_cln {
                         self.config.q_cln_flag[idx].enable(&mut region, i)?;
                     }
@@ -1771,6 +2039,49 @@ impl<F: Field + Ord> TestChip<F> {
                     }
                 }
 
+                // ===================== PAIRWISE CONSISTENCY CHECK =====================
+                // condition (3) of the One-Pass OBJ. One selector per relation over
+                // the clean rows of its partition group, which is what pins the
+                // three derived key columns and what gates that relation's key
+                // column on both sides of the ten lookups. There is no table to
+                // fill: each direction of an edge looks straight into the other
+                // endpoint's clean key column.
+                for i in 0..pw_sect[R_PART].0 {
+                    self.config.q_pw_in[R_PART].enable(&mut region, i)?;
+                }
+                for i in 0..pw_sect[R_ORD].0 {
+                    self.config.q_pw_in[R_ORD].enable(&mut region, i)?;
+                }
+                for i in 0..pw_sect[R_PS].0 {
+                    self.config.q_pw_in[R_PS].enable(&mut region, i)?;
+                }
+                for i in 0..pw_sect[R_SUPP].0 {
+                    self.config.q_pw_in[R_SUPP].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "s_pw_nkey",
+                        self.config.s_pw_nkey,
+                        i,
+                        || Value::known(F::from(pw_s_nkey[i])),
+                    )?;
+                }
+                for i in 0..pw_sect[R_NAT].0 {
+                    self.config.q_pw_in[R_NAT].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "n_pw_key",
+                        self.config.n_pw_key,
+                        i,
+                        || Value::known(F::from(pw_n_key[i])),
+                    )?;
+                }
+                for i in 0..pw_sect[R_LINE].0 {
+                    self.config.q_pw_in[R_LINE].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "l_pw_pskey",
+                        self.config.l_pw_pskey,
+                        i,
+                        || Value::known(F::from(pw_l_pskey[i])),
+                    )?;
+                }
                 // enable table selectors for lookups: enable on full lengths (pads are allowed in table)
                 for i in 0..part.len() {
                     self.config.q_tbl_p.enable(&mut region, i)?;
@@ -2250,7 +2561,7 @@ impl<F: Field + Ord> TestChip<F> {
                     cp_mu.push((ta * ua, l_cln[i] * tc * uc));
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
-                if !tamper {
+                if !tamper && !all_clean {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R join|"
@@ -2347,7 +2658,7 @@ mod tests {
     use crate::data::data_processing;
 
     use chrono::{Datelike, NaiveDate};
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
     use halo2curves::pasta::{vesta, EqAffine, Fp};
 
     use halo2_proofs::{
@@ -2654,6 +2965,30 @@ mod tests {
         // every one of the six relations.
         let cond_hash = string_to_u64("orange olive puff midnight almond");
 
+        // The all-clean partition of the third direction below must really be
+        // wrong on this slice, or condition (3) would accept it and that
+        // direction would pass vacuously. Every lineitem row whose l_partkey is
+        // not one of the parts the predicate keeps is a dangling tuple on the
+        // lineitem -> part edge the moment the whole relation is declared clean:
+        // part^c can never hold a row the predicate dropped, because the link
+        // gate pads the clean indicator with 0.
+        let kept_pkeys: std::collections::HashSet<u64> = part
+            .iter()
+            .filter(|r| r[1] == cond_hash)
+            .map(|r| r[0])
+            .collect();
+        let dangling = lineitem
+            .iter()
+            .filter(|r| !kept_pkeys.contains(&r[1]))
+            .count();
+        assert!(
+            !kept_pkeys.is_empty() && dangling > 0,
+            "the slice has {} kept parts and {} lineitem rows dangling on the part edge, \
+             so the all-clean partition would be a legitimate reduced instance",
+            kept_pkeys.len(),
+            dangling
+        );
+
         let circuit = MyCircuit::<Fp> {
             part,
             supplier,
@@ -2684,6 +3019,29 @@ mod tests {
                 .iter()
                 .any(|f| format!("{:?}", f).contains("cardinality preservation")),
             "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: the escape condition (3) closes. The prover skips the
+        // reduction and declares every real tuple clean, which leaves the
+        // residual section empty. Conservation still holds and both channels of
+        // condition (4) then compute the same number on every row, so nothing in
+        // condition (1) or (4) objects. The partition is not the reduced
+        // instance though, and the dangling tuples counted above have no partner
+        // in the clean part of the adjacent relation, so a Pairwise Consistency
+        // lookup must reject.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        let verdict = unreduced.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected, but not through a Pairwise Consistency lookup: {:?}",
             failures
         );
     }

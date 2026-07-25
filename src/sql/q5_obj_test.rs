@@ -58,6 +58,22 @@
 //! `[clean rows | residual rows | pad rows]` inside the existing `*_out_pad`
 //! tables.
 //!
+//! UPDATE (condition (3) of the One-Pass OBJ):
+//! Pairwise Consistency is now two mutual Membership Checks per edge of the
+//! cluster tree, over the clean sections only:
+//!
+//!   edge (LS, CO) on `okey * SHIFT_NATION + nk_shift`:  LS^c <-> CO^c
+//!   edge (LS, NR) on `nk_shift`:                        LS^c <-> NR^c
+//!
+//! Four lookups between the clean key columns themselves, with no intermediate
+//! key table. `q5_obj.rs` has only the LS -> child direction, into advice columns
+//! (`co_key` / `nr_key`) filled from the full filtered bags: a dangling LS tuple
+//! is caught, because that direction is a real semijoin filter on the root, but a
+//! CO^c or NR^c tuple matching no clean LS tuple contributes to neither channel
+//! of condition (4) and is invisible, and nothing binds the two tables to the
+//! relations they claim to enumerate. The mirror directions close the first hole
+//! and dropping the tables closes the second.
+//!
 //! Everything else, including the group-by, the name attachment and the ORDER BY
 //! proof, is unchanged from `q5_obj.rs`.
 
@@ -98,6 +114,14 @@ pub(crate) const SHIFT_NATION: u64 = 1u64 << 8; // nationkey_shift <= 25+1 fits
 /// the cheat a residual-side-only argument misses, so the negative test in this
 /// module is what shows the Cardinality Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every tuple that passes its
+/// predicate clean, so all three residual sections are empty. Conservation still
+/// holds and both channels of condition (4) then agree row by row, so this is the
+/// escape that only Pairwise Consistency can close, and the negative direction
+/// for it in this module is what shows condition (3) is doing work.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -165,10 +189,14 @@ pub struct Q5Config<F: Field + Ord> {
     ls_part_pad: Vec<Column<Advice>>, // 5 cols: the tuple plus the clean flag
     perm_ls: PermAnyConfig,
 
-    co_key: Column<Advice>,
-    nr_key: Column<Advice>,
-
-    q_join_member: Selector, // enable membership lookups for ls_join rows
+    // -------- condition (3), Pairwise Consistency --------
+    // One complex selector per relation of the cluster tree, enabled over
+    // exactly the clean section of that relation's partition group. Each one is
+    // the input selector of the two lookups leaving its relation and the table
+    // selector of the two entering it.
+    q_pw_ls: Selector, // rows [0, |LS^c|) of ls_join
+    q_pw_co: Selector, // rows [0, |CO^c|) of co_out_pad
+    q_pw_nr: Selector, // rows [0, |NR^c|) of nr_out_pad
 
     // ---------------- Cardinality Preservation Check (condition (4)) ----------------
     // |R^c join| == |R join| over the cluster tree rooted at LS
@@ -650,23 +678,81 @@ impl<F: Field + Ord> Q5Chip<F> {
             });
         }
 
-        // ---------------- membership key tables ----------------
-        let q_join_member = meta.complex_selector();
-        let co_key = meta.advice_column();
-        let nr_key = meta.advice_column();
+        // ---------------- condition (3), Pairwise Consistency ----------------
+        // Two mutual Membership Checks per edge of the cluster tree, each looking
+        // one clean relation's key column up directly in the adjacent clean
+        // relation's key column. Two things were wrong before:
+        //
+        //  * only the LS -> child direction existed, so a CO^c or NR^c tuple whose
+        //    key matched no clean LS tuple contributed to neither channel of
+        //    condition (4) and was invisible: the certified clean instance could
+        //    carry dangling tuples in both child bags;
+        //  * the tables the LS direction looked into were plain advice columns
+        //    (`co_key` / `nr_key`) filled from the FULL filtered bags, and nothing
+        //    in the circuit bound them to the relation they claimed to enumerate,
+        //    so a prover could fill them with pi_K(LS^c) and pass for free.
+        //
+        // Looking the clean key columns up in each other, in both directions,
+        // removes the free advice and closes both holes: the two containments give
+        // the set equality condition (3) asks for, at one fewer advice column than
+        // the one-directional version cost.
+        //
+        // A lookup input is 0 on every row where its selector is off, and the
+        // table side is 0 on those rows too, so 0 is always in the table and the
+        // gated-off (and unassigned) rows cost nothing. Real orderkeys are at
+        // least 1 in TPC-H and every nationkey is stored shifted by +1, so both
+        // keys are nonzero on the rows that matter and the containment is over the
+        // real keys.
+        let q_pw_ls = meta.complex_selector();
+        let q_pw_co = meta.complex_selector();
+        let q_pw_nr = meta.complex_selector();
 
-        // join rows must be members of both sets
-        meta.lookup_any("CO member (ls_join)", |m| {
-            let q = m.query_selector(q_join_member);
-            let key = (m.query_advice(ls_join[0], Rotation::cur())
-                * Expression::Constant(F::from(SHIFT_NATION)))
-                + m.query_advice(ls_join[1], Rotation::cur());
-            vec![(q * key, m.query_advice(co_key, Rotation::cur()))]
+        // Key columns of the PARTITION groups, never of the base relations:
+        // ls_join is the clean section of the LS partition, and co_out_pad /
+        // nr_out_pad are laid out as [clean rows | residual rows | pad rows]. The
+        // (orderkey, nationkey_shift) key is packed inline with the same
+        // SHIFT_NATION the rest of the file uses, which is why neither side needs
+        // a materialized packed-key column of its own: co_pkey and ls_pkey live on
+        // the input side of the two permutations, in base-relation row order, so
+        // they are the wrong columns for this check.
+        let ls_ok = ls_join[0];
+        let ls_nk = ls_join[1];
+        let co_ok = co_out_pad[0];
+        let co_nk_p = co_out_pad[1];
+        let nr_nk = nr_out_pad[0];
+
+        // edge (LS, CO) on the packed (o_orderkey, nationkey_shift) key
+        meta.lookup_any("pw: LS^c pkey in CO^c pkey", move |m| {
+            let s = Expression::Constant(F::from(SHIFT_NATION));
+            let lhs = m.query_selector(q_pw_ls)
+                * (m.query_advice(ls_ok, Rotation::cur()) * s.clone()
+                    + m.query_advice(ls_nk, Rotation::cur()));
+            let rhs = m.query_selector(q_pw_co)
+                * (m.query_advice(co_ok, Rotation::cur()) * s
+                    + m.query_advice(co_nk_p, Rotation::cur()));
+            vec![(lhs, rhs)]
         });
-        meta.lookup_any("NR member (ls_join)", |m| {
-            let q = m.query_selector(q_join_member);
-            let nk = m.query_advice(ls_join[1], Rotation::cur());
-            vec![(q * nk, m.query_advice(nr_key, Rotation::cur()))]
+        meta.lookup_any("pw: CO^c pkey in LS^c pkey", move |m| {
+            let s = Expression::Constant(F::from(SHIFT_NATION));
+            let lhs = m.query_selector(q_pw_co)
+                * (m.query_advice(co_ok, Rotation::cur()) * s.clone()
+                    + m.query_advice(co_nk_p, Rotation::cur()));
+            let rhs = m.query_selector(q_pw_ls)
+                * (m.query_advice(ls_ok, Rotation::cur()) * s
+                    + m.query_advice(ls_nk, Rotation::cur()));
+            vec![(lhs, rhs)]
+        });
+
+        // edge (LS, NR) on nationkey_shift
+        meta.lookup_any("pw: LS^c nationkey in NR^c nationkey", move |m| {
+            let lhs = m.query_selector(q_pw_ls) * m.query_advice(ls_nk, Rotation::cur());
+            let rhs = m.query_selector(q_pw_nr) * m.query_advice(nr_nk, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
+        meta.lookup_any("pw: NR^c nationkey in LS^c nationkey", move |m| {
+            let lhs = m.query_selector(q_pw_nr) * m.query_advice(nr_nk, Rotation::cur());
+            let rhs = m.query_selector(q_pw_ls) * m.query_advice(ls_nk, Rotation::cur());
+            vec![(lhs, rhs)]
         });
 
         // ---------------- Cardinality Preservation Check (condition (4)) ----------------
@@ -919,10 +1005,9 @@ impl<F: Field + Ord> Q5Chip<F> {
             ls_part_pad,
             perm_ls,
 
-            co_key,
-            nr_key,
-
-            q_join_member,
+            q_pw_ls,
+            q_pw_co,
+            q_pw_nr,
 
             cp_agg_co,
             cp_agg_nr,
@@ -1103,6 +1188,17 @@ impl<F: Field + Ord> Q5Chip<F> {
             }
         }
 
+        // test hook only: no reduction at all. Every tuple that passes its own
+        // predicate is declared clean, so all three residual sections come out
+        // empty and both channels of condition (4) agree row by row. Only
+        // condition (3) can reject this.
+        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        if all_clean {
+            for b in ls_cln_b.iter_mut() {
+                *b = 1;
+            }
+        }
+
         let mut ls_join_u64: Vec<Vec<u64>> = vec![];
         let mut ls_dis_u64: Vec<Vec<u64>> = vec![];
         for (i, r) in ls_mat_u64.iter().enumerate() {
@@ -1123,12 +1219,16 @@ impl<F: Field + Ord> Q5Chip<F> {
         let cln_co: Vec<u64> = (0..orders.len())
             .map(|i| {
                 (co_keep_b[i]
-                    && cln_ls_keys.contains(&(co_pair_u64[i][0] * SHIFT_NATION + co_pair_u64[i][1])))
+                    && (all_clean
+                        || cln_ls_keys
+                            .contains(&(co_pair_u64[i][0] * SHIFT_NATION + co_pair_u64[i][1]))))
                     as u64
             })
             .collect();
         let cln_nr: Vec<u64> = (0..nation.len())
-            .map(|i| (nr_keep_b[i] && cln_ls_nks.contains(&nr_pair_u64[i][0])) as u64)
+            .map(|i| {
+                (nr_keep_b[i] && (all_clean || cln_ls_nks.contains(&nr_pair_u64[i][0]))) as u64
+            })
             .collect();
 
         // ---- clean indicator on both sides of the three Conservation Checks ----
@@ -1188,21 +1288,8 @@ impl<F: Field + Ord> Q5Chip<F> {
         let (co_out_pad_u64, co_cln_len, co_res_len) =
             split_clean(&co_pair_u64, &co_keep_b, &cln_co, co_total);
 
-        // key vectors for the ls_join membership lookups (condition (3))
-        let mut valid_co_keys: Vec<u64> = co_filtered
-            .iter()
-            .map(|r| r[0] * SHIFT_NATION + r[1])
-            .collect();
-        valid_co_keys.push(0);
-        valid_co_keys.push(MAX_SENTINEL);
-        valid_co_keys.sort();
-        valid_co_keys.dedup();
-
-        let mut valid_nr_keys: Vec<u64> = nr_filtered.iter().map(|r| r[0]).collect();
-        valid_nr_keys.push(0);
-        valid_nr_keys.push(MAX_SENTINEL);
-        valid_nr_keys.sort();
-        valid_nr_keys.dedup();
+        // condition (3) needs no key vectors any more: the four Pairwise
+        // Consistency lookups run between the clean key columns themselves.
 
         // the partition side of the LS Conservation Check carries the flag as a
         // fifth column: 1 on the clean rows, 0 on the residual and pad rows
@@ -1745,42 +1832,20 @@ impl<F: Field + Ord> Q5Chip<F> {
                     self.config.q_res_flag[2].enable(&mut region, i)?;
                 }
 
-                // ---------- key tables (row0 dummy) ----------
-                region.assign_advice(
-                    || "co_key0",
-                    self.config.co_key,
-                    0,
-                    || Value::known(F::from(0)),
-                )?;
-                region.assign_advice(
-                    || "nr_key0",
-                    self.config.nr_key,
-                    0,
-                    || Value::known(F::from(0)),
-                )?;
-
-                for i in 0..valid_co_keys.len() {
-                    let k = valid_co_keys[i];
-                    region.assign_advice(
-                        || "co_key",
-                        self.config.co_key,
-                        i + 1,
-                        || Value::known(F::from(k)),
-                    )?;
-                }
-                for i in 0..valid_nr_keys.len() {
-                    let k = valid_nr_keys[i];
-                    region.assign_advice(
-                        || "nr_key",
-                        self.config.nr_key,
-                        i + 1,
-                        || Value::known(F::from(k)),
-                    )?;
-                }
-
-                // join member selector (ONLY real join rows)
+                // ---------- condition (3), Pairwise Consistency ----------
+                // One selector per relation, enabled over exactly the clean
+                // section of its partition group. Each one is both the input
+                // selector of the lookups leaving that relation and the table
+                // selector of the lookups entering it, so there is no free advice
+                // anywhere in the check.
                 for i in 0..ls_join_u64.len() {
-                    self.config.q_join_member.enable(&mut region, i)?;
+                    self.config.q_pw_ls.enable(&mut region, i)?;
+                }
+                for i in 0..co_cln_len {
+                    self.config.q_pw_co.enable(&mut region, i)?;
+                }
+                for i in 0..nr_cln_len {
+                    self.config.q_pw_nr.enable(&mut region, i)?;
                 }
 
                 // ===================== CARDINALITY PRESERVATION CHECK =====================
@@ -1844,7 +1909,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     self.config.q_cp_mu.enable(&mut region, i)?;
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
-                if !tamper {
+                if !tamper && !all_clean {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R join|"
@@ -2285,7 +2350,7 @@ mod tests {
 
     use crate::data::data_processing;
     use chrono::{DateTime, NaiveDate, Utc};
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
     use halo2curves::pasta::{vesta, EqAffine, Fp};
     use rand::rngs::OsRng;
 
@@ -2650,6 +2715,27 @@ mod tests {
                 .iter()
                 .any(|f| format!("{:?}", f).contains("cardinality preservation")),
             "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: no reduction at all, every tuple that passes its own
+        // predicate declared clean and all three residual sections empty.
+        // Conservation holds and condition (4) is satisfied for free, since both
+        // channels then agree row by row, so this is the escape that condition (3)
+        // exists to close. The two child bags now carry dangling tuples as well,
+        // which is what the mirror direction of each edge catches.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        let verdict = unreduced.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted an unreduced clean instance");
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected, but not through a Pairwise Consistency lookup: {:?}",
             failures
         );
     }

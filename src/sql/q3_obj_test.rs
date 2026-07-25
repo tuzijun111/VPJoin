@@ -65,6 +65,14 @@ const PAD_REV: u64 = 0; // pad revenue (min -> last when DESC)
 /// is what shows the Cardinality Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every tuple that passes its
+/// predicate clean. Conservation still holds and both channels of condition (4)
+/// then agree row by row, so this is the escape that only Pairwise Consistency
+/// can close, and the negative direction for it in this module is what shows
+/// condition (3) is doing work.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
@@ -131,16 +139,8 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     q_in_o_okey_in_l: Selector, // o_join.orderkey -> l_join table
 
     // table selectors (gate the table side!)
-    q_tbl_c_cust: Selector,
-    q_tbl_o_cust: Selector,
-    q_tbl_o_okey: Selector,
-    q_tbl_l_okey: Selector,
 
     // key-table advice columns
-    tbl_c_custkey: Column<Advice>, // values: [0] + uniq(c_join.c_custkey)
-    tbl_o_custkey: Column<Advice>, // values: [0] + uniq(o_join.o_custkey)
-    tbl_o_orderkey: Column<Advice>, // values: [0] + uniq(o_join.o_orderkey)
-    tbl_l_orderkey: Column<Advice>, // values: [0] + uniq(l_join.l_orderkey)
 
     // ---------- l_join -> l_sorted permutation ----------
     l_sorted: Vec<Column<Advice>>, // 4 cols (same as lineitem)
@@ -508,55 +508,67 @@ impl<F: Field + Ord> TestChip<F> {
         let q_in_l_okey_in_o = meta.complex_selector();
         let q_in_o_okey_in_l = meta.complex_selector();
 
-        let q_tbl_c_cust = meta.complex_selector();
-        let q_tbl_o_cust = meta.complex_selector();
-        let q_tbl_o_okey = meta.complex_selector();
-        let q_tbl_l_okey = meta.complex_selector();
 
-        let tbl_c_custkey = meta.advice_column();
-        let tbl_o_custkey = meta.advice_column();
-        let tbl_o_orderkey = meta.advice_column();
-        let tbl_l_orderkey = meta.advice_column();
 
-        // o_join.o_custkey ∈ c_join.c_custkey
-        meta.lookup_any("o_join.custkey in c_join", |m| {
-            let q_in = m.query_selector(q_in_o_cust_in_c);
-            let q_t = m.query_selector(q_tbl_c_cust);
+        // -------- condition (3), Pairwise Consistency --------
+        // Two mutual Membership Checks per tree edge, each looking one clean
+        // relation's key column up directly in the adjacent clean relation's key
+        // column. q3_obj.rs routed these through intermediate `tbl_*` advice
+        // columns holding the deduplicated key sets, but nothing bound those
+        // columns to the relations they claimed to enumerate: a prover could put
+        // o_join's custkeys into the table o_join looks into and c_join's into
+        // the table c_join looks into, and all four lookups would pass for an
+        // arbitrary partition. Looking the columns up in each other removes the
+        // free advice, and with it the escape, at one fewer column per edge
+        // direction.
+        //
+        // A lookup input is 0 on every row where its selector is off, and the
+        // table side is 0 on those rows too, so 0 is always in the table and the
+        // gated-off rows cost nothing. Real custkeys and orderkeys are at least
+        // 1 in TPC-H, so the containment is over the real keys.
+        let mut pw_edge = |name: &'static str,
+                           q_in: Selector,
+                           in_col: Column<Advice>,
+                           q_t: Selector,
+                           tbl_col: Column<Advice>| {
+            meta.lookup_any(name, move |m| {
+                let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
+                let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                vec![(lhs, rhs)]
+            });
+        };
 
-            let lhs = q_in * m.query_advice(o_join[2], Rotation::cur()); // o_custkey
-            let rhs = q_t * m.query_advice(tbl_c_custkey, Rotation::cur());
-            vec![(lhs, rhs)]
-        });
+        // edge (orders, customer) on custkey
+        pw_edge(
+            "pw: o_join.custkey in c_join.custkey",
+            q_in_o_cust_in_c,
+            o_join[2],
+            q_in_c_cust_in_o,
+            c_join[1],
+        );
+        pw_edge(
+            "pw: c_join.custkey in o_join.custkey",
+            q_in_c_cust_in_o,
+            c_join[1],
+            q_in_o_cust_in_c,
+            o_join[2],
+        );
 
-        // c_join.c_custkey ∈ o_join.o_custkey
-        meta.lookup_any("c_join.custkey in o_join", |m| {
-            let q_in = m.query_selector(q_in_c_cust_in_o);
-            let q_t = m.query_selector(q_tbl_o_cust);
-
-            let lhs = q_in * m.query_advice(c_join[1], Rotation::cur()); // c_custkey
-            let rhs = q_t * m.query_advice(tbl_o_custkey, Rotation::cur());
-            vec![(lhs, rhs)]
-        });
-
-        // l_join.l_orderkey ∈ o_join.o_orderkey
-        meta.lookup_any("l_join.orderkey in o_join", |m| {
-            let q_in = m.query_selector(q_in_l_okey_in_o);
-            let q_t = m.query_selector(q_tbl_o_okey);
-
-            let lhs = q_in * m.query_advice(l_join[0], Rotation::cur()); // l_orderkey
-            let rhs = q_t * m.query_advice(tbl_o_orderkey, Rotation::cur());
-            vec![(lhs, rhs)]
-        });
-
-        // o_join.o_orderkey ∈ l_join.l_orderkey
-        meta.lookup_any("o_join.orderkey in l_join", |m| {
-            let q_in = m.query_selector(q_in_o_okey_in_l);
-            let q_t = m.query_selector(q_tbl_l_okey);
-
-            let lhs = q_in * m.query_advice(o_join[3], Rotation::cur()); // o_orderkey
-            let rhs = q_t * m.query_advice(tbl_l_orderkey, Rotation::cur());
-            vec![(lhs, rhs)]
-        });
+        // edge (orders, lineitem) on orderkey
+        pw_edge(
+            "pw: l_join.orderkey in o_join.orderkey",
+            q_in_l_okey_in_o,
+            l_join[0],
+            q_in_o_okey_in_l,
+            o_join[3],
+        );
+        pw_edge(
+            "pw: o_join.orderkey in l_join.orderkey",
+            q_in_o_okey_in_l,
+            o_join[3],
+            q_in_l_okey_in_o,
+            l_join[0],
+        );
 
         // ---------------- Cardinality Preservation Check (condition (4)) ----------------
         // One fixed column serves every Lt chip of the check, so the whole
@@ -875,15 +887,7 @@ impl<F: Field + Ord> TestChip<F> {
             q_in_l_okey_in_o,
             q_in_o_okey_in_l,
 
-            q_tbl_c_cust,
-            q_tbl_o_cust,
-            q_tbl_o_okey,
-            q_tbl_l_okey,
 
-            tbl_c_custkey,
-            tbl_o_custkey,
-            tbl_o_orderkey,
-            tbl_l_orderkey,
 
             q_line,
             q_first,
@@ -1039,6 +1043,17 @@ impl<F: Field + Ord> TestChip<F> {
             noncontributing_lineitems.extend(l_drop2);
         }
 
+        // test hook only: declare everything clean, i.e. no reduction at all
+        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        if all_clean {
+            contributing_orders = o_combined.clone();
+            contributing_customers = c_combined.clone();
+            contributing_lineitems = l_combined.clone();
+            noncontributing_orders.clear();
+            noncontributing_customers.clear();
+            noncontributing_lineitems.clear();
+        }
+
         let contributing_o_custkeys: HashSet<u64> =
             contributing_orders.iter().map(|o| o[2]).collect();
         let contributing_o_orderkeys: HashSet<u64> =
@@ -1055,18 +1070,6 @@ impl<F: Field + Ord> TestChip<F> {
             noncontributing_customers.clone(),
             noncontributing_lineitems.clone(),
         ];
-
-        fn uniq_keys(mut v: Vec<u64>) -> Vec<u64> {
-            v.push(0); // dummy so gated-off inputs (=>0) always in-table
-            v.sort();
-            v.dedup();
-            v
-        }
-
-        let c_join_keys_tbl: Vec<u64> = uniq_keys(join_value[1].iter().map(|r| r[1]).collect()); // c_custkey
-        let o_join_cust_tbl: Vec<u64> = uniq_keys(join_value[0].iter().map(|r| r[2]).collect()); // o_custkey
-        let o_join_okey_tbl: Vec<u64> = uniq_keys(join_value[0].iter().map(|r| r[3]).collect()); // o_orderkey
-        let l_join_okey_tbl: Vec<u64> = uniq_keys(join_value[2].iter().map(|r| r[0]).collect()); // l_orderkey
 
         // ---------------- permutation padding helpers ----------------
         fn pad_filter_u64(rows: &[Vec<u64>], keep: &[bool], pad: &[u64]) -> Vec<Vec<u64>> {
@@ -1117,20 +1120,21 @@ impl<F: Field + Ord> TestChip<F> {
             .iter()
             .zip(o_keep.iter())
             .map(|(o, &k)| {
-                (k && c_keys.contains(&o[2])
-                    && l_orderkeys.contains(&o[3])
-                    && !hidden_orders.contains(&(o[2], o[3]))) as u64
+                (k && (all_clean
+                    || (c_keys.contains(&o[2])
+                        && l_orderkeys.contains(&o[3])
+                        && !hidden_orders.contains(&(o[2], o[3]))))) as u64
             })
             .collect();
         let cln_c: Vec<u64> = customer
             .iter()
             .zip(c_keep.iter())
-            .map(|(c, &k)| (k && contributing_o_custkeys.contains(&c[1])) as u64)
+            .map(|(c, &k)| (k && (all_clean || contributing_o_custkeys.contains(&c[1]))) as u64)
             .collect();
         let cln_l: Vec<u64> = lineitem
             .iter()
             .zip(l_keep.iter())
-            .map(|(l, &k)| (k && contributing_o_orderkeys.contains(&l[0])) as u64)
+            .map(|(l, &k)| (k && (all_clean || contributing_o_orderkeys.contains(&l[0]))) as u64)
             .collect();
 
         // the indicator rides along as the last column of each base relation,
@@ -1544,76 +1548,12 @@ impl<F: Field + Ord> TestChip<F> {
                 }
                 let (cp_all, cp_cln) =
                     assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
-                if !tamper {
+                if !tamper && !all_clean {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R join|"
                     );
                 }
-
-                let h = *[
-                    customer.len(),
-                    orders.len(),
-                    lineitem.len(),
-                    join_value[0].len(),
-                    join_value[1].len(),
-                    join_value[2].len(),
-                ]
-                .iter()
-                .max()
-                .unwrap();
-
-                // helper: fill a key-table column up to h rows, gating only real table rows
-                fn assign_key_table<F: Field + Ord>(
-                    region: &mut Region<'_, F>,
-                    col: Column<Advice>,
-                    q_tbl: Selector,
-                    keys: &[u64],
-                    h: usize,
-                    name: &'static str,
-                ) -> Result<(), Error> {
-                    for i in 0..h {
-                        let v = if i < keys.len() { keys[i] } else { 0u64 };
-                        region.assign_advice(|| name, col, i, || Value::known(F::from(v)))?;
-                        if i < keys.len() {
-                            q_tbl.enable(region, i)?;
-                        }
-                    }
-                    Ok(())
-                }
-
-                assign_key_table::<F>(
-                    &mut region,
-                    self.config.tbl_c_custkey,
-                    self.config.q_tbl_c_cust,
-                    &c_join_keys_tbl,
-                    h,
-                    "tbl_c_custkey",
-                )?;
-                assign_key_table::<F>(
-                    &mut region,
-                    self.config.tbl_o_custkey,
-                    self.config.q_tbl_o_cust,
-                    &o_join_cust_tbl,
-                    h,
-                    "tbl_o_custkey",
-                )?;
-                assign_key_table::<F>(
-                    &mut region,
-                    self.config.tbl_o_orderkey,
-                    self.config.q_tbl_o_okey,
-                    &o_join_okey_tbl,
-                    h,
-                    "tbl_o_orderkey",
-                )?;
-                assign_key_table::<F>(
-                    &mut region,
-                    self.config.tbl_l_orderkey,
-                    self.config.q_tbl_l_okey,
-                    &l_join_okey_tbl,
-                    h,
-                    "tbl_l_orderkey",
-                )?;
 
                 // inputs: only enable on real rows of each join table
                 for i in 0..join_value[0].len() {
@@ -1852,7 +1792,7 @@ mod tests {
     use super::MyCircuit;
     use crate::data::data_processing;
     use chrono::{DateTime, NaiveDate, Utc};
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
     use std::marker::PhantomData;
     use std::sync::atomic::Ordering;
 
@@ -2339,6 +2279,25 @@ mod tests {
                 .iter()
                 .any(|f| format!("{:?}", f).contains("cardinality preservation")),
             "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: no reduction at all, every tuple that passes its
+        // predicate declared clean. Conservation holds and condition (4) is
+        // satisfied for free, since both channels then agree row by row, so this
+        // is the escape that condition (3) exists to close.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        let verdict = unreduced.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted an unreduced clean instance");
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected, but not through a Pairwise Consistency lookup: {:?}",
             failures
         );
     }

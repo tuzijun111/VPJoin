@@ -82,6 +82,21 @@
 //! that went to `R^c`. Host side, `R^c` is the fully reduced instance: on a
 //! two-node tree the semijoin reduction is exact, so the clean tuples are
 //! exactly the ones that extend to a full 4-cycle.
+//!
+//! Condition (3), Pairwise Consistency, is what makes that comparison
+//! meaningful, and this file adds it too. Without it the all-clean partition,
+//! `R^c = R` with `R^r` empty, conserves both bags and makes the two channels
+//! of the check agree on every row, so `sum_cln == sum_all` holds for free and
+//! nothing forces the clean side to be the reduced instance. On the single bag
+//! tree edge the condition is
+//!
+//!   pi_K(t12^c) == pi_K(t34^c),      K = pack2(A,C),
+//!
+//! realized as two mutual membership lookups directly between the separator key
+//! columns of the two clean sections, each column being the table of the other
+//! direction. There is no intermediate key table left to forge, so a dangling
+//! bag tuple kept on the clean side has no partner in the other bag's clean
+//! section, its key is absent from the other column, and the lookup fails.
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
@@ -123,6 +138,13 @@ pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
 /// a residual-side-only argument misses, so the negative test in this module is
 /// what shows the Cardinality Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple of both bags
+/// clean, leaving the residual side empty. Conservation still holds and both
+/// channels of condition (4) then agree on every row, so this is exactly the
+/// escape that Pairwise Consistency has to close.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -1437,6 +1459,16 @@ pub struct Cycle4OrderedConfig<F: Field + Ord> {
     perm_t34: PermAnyConfig,
     q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1   ([t12, t34])
     q_res_flag: Vec<Selector>, // rows of R^r: flag == 0
+
+    // ---------------- Pairwise Consistency ----------------
+    // condition (3): pi_K(t12^c) == pi_K(t34^c) on the one bag tree edge.
+    // Every vector below is indexed [t12, t34].
+    pw_key: Vec<Column<Advice>>, // packed separator key of the partition rows
+    q_pw_key: Vec<Selector>,     // pins pw_key over the clean rows
+    // Enabled over exactly the clean rows of its bag. It gates the input side of
+    // its own direction and the table side of the other one, so the two lookups
+    // need nothing beyond these two columns and these two selectors.
+    q_pw_in: Vec<Selector>,
 }
 
 #[derive(Clone, Debug)]
@@ -1840,6 +1872,94 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             });
         }
 
+        // ================= Pairwise Consistency (condition (3)) =================
+        // pi_K(R_i^c) == pi_K(R_j^c) on every join tree edge. Here the bag tree
+        // has one edge, t12 -- t34 on the packed separator key pack2(A,C), so
+        // the condition is two mutual Membership Checks between the clean
+        // sections of the two partitions.
+        //
+        // Both sides read the *partition* columns, whose tuples the Conservation
+        // Check above ties to the bag rows: restricted to the clean rows, the
+        // separator key of that group is exactly pi_K(R^c). A lookup over the
+        // bag rows instead would certify membership in R_j, which is the weaker
+        // statement the four bag lookups already make.
+        //
+        // t12_part_pad is (A,B,C,r1_eid,r2_eid,c) and t34_part_pad is
+        // (C,D,A,r3_eid,r4_eid,c), so the same packed key reads off different
+        // columns on the two sides. Folding it into one column per bag keeps
+        // both lookups at the degree of the circuit's other membership
+        // arguments, and reuses the packing the previous round already fixed.
+        let pw_key = (0..2).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let q_pw_key = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
+        for (idx, (a_col, c_col)) in [
+            (t12_part_pad[0], t12_part_pad[2]),
+            (t34_part_pad[2], t34_part_pad[0]),
+        ]
+        .iter()
+        .copied()
+        .enumerate()
+        {
+            let q = q_pw_key[idx];
+            let key_col = pw_key[idx];
+            meta.create_gate("pw: clean key = pack2(A,C)", move |m| {
+                let q = m.query_selector(q);
+                let a = m.query_advice(a_col, Rotation::cur());
+                let c = m.query_advice(c_col, Rotation::cur());
+                let packed = a * Expression::Constant(F::from(PACK_SHIFT)) + c;
+                vec![q * (m.query_advice(key_col, Rotation::cur()) - packed)]
+            });
+        }
+
+        // The two containments run directly between `pw_key[0]` and `pw_key[1]`.
+        // The earlier round routed each of them through an intermediate advice
+        // column holding [0] ++ uniq(keys of the other bag's clean section), but
+        // nothing in the circuit bound that column to the bag it claimed to
+        // enumerate: a prover could put t12's clean keys in the table t12 looks
+        // into and t34's in the table t34 looks into, and both lookups would pass
+        // for an arbitrary partition, which made condition (3) vacuous. Looking
+        // the two key columns up in each other leaves no free advice, and costs
+        // one advice column and one complex selector per direction less.
+        //
+        // The selectors must be complex: a simple selector may not appear in a
+        // lookup expression, so the q_cln_flag pair of the Conservation Check
+        // cannot be reused here. Each one now gates both the input side of its
+        // own direction and the table side of the other.
+        let q_pw_in = (0..2).map(|_| meta.complex_selector()).collect::<Vec<_>>();
+
+        // On every row where a selector is off both sides of its lookup read as
+        // 0, so 0 is always in the table and the gated-off rows cost nothing. The
+        // real keys are pack2(A,C) = A*2^32 + C over node ids shifted by SHIFT_ID,
+        // hence at least 2^32 + 1, so the containment is over the real keys.
+        let mut pw_edge = |name: &'static str,
+                           q_in: Selector,
+                           in_col: Column<Advice>,
+                           q_t: Selector,
+                           tbl_col: Column<Advice>| {
+            meta.lookup_any(name, move |m| {
+                let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
+                let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                vec![(lhs, rhs)]
+            });
+        };
+
+        // pi_K(t12^c) subset of pi_K(t34^c): a Bag1 tuple left on the clean side
+        // with no clean Bag2 partner is rejected here. The mirror direction makes
+        // the two key sets equal rather than merely nested.
+        pw_edge(
+            "pw: t12^c key in t34^c",
+            q_pw_in[0],
+            pw_key[0],
+            q_pw_in[1],
+            pw_key[1],
+        );
+        pw_edge(
+            "pw: t34^c key in t12^c",
+            q_pw_in[1],
+            pw_key[1],
+            q_pw_in[0],
+            pw_key[0],
+        );
+
         // -------- the two channels over the single bag tree edge --------
         // One fixed column serves every Lt chip of the check, so the whole
         // check costs a single u8 range table.
@@ -1946,6 +2066,9 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             perm_t34,
             q_cln_flag,
             q_res_flag,
+            pw_key,
+            q_pw_key,
+            q_pw_in,
         }
     }
 
@@ -2087,13 +2210,27 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     }
                 }
 
+                // test hook only: skip the reduction and declare every real
+                // tuple of both bags clean, which leaves the residual side
+                // empty. Conservation still holds and both channels of
+                // condition (4) then agree on every row, so only Pairwise
+                // Consistency can see the dangling tuples.
+                let mark_all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+                if mark_all_clean {
+                    cln12 = pred12.clone();
+                }
+
                 let clean_keys12: HashSet<u64> = (0..n12)
                     .filter(|&i| cln12[i] == 1)
                     .map(|i| key12[i])
                     .collect();
-                let cln34: Vec<u64> = (0..n34)
-                    .map(|i| (keep34[i] == 1 && clean_keys12.contains(&key34[i])) as u64)
-                    .collect();
+                let cln34: Vec<u64> = if mark_all_clean {
+                    keep34.clone()
+                } else {
+                    (0..n34)
+                        .map(|i| (keep34[i] == 1 && clean_keys12.contains(&key34[i])) as u64)
+                        .collect()
+                };
 
                 // both sides of the two Conservation Checks
                 let pad_bag: [u64; 6] = [PAD_U64, PAD_U64, PAD_U64, PAD_U64, PAD_U64, 0];
@@ -2514,6 +2651,38 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     cfg.q_res_flag[0].enable(&mut region, i)?;
                 }
 
+                // ============== PAIRWISE CONSISTENCY (condition (3)) ==============
+                // The two key sets of the one bag tree edge, read off the clean
+                // sections of the two partitions rather than off the bag rows,
+                // and each of them looked up in the other. `part12` is
+                // (A,B,C,...) and `part34` is (C,D,A,...), so the shared key
+                // pack2(A,C) reads off different columns on the two sides, the
+                // same way the "pw: clean key = pack2(A,C)" gate does.
+                //
+                // There is no key table to fill: the column of one bag is the
+                // table of the other direction, so `q_pw_in[r]` over the clean
+                // rows of bag r is all the gating either lookup needs.
+                let pw_keys: [Vec<u64>; 2] = [
+                    (0..n_cln12)
+                        .map(|i| pack2(part12[i][0], part12[i][2]))
+                        .collect(),
+                    (0..n_cln34)
+                        .map(|i| pack2(part34[i][2], part34[i][0]))
+                        .collect(),
+                ];
+                for r in 0..2 {
+                    for (i, &k) in pw_keys[r].iter().enumerate() {
+                        cfg.q_pw_key[r].enable(&mut region, i)?;
+                        cfg.q_pw_in[r].enable(&mut region, i)?;
+                        region.assign_advice(
+                            || "pw_key",
+                            cfg.pw_key[r],
+                            i,
+                            || Value::known(F::from(k)),
+                        )?;
+                    }
+                }
+
                 // ============== CARDINALITY PRESERVATION CHECK ==============
                 // Parent side of the single bag tree edge: fetch both sigma
                 // values for this Bag1 row's separator key, or certify with a
@@ -2534,7 +2703,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     cfg.q_cp_mu.enable(&mut region, i)?;
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &cfg.cp_root, &cp_mu)?;
-                if !tamper {
+                if !tamper && !mark_all_clean {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R join|"
@@ -2617,7 +2786,7 @@ mod tests {
     use super::*;
     use crate::data::graph_data_processing::read_edges;
     use crate::data::graph_data_processing::read_edges_csv;
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
 
     use halo2_proofs::{
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
@@ -2866,9 +3035,10 @@ mod tests {
         edges
     }
 
-    /// Fast correctness check of the Cardinality Preservation Check: a
-    /// truncated slice of the dataset under MockProver, which verifies every
-    /// gate, shuffle and lookup of the circuit without paying for a real proof.
+    /// Fast correctness check of the Cardinality Preservation Check and of
+    /// Pairwise Consistency: a truncated slice of the dataset under MockProver,
+    /// which verifies every gate, shuffle and lookup of the circuit without
+    /// paying for a real proof.
     #[test]
     fn test_cardinality_preservation() {
         let k = 15;
@@ -2878,6 +3048,45 @@ mod tests {
         assert!(
             cnt > 0,
             "the slice has no 4-cycle, the test would be vacuous"
+        );
+
+        // The third direction below only bites if the slice really has dangling
+        // bag tuples: with none of them the all-clean partition would be the
+        // reduced instance and condition (3) would rightly accept it. Count
+        // them on both ends of the bag tree edge, the same way `assign` does.
+        let derived = gq4_derive(&edges);
+        let kept34_keys: HashSet<u64> = derived
+            .t34
+            .iter()
+            .filter(|&&(c, d, ..)| c < d)
+            .map(|&(c, _d, a, ..)| pack2(a, c))
+            .collect();
+        let pred12_keys: HashSet<u64> = derived
+            .t12
+            .iter()
+            .filter(|&&(a, b, c, ..)| a < b && b < c)
+            .map(|&(a, _b, c, ..)| pack2(a, c))
+            .collect();
+        let dangling12 = derived
+            .t12
+            .iter()
+            .filter(|&&(a, b, c, ..)| a < b && b < c && !kept34_keys.contains(&pack2(a, c)))
+            .count();
+        let dangling34 = derived
+            .t34
+            .iter()
+            .filter(|&&(c, d, a, ..)| c < d && !pred12_keys.contains(&pack2(a, c)))
+            .count();
+        println!(
+            "[gq4 cp] |t12|={} |t34|={} dangling: t12={} t34={}",
+            derived.t12.len(),
+            derived.t34.len(),
+            dangling12,
+            dangling34
+        );
+        assert!(
+            dangling12 + dangling34 > 0,
+            "the slice has no dangling bag tuple, the all-clean direction would be vacuous"
         );
 
         let circuit = MyCircuit::<Fp> {
@@ -2911,6 +3120,28 @@ mod tests {
                 .iter()
                 .any(|f| format!("{:?}", f).contains("cardinality preservation")),
             "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: the escape that Pairwise Consistency closes. Every
+        // real bag tuple is declared clean and the residual side is left empty,
+        // so both Conservation Checks still pass and the two channels of
+        // condition (4) compute the same number on every row. Only condition
+        // (3) can see the dangling tuples counted above, and it must, through a
+        // "pw: " lookup.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let all_clean = MockProver::run(k, &circuit, vec![vec![Fp::from(cnt)]]).unwrap();
+        let verdict = all_clean.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
+        println!("[gq4 cp] all-clean failures: {}", failures.len());
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected, but not through a Pairwise Consistency lookup: {:?}",
             failures
         );
     }

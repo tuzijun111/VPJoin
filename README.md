@@ -195,11 +195,11 @@ VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-
 VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
 ```
 
-**8. The two realizations of OBJ condition (4).** Every query ships twice: `*_obj.rs` carries
-the earlier residual-side condition and `*_obj_test.rs` carries the Cardinality Preservation
-Check, with the same witness, the same aggregation and the same degree, so the two are directly
-comparable. `VPJOIN_OBJ=test` selects the second everywhere, and the reported `config` column
-gains a `+cp` suffix so a results file keeps the two apart:
+**8. The two realizations of the One-Pass OBJ.** Every query ships twice. `*_obj.rs` is the
+earlier circuit and `*_obj_test.rs` the current one, with the same witness, the same aggregation
+and the same degree, so the two are directly comparable. `VPJOIN_OBJ=test` selects the second
+everywhere, and the reported `config` column gains a `+cp` suffix so a results file keeps the two
+apart:
 
 ```bash
 VPJOIN_OBJ=test cargo run --bin vpjoin_bench -- baseline
@@ -214,9 +214,17 @@ still hold and only condition (4) can catch the cheat:
 RUST_MIN_STACK=33554432 cargo test --lib test_cardinality_preservation
 ```
 
-What the check costs in the arithmetization, per query and independently of the data, is
+What the two differ by in the arithmetization, per query and independently of the data, is
 reported by:
 
 ```bash
 cargo run --release --bin obj_gate_cost
 ```
+
+Those deltas are not all the same quantity, and the tool says so at the end of its output. Q3
+and Q5 already carried a clean/residual partition and a residual-side condition (4), so their
+delta is close to the swap described above. The other seven never partitioned at all: their
+`*_obj.rs` verifies the join with one-directional lookups from a root relation, so their delta
+pays for the whole gate that was missing, conditions (1), (3) and (4) together. GQ1 is the row
+that isolates the incremental cost of the clean channel, because that circuit already ran the
+single-channel propagation over the inputs.
