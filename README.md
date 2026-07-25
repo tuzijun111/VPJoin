@@ -30,7 +30,17 @@ achieved entirely for free** with zero padding overhead. The gate enforces four 
 - **Conservation** -- every original tuple appears in exactly one group (permutation argument)
 - **Disjointness** -- clean and residual groups share no tuples (non-membership check)
 - **Pairwise Consistency** -- clean tuples in neighboring relations agree on join keys (lookup arguments)
-- **Completeness** -- no valid join result hides among the residuals (semijoin pass)
+- **Cardinality Preservation** -- the clean join and the input join have the same size, so no
+  valid join result hides among the residuals
+
+Cardinality preservation replaced an earlier residual-side condition, which asked only that a
+semijoin reduction over the residual relations empty at the root. That detects a join witness
+lying entirely on the residual side but not one mixing clean and residual tuples, since a tuple
+wrongly moved to the residual whose join partners stay clean leaves no trace there at all. The
+current condition counts instead: the clean join is always contained in the input join, so equal
+cardinality forces the two to be the same multiset. Both cardinalities come from one traversal
+of the join tree carrying two multiplicities per tuple, one over the inputs and one over the
+clean instance, and a single equality constraint compares the two root sums.
 
 ### Aggregation Without Join Materialization
 
@@ -55,6 +65,8 @@ src/
   circuits/       # Reusable circuit gadgets (inclusion checks, permutations, Merkle trees)
   sql/            # TPC-H query circuits (Q3, Q5, Q8, Q9, Q18)
   graph_sql/      # Graph pattern query circuits (GQ1--GQ4)
+  circuits/card_preserve.rs  # Cardinality Preservation Check: the two-channel
+                             # multiplicity propagation behind OBJ condition (4)
   data/           # TPC-H dataset files and parsing utilities
   graph_data/     # Network dataset files and parsing
   proof/          # Persisted public parameters (param15..param19) and some proof artifacts
@@ -183,4 +195,28 @@ VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-
 VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
 ```
 
+**8. The two realizations of OBJ condition (4).** Every query ships twice: `*_obj.rs` carries
+the earlier residual-side condition and `*_obj_test.rs` carries the Cardinality Preservation
+Check, with the same witness, the same aggregation and the same degree, so the two are directly
+comparable. `VPJOIN_OBJ=test` selects the second everywhere, and the reported `config` column
+gains a `+cp` suffix so a results file keeps the two apart:
 
+```bash
+VPJOIN_OBJ=test cargo run --bin vpjoin_bench -- baseline
+```
+
+Each `*_obj_test.rs` carries its own fast correctness test, which checks the circuit under
+`MockProver` on a truncated slice of the dataset and then re-runs it with one joinable tuple
+hidden in the residual side and the neighbours re-reduced around it, so that conditions (1)-(3)
+still hold and only condition (4) can catch the cheat:
+
+```bash
+RUST_MIN_STACK=33554432 cargo test --lib test_cardinality_preservation
+```
+
+What the check costs in the arithmetization, per query and independently of the data, is
+reported by:
+
+```bash
+cargo run --release --bin obj_gate_cost
+```
