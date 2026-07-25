@@ -239,36 +239,48 @@ pub enum Mode {
 /// overflow `k=21` (also measured) and are tabulated separately.
 pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
     match (query, dataset) {
-        // TPC-H: every query includes lineitem (60,175 rows), so k = 16.
+        // TPC-H: every query includes lineitem (60,175 rows at the base
+        // scale), so k = 16 there.
         //
-        // Q5 also materializes intermediates.  Under rjs/legacy the padded
-        // bags still fit 2^16 (rjs shrinks them; legacy adds 2,848 + 59,452
-        // rows on top of |orders| and the LS join); the assertion in
-        // `run_at` fails loudly if that ever stops holding.  Under dp BOTH
-        // bags carry released capacities that can far exceed 2^16 at small
-        // epsilon, so the degree is computed from the actual padded section
-        // heights (the circuit lays its sections in disjoint column groups,
-        // so the height is their maximum -- the k=16 fit of
-        // lineitem 60,175 + LS 59,515 + CO 17,848 confirms max, not sum).
-        ("q5", _) => match privacy {
-            Privacy::Dp { .. } => {
-                let (_, co_pad, ls_pad) = q5_pads(privacy);
-                let TpchInput::Q5 { orders, lineitem, .. } = q5_raw_cached()
-                else {
-                    unreachable!("q5_raw_cached() returns Q5")
-                };
-                let rows = lineitem
-                    .len()
-                    .max(orders.len() + co_pad)
-                    .max(q5_ls_true() + ls_pad) as u64;
-                ceil_log2(rows + 64)
-            }
-            _ => {
-                let _ = q5_pads(privacy);
-                16
-            }
-        },
-        ("q3" | "q8" | "q9" | "q18", _) => 16,
+        // Q5 materializes three intermediates (NR, CO, and the LS join).  The
+        // circuit lays them in disjoint column groups, so the circuit height
+        // is their MAXIMUM, not their sum.  Size the degree from the actual
+        // (padded) section heights under whatever privacy regime is in force,
+        // so the same query scales with the data instead of being pinned to
+        // one hand-tabulated value:
+        //   * rjs shrinks every bag to its true size (pads = 0,0,0);
+        //   * legacy adds the fixed 2,848 / 59,452 constants on top of
+        //     |orders| and the LS join;
+        //   * dp releases per-bag capacities that can far exceed the base at
+        //     small epsilon.
+        // The `lineitem` section is the raw fact table, so it dominates once
+        // lineitem grows past the padded CO/LS bags.  At the base 60,175-row
+        // lineitem this returns 16 for every regime (the max of lineitem
+        // 60,175 / CO 17,848 / LS 59,515 confirms max, not sum, and is
+        // unchanged from the previous hand-tabulated 16); at 120K/240K rows it
+        // grows to 17/18.  `run_at` still fails loudly if a bag ever outgrows
+        // the returned degree.
+        ("q5", _) => {
+            let (_, co_pad, ls_pad) = q5_pads(privacy);
+            let TpchInput::Q5 { orders, lineitem, .. } = q5_raw_cached()
+            else {
+                unreachable!("q5_raw_cached() returns Q5")
+            };
+            let rows = lineitem
+                .len()
+                .max(orders.len() + co_pad)
+                .max(q5_ls_true() + ls_pad) as u64;
+            ceil_log2(rows + 64)
+        }
+        // The acyclic queries materialize no join intermediate: they lay each
+        // input table in its own disjoint column group and do lookups, so the
+        // circuit height is the tallest single section, which is always the raw
+        // `lineitem` fact table (every other table is smaller at every scale,
+        // and the filtered result section is a subset of lineitem).  Size the
+        // degree from the live lineitem row count so these scale with the data
+        // too: 60,175 -> 16, 120K -> 17, 240K -> 18.  (Was pinned to 16, which
+        // only fits <=65,536 rows.)
+        ("q3" | "q8" | "q9" | "q18", _) => ceil_log2(lineitem_rows() as u64 + 64),
 
         // Path queries: k = 17 on all three graphs (measured).
         ("gq1" | "gq2", _) => 17,
@@ -1337,8 +1349,8 @@ fn require(name: &str, t: &[Vec<u64>]) {
     );
 }
 
-fn run_tpch(query: &str, mode: Mode, privacy: Privacy) -> Row {
-    let k = degree_for(query, "tpch-60K", privacy);
+fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
+    let k = degree_for(query, dataset, privacy);
     use crate::data::data_processing as dp;
     use crate::sql::{q18_obj, q3_obj, q5_obj, q8_obj, q9_obj};
     use std::marker::PhantomData;
@@ -1346,13 +1358,13 @@ fn run_tpch(query: &str, mode: Mode, privacy: Privacy) -> Row {
     let t_all = Instant::now();
     let mut row = Row {
         query: query.to_string(),
-        dataset: "tpch-60K".to_string(),
+        dataset: dataset.to_string(),
         public_output: 1,
         profile: build_profile(),
         ..Default::default()
     };
     let one = [Fp::from(1u64)];
-    let label = format!("{}_tpch-60K", query);
+    let label = format!("{}_{}", query, dataset);
     // Set inside each arm once that query's tables are loaded and projected.
     let mut load_s = 0.0f64;
 
@@ -1665,7 +1677,7 @@ pub fn run_one(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row 
         if is_graph(query) {
             run_graph(query, dataset, mode, privacy)
         } else {
-            run_tpch(query, mode, privacy)
+            run_tpch(query, dataset, mode, privacy)
         }
     }));
     match res {
@@ -1697,10 +1709,18 @@ pub fn plan(queries: &[String]) -> Vec<(String, String)> {
                 out.push((q.clone(), d.to_string()));
             }
         } else {
-            out.push((q.clone(), "tpch-60K".to_string()));
+            out.push((q.clone(), tpch_label()));
         }
     }
     out
+}
+
+/// Label reported for the TPC-H dataset.  `VPJOIN_DATA` selects WHICH tables are
+/// read; this only *names* them in the results (the CSV `dataset` column, the
+/// resume key, the log lines), so a sweep over several data roots stays
+/// distinguishable in one place.  Defaults to the historical `tpch-60K`.
+pub fn tpch_label() -> String {
+    std::env::var("VPJOIN_LABEL").unwrap_or_else(|_| "tpch-60K".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,6 +1805,19 @@ pub fn tpch_inputs(query: &str, privacy: Privacy) -> TpchInput {
 fn q5_raw_cached() -> &'static TpchInput {
     static CACHE: std::sync::OnceLock<TpchInput> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| tpch_inputs_uncached("q5", 0, 0, 0))
+}
+
+/// Row count of the active `lineitem.tbl` (whatever `VPJOIN_DATA` points at),
+/// memoized.  Drives the degree of the acyclic TPC-H queries, whose circuit
+/// height is dominated by the lineitem section.
+fn lineitem_rows() -> usize {
+    use std::io::BufRead;
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::fs::File::open(tbl("lineitem.tbl"))
+            .map(|f| std::io::BufReader::new(f).lines().count())
+            .unwrap_or(0)
+    })
 }
 
 /// Size of Q5's LS join at zero padding, memoized: it is derived from the

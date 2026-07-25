@@ -15,7 +15,20 @@ pub fn in_src(rel: &str) -> String {
 }
 
 /// A TPC-H table, e.g. `data_file("lineitem.tbl")`.
+///
+/// `VPJOIN_TABLES` overrides just the directory the `.tbl`/`.cvs` tables load
+/// from, leaving the proof params and graph datasets where they are (under
+/// [`src_root`]).  This is what a scaling sweep uses: it swaps the tables per
+/// scale while `proof/param{k}` keeps resolving to the crate.  `VPJOIN_DATA`
+/// still overrides the whole root (data + proof + graph) for the case where an
+/// entire self-contained tree has been relocated.
 pub fn data_file(name: &str) -> String {
+    if let Ok(dir) = std::env::var("VPJOIN_TABLES") {
+        return PathBuf::from(dir)
+            .join(name)
+            .to_string_lossy()
+            .into_owned();
+    }
     in_src(&format!("data/{}", name))
 }
 
