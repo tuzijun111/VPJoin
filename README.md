@@ -185,15 +185,4 @@ VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-
 VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
 ```
 
-Run these from the repo root so `$PWD` resolves. An argument ending in `.csv` is taken as an
-output file, so omitting it writes nothing and the results print to stdout, ending in an
-aligned summary table; it also disables resume, so every query re-runs rather than being
-skipped as already done. Dropping `--release` selects the debug profile, which is several
-times slower than release, so do not mix the two in one comparison. The degree follows the
-`lineitem` row count, k=16 at 60K, 17 at 120K and 18 at 240K, and the params for all three
-already ship in `src/proof/`. Q5 runs under `VPJOIN_PRIVACY=rjs` so that the two families
-differ only in their table sizes; the other four queries materialize nothing and ignore it.
-Proofs are still written to `src/proof/bench/` as auditable artifacts, named per group by
-`VPJOIN_LABEL`, and `src/new_data/README.md` documents the datasets and the sweep script
-`src/new_data/run_sweep.sh`.
 
