@@ -153,9 +153,7 @@ PONE_K0=17 cargo run --bin pone_graph_bench
 **7. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
 `all_scaled` grows every table by the same 2x and 4x factors, while `lineitem_scaled` grows
 only `lineitem` and holds the dimension tables at the base size, so the pair isolates what
-the dimension tables cost. `VPJOIN_TABLES` selects which tables are read and leaves the
-proof params under `src/proof/`, and `VPJOIN_LABEL` names the group in the reported rows.
-Build once, then run the six groups:
+the dimension tables cost:
 
 ```bash
 cargo build --bin vpjoin_bench
