@@ -1,32 +1,3 @@
-//! 4-way path COUNT(*) with ordering: a<b<c<d
-//!
-//! Query:
-//!   SELECT COUNT(*) AS cnt
-//!   FROM Edge r1
-//!   JOIN Edge r2 ON r1.dst = r2.src
-//!   JOIN Edge r3 ON r2.dst = r3.src
-//!   JOIN Edge r4 ON r3.dst = r4.src
-//!   WHERE r1.src < r2.src
-//!     AND r2.src < r3.src
-//!     AND r3.src < r4.src;
-//!
-//! Variables:
-//!   r1: (a -> b)
-//!   r2: (b -> c)
-//!   r3: (c -> d)
-//!   r4: (d -> e)
-//! Ordering means: a<b<c<d   (note: e unconstrained)
-//!
-//! DP plan:
-//!   T4[d] = outdeg(d)                                      // from r4
-//!   T3[c] = Σ_{(c->d) in r3} T4[d] * [c<d]                 // join r3.dst into T4
-//!   T2[b] = Σ_{(b->c) in r2} T3[c] * [b<c]                 // join r2.dst into T3
-//!   ans   = Σ_{(a->b) in r1} T2[b] * [a<b]                 // join r1.dst into T2
-//!
-//! IMPORTANT: selectors used inside meta.lookup_any(...) MUST be complex_selector().
-//! - join.q_lookup_complex is complex_selector()
-//! - agg.q_map_tbl (map-table gate) is complex_selector()
-
 use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -34,16 +5,43 @@ use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
+use crate::circuits::card_preserve::{
+    assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
+    configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
 
 use crate::data::graph_data_processing::Edge;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const NUM_BYTES: usize = 8;
 const MAX_SENTINEL: u64 = u64::MAX;
 const PAD_KEY: u64 = MAX_SENTINEL; // pad key goes last in ASC
 const PAD_VAL: u64 = 0;
+
+/// Every key handed to the Cardinality Preservation Check is shifted by this,
+/// so key 0 stays free for the gadget's dummy table row. Node ids in the graph
+/// datasets start at 0 (facebook_combined), and shifting preserves the
+/// equality joins the check traverses.
+const SHIFT_ID: u64 = 1;
+
+/// Test hook, off in every benchmark path: when set, the prover moves one
+/// joinable r1 tuple to the residual side and re-reduces the relations around
+/// it, so the partition still passes Conservation and only condition (4) can
+/// catch it. This is exactly the cheat a residual-side-only argument misses,
+/// so the negative test in this module is what shows the Cardinality
+/// Preservation Check is not vacuous.
+pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple clean, leaving
+/// the residual section empty. Conservation still holds and both channels of
+/// condition (4) then agree trivially, so this is exactly the escape that
+/// Pairwise Consistency has to close, and the third direction of the test in
+/// this module is what shows condition (3) closes it.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -61,6 +59,8 @@ struct AggConfig<F: Field + Ord> {
 
     // prove sorted[0] is nondecreasing
     q_sort: Selector,
+    // pins the sorted view's sentinel cell at row n to PAD
+    q_sentinel: Selector,
     lt_src_cur_next: LtConfig<F, NUM_BYTES>,
     iz_src_eq: IsZeroConfig<F>,
 
@@ -140,6 +140,9 @@ pub struct GraphPath4OrderConfig<F: Field + Ord> {
     q_r1_contrib: Selector,
     lt_ab: LtConfig<F, NUM_BYTES>,
 
+    // the leaf stage's input multiplicity is one per r4 tuple
+    q_r4_val_one: Selector,
+
     contrib: Column<Advice>,
 
     // sum
@@ -148,6 +151,54 @@ pub struct GraphPath4OrderConfig<F: Field + Ord> {
     sum: Column<Advice>,
 
     out: Column<Advice>,
+    // ties the published cell to the accumulator
+    q_out: Selector,
+
+    // ---------------- One-Pass OBJ partition, condition (1) ----------------
+    // clean indicator per base row of r1..r4
+    cflag: [Column<Advice>; 4],
+
+    // Conservation Check per relation: filt_pad = (keep? base : PAD) is a
+    // shuffle of part_pad = [R^c rows | R^r rows | PAD rows], both carrying
+    // (src, dst, clean indicator) so the indicator is pinned to the partition
+    filt_pad: [[Column<Advice>; 3]; 4],
+    part_pad: [[Column<Advice>; 3]; 4],
+    perm_cons: [PermAnyConfig; 4],
+    q_cln_flag: [Selector; 4], // rows of R^c: indicator == 1
+    q_res_flag: [Selector; 4], // rows of R^r: indicator == 0
+    // booleanity of both copies of the indicator, and the masked clean keys
+    // below, on ALL n rows of every relation rather than on a prover-chosen
+    // prefix
+    q_flag: Selector,
+
+    // ---------------- Pairwise Consistency, condition (3) ----------------
+    // The six lookups of the three tree edges read one masked key column per
+    // side: `flag * (key + SHIFT_ID)` over the partition group's rows, which is
+    // 0 on every row the clean part does not use. The clean row set the lookups
+    // range over is therefore carried by the (boolean) indicator column, not by
+    // a selector range derived from the private |R^c|, and the selectors below
+    // are enabled on all n rows of every relation.
+    q_pw_in: [Selector; 4],
+    // pw_dst[e] masks the dst key of the parent of edge e (relations r1, r2, r3)
+    // pw_src[e] masks the src key of the child of edge e (relations r2, r3, r4)
+    pw_dst: [Column<Advice>; 3],
+    pw_src: [Column<Advice>; 3],
+
+    // ---------------- Cardinality Preservation Check, condition (4) --------
+    // shifted join keys, sk[k][j] = r[k][j] + SHIFT_ID
+    sk: [[Column<Advice>; 2]; 4],
+    q_shift: Selector,
+
+    // edge index 0 = (r3 parent, r4 child), 1 = (r2, r3), 2 = (r1, r2)
+    cp_agg: [CpAggConfig<F, NUM_BYTES>; 3],
+    cp_join: [CpJoinConfig<F, NUM_BYTES>; 3],
+    cp_root: CpRootConfig,
+
+    // the leaf's input-channel multiplicity, pinned to 1
+    cp_one: Column<Advice>,
+    // (mu_all, mu_cln) of the two internal nodes r3 and r2
+    cp_mu: [[Column<Advice>; 2]; 2],
+    q_cp_mu: Selector,
 }
 
 #[derive(Clone)]
@@ -224,6 +275,28 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             let q = m.query_selector(q_sort);
             let le = lt_src_cur_next.is_lt(m, None) + iz_src_eq.expr();
             vec![q * (le - Expression::Constant(F::ONE))]
+        });
+
+        // The group-boundary detector on the last real row reads the sentinel
+        // cell at row n through `iz_same_next`, and nondecreasing alone does not
+        // pin that cell. A prover that sets it equal to the last real key makes
+        // `iz_same_next` report "same group" there, so the emit gate below
+        // *demands* PAD instead of that group's sum and the highest-key group
+        // disappears from the table the next join reads: the parent carrying
+        // that key then certifies its absence with a gap witness that really
+        // does hold in the forged table, takes val = 0, and the answer is
+        // undercounted. This is the same gate as
+        // `card_preserve.rs: "cp: sorted view sentinel is PAD"`, and pinning the
+        // VALUE rather than requiring a strict last increase is deliberate: a
+        // stage whose rows include padding keyed at PAD legitimately ends at
+        // PAD, and those rows must not be emitted as a group.
+        let q_sentinel = meta.selector();
+        meta.create_gate("agg: sorted view sentinel is PAD", |m| {
+            let q = m.query_selector(q_sentinel);
+            vec![
+                q * (m.query_advice(sorted[0], Rotation::cur())
+                    - Expression::Constant(F::from(PAD_KEY))),
+            ]
         });
 
         // group-by helpers
@@ -381,6 +454,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             sorted,
             perm_sort,
             q_sort,
+            q_sentinel,
             lt_src_cur_next,
             iz_src_eq,
             q_first,
@@ -502,14 +576,19 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         ];
 
         // r3 filter: agg[1].val_in = join[2].val * [c<d]
+        //
+        // The three ordering chips below are range-gated on the bare filter
+        // selector, not on `q * in_next` as in g_sql2_obj.rs. Their `lt` cell
+        // is the relation's `keep` bit, which the Conservation Check and the
+        // input channel of the Cardinality Preservation Check both read on
+        // every base row, so it has to be constrained on every base row.
+        // Gating on `in_next` left it free wherever the DP had already forced
+        // the fetched value to 0. The witness was assigned on every row
+        // already, so nothing on the DP side changes.
         let q_r3_filt = meta.selector();
         let lt_cd = LtChip::<F, NUM_BYTES>::configure(
             meta,
-            |m| {
-                let q = m.query_selector(q_r3_filt);
-                let inx = m.query_advice(join[2].in_next, Rotation::cur());
-                q * inx
-            },
+            |m| m.query_selector(q_r3_filt),
             |m| m.query_advice(r[2][0], Rotation::cur()), // c
             |m| m.query_advice(r[2][1], Rotation::cur()), // d
         );
@@ -521,15 +600,24 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             vec![q * (outv - v * cd)]
         });
 
+        // The leaf stage r4 has no filter of its own, so nothing above ties its
+        // val_in column to anything: it was free advice, and a uniform val_in = v
+        // makes T4 = v * outdeg, which the sorted view carries as an exact
+        // permutation and which then scales T3, T2, contrib and the answer by v.
+        // T4[d] must be the out-degree, so the input multiplicity is 1 per tuple.
+        let q_r4_val_one = meta.selector();
+        meta.create_gate("r4 val_in is 1", |m| {
+            let q = m.query_selector(q_r4_val_one);
+            vec![
+                q * (m.query_advice(agg[0].val_in, Rotation::cur()) - Expression::Constant(F::ONE)),
+            ]
+        });
+
         // r2 filter: agg[2].val_in = join[1].val * [b<c]
         let q_r2_filt = meta.selector();
         let lt_bc = LtChip::<F, NUM_BYTES>::configure(
             meta,
-            |m| {
-                let q = m.query_selector(q_r2_filt);
-                let inx = m.query_advice(join[1].in_next, Rotation::cur());
-                q * inx
-            },
+            |m| m.query_selector(q_r2_filt),
             |m| m.query_advice(r[1][0], Rotation::cur()), // b
             |m| m.query_advice(r[1][1], Rotation::cur()), // c
         );
@@ -548,11 +636,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         let q_r1_contrib = meta.selector();
         let lt_ab = LtChip::<F, NUM_BYTES>::configure(
             meta,
-            |m| {
-                let q = m.query_selector(q_r1_contrib);
-                let inx = m.query_advice(join[0].in_next, Rotation::cur());
-                q * inx
-            },
+            |m| m.query_selector(q_r1_contrib),
             |m| m.query_advice(r[0][0], Rotation::cur()), // a
             |m| m.query_advice(r[0][1], Rotation::cur()), // b
         );
@@ -584,6 +668,372 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             vec![q * (s_cur - (s_prev + v))]
         });
 
+        // The published answer. `out` is the only cell of this circuit copied to
+        // the instance column, and without this gate no polynomial identity
+        // relates it to the accumulator: the prover could publish any COUNT and
+        // every other condition of the file would still hold, because the sum
+        // chain and `out` were connected only by the host-side witness. Degree 2.
+        let q_out = meta.selector();
+        meta.create_gate("out equals sum", |m| {
+            let q = m.query_selector(q_out);
+            let o = m.query_advice(out, Rotation::cur());
+            let s = m.query_advice(sum, Rotation::cur());
+            vec![q * (o - s)]
+        });
+
+        // ================= condition (1): Conservation Check =================
+        // g_sql2_obj.rs has no partition at all, so one is introduced here:
+        // a clean indicator per base row, and one shuffle per relation between
+        // the filtered base rows and a materialized [R^c | R^r | PAD] layout.
+        // The indicator rides along as the third column of both sides, which
+        // is what binds it to the partition.
+        fn cols3<FF: PrimeField>(meta: &mut ConstraintSystem<FF>) -> [Column<Advice>; 3] {
+            [
+                meta.advice_column(),
+                meta.advice_column(),
+                meta.advice_column(),
+            ]
+        }
+        fn cols2<FF: PrimeField>(meta: &mut ConstraintSystem<FF>) -> [Column<Advice>; 2] {
+            [meta.advice_column(), meta.advice_column()]
+        }
+
+        let cflag: [Column<Advice>; 4] = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
+        let filt_pad: [[Column<Advice>; 3]; 4] =
+            [cols3(meta), cols3(meta), cols3(meta), cols3(meta)];
+        let part_pad: [[Column<Advice>; 3]; 4] =
+            [cols3(meta), cols3(meta), cols3(meta), cols3(meta)];
+
+        let q_cln_flag: [Selector; 4] = [
+            meta.selector(),
+            meta.selector(),
+            meta.selector(),
+            meta.selector(),
+        ];
+        let q_res_flag: [Selector; 4] = [
+            meta.selector(),
+            meta.selector(),
+            meta.selector(),
+            meta.selector(),
+        ];
+
+        let mut perm_cons_v: Vec<PermAnyConfig> = Vec::with_capacity(4);
+        for k in 0..4 {
+            let q1 = meta.complex_selector();
+            let q2 = meta.complex_selector();
+            perm_cons_v.push(PermAnyChip::configure(
+                meta,
+                q1,
+                q2,
+                filt_pad[k].to_vec(),
+                part_pad[k].to_vec(),
+            ));
+        }
+        let perm_cons: [PermAnyConfig; 4] = perm_cons_v.try_into().unwrap();
+
+        // The indicator column pads with 0, so a row the predicate drops is
+        // never clean and contributes to neither channel of condition (4).
+        let pad_row: [u64; 3] = [PAD_KEY, PAD_KEY, 0];
+        for k in 0..4 {
+            let base = [r[k][0], r[k][1], cflag[k]];
+            let filt = filt_pad[k];
+            let q1 = perm_cons[k].q_perm1;
+            // r4 has no predicate of its own, so its keep bit is the constant 1
+            let keep_lt: Option<LtConfig<F, NUM_BYTES>> = match k {
+                0 => Some(lt_ab),
+                1 => Some(lt_bc),
+                2 => Some(lt_cd),
+                _ => None,
+            };
+            meta.create_gate("link filt_pad = (keep? base : PAD)", move |m| {
+                let q = m.query_selector(q1);
+                let one = Expression::Constant(F::ONE);
+                let keep = match keep_lt {
+                    Some(lt) => lt.is_lt(m, None),
+                    None => one.clone(),
+                };
+                (0..3)
+                    .map(|j| {
+                        let f = m.query_advice(filt[j], Rotation::cur());
+                        let b = m.query_advice(base[j], Rotation::cur());
+                        let p = Expression::Constant(F::from(pad_row[j]));
+                        q.clone() * (f - (keep.clone() * b + (one.clone() - keep.clone()) * p))
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            // Partition side of the indicator: a constant 1 on the R^c rows
+            // and 0 on the R^r rows. Without these the prover could mark a
+            // residual row clean and inflate the clean channel below.
+            let flag_col = part_pad[k][2];
+            let qc = q_cln_flag[k];
+            let qr = q_res_flag[k];
+            meta.create_gate("clean indicator on the partition side", move |m| {
+                let f = m.query_advice(flag_col, Rotation::cur());
+                vec![
+                    m.query_selector(qc) * (f.clone() - Expression::Constant(F::ONE)),
+                    m.query_selector(qr) * f,
+                ]
+            });
+        }
+
+        // Both copies of the indicator are boolean on EVERY base row and on
+        // every partition row, not only on the [0, n_cln) / [n_cln, n_cln+n_res)
+        // ranges above, which the prover derives from the private partition and
+        // could shrink. Without this the indicator was a free field element:
+        // the link gate carries `keep * c` into the Conservation shuffle and
+        // the `q_cp_mu` gate reads that same cell as the clean channel's factor,
+        // so a value like `1 + d * s^{-1}` pays back exactly the deficit that
+        // hiding a joinable tuple creates and condition (4) accepts. Booleanity
+        // on the partition side additionally stops a forged key from entering the
+        // masked key columns below, where a non-boolean factor could make an
+        // arbitrary field element look like a clean key. Degree 3.
+        let q_flag = meta.selector();
+        {
+            let cf = cflag;
+            let pf: [Column<Advice>; 4] = std::array::from_fn(|k| part_pad[k][2]);
+            meta.create_gate("clean indicator is boolean", move |m| {
+                let q = m.query_selector(q_flag);
+                let one = Expression::Constant(F::ONE);
+                let mut cs = Vec::with_capacity(8);
+                for k in 0..4 {
+                    let b = m.query_advice(cf[k], Rotation::cur());
+                    cs.push(q.clone() * b.clone() * (one.clone() - b));
+                    let p = m.query_advice(pf[k], Rotation::cur());
+                    cs.push(q.clone() * p.clone() * (one.clone() - p));
+                }
+                cs
+            });
+        }
+
+        // ============= condition (3): Pairwise Consistency =============
+        // Two mutual Membership Checks per join-tree edge, each looking one
+        // clean key column up directly in the adjacent relation's clean key
+        // column. Both sides read the key column of the *partition* group over
+        // its clean rows, never the base relation's column: a lookup against the
+        // base rows would only certify membership in R_i, which is the weaker
+        // statement g_sql2_obj.rs already made and is not condition (3). The
+        // tuple columns of the partition group are tied to the base relation by
+        // the Conservation Check above, so those rows are exactly pi_K(R^c).
+        //
+        // An earlier version of this file routed each direction through an
+        // intermediate advice column holding the deduplicated key set of the
+        // relation it looked into. That column was plain prover advice and
+        // nothing bound it to the relation it claimed to enumerate, so setting
+        // the two tables of an edge to each other's key sets satisfied both
+        // lookups for an arbitrary partition and condition (3) was vacuous.
+        // Looking the two key columns up in each other leaves no free advice:
+        // the two containments now hold between the actual clean key columns
+        // and together they are the set equality condition (3) asks for, at one
+        // advice column and one complex selector less per side.
+        //
+        // Keys enter both sides shifted by SHIFT_ID: a lookup_any expression is
+        // evaluated on every row of the circuit and both sides are 0 wherever
+        // their selector is off or their row is not clean, so 0 is unavoidably in
+        // the table, and node 0 is a real node in these datasets.
+        //
+        // Which rows the two containments range over is the delicate part. An
+        // earlier version gated both sides with a selector enabled on the
+        // partition group's clean prefix [0, n_cln), a range the prover derives
+        // from the private partition. Then a row past n_cln + n_res carried no
+        // constraint at all: a dangling tuple marked clean on the base side was
+        // absorbed by the Conservation shuffle at such a tail row, a PAD triple
+        // filled the residual slot it vacated, the multiset equality still held,
+        // and no Pairwise Consistency lookup ever saw the smuggled row, so
+        // conditions (9) and (10) stopped speaking about the same R^c. Shrinking
+        // the prefix to nothing made the whole condition vacuous.
+        //
+        // The clean row set is therefore carried by the indicator column itself:
+        // each side reads a masked key `flag * (key + SHIFT_ID)`, which is the
+        // shifted key on a clean row and 0 on every other row, and the selector
+        // is enabled on all n rows of the relation. 0 is in every table (the rows
+        // past n have the selector off), so the masked-out rows are free. The
+        // mask lives in its own advice column rather than in the lookup
+        // expression on purpose: a lookup's required degree is
+        // 2 + input_degree + table_degree, so multiplying inside the expression
+        // would have pushed both sides to degree 3 and the whole constraint
+        // system from 7 to 8.
+        //
+        // fresh complex selectors: a simple selector may not appear in a lookup
+        // expression, so the q_cln_flag ones above cannot be reused here
+        let q_pw_in: [Selector; 4] = std::array::from_fn(|_| meta.complex_selector());
+        let pw_dst: [Column<Advice>; 3] = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
+        let pw_src: [Column<Advice>; 3] = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
+        {
+            let pd = pw_dst;
+            let ps = pw_src;
+            meta.create_gate("pw: masked clean keys", move |m| {
+                let q = m.query_selector(q_flag);
+                let sh = Expression::Constant(F::from(SHIFT_ID));
+                let mut cs = Vec::with_capacity(6);
+                for e in 0..3 {
+                    // parent of edge e is relation e, child is relation e + 1
+                    let fp = m.query_advice(part_pad[e][2], Rotation::cur());
+                    let kp = m.query_advice(part_pad[e][1], Rotation::cur());
+                    cs.push(
+                        q.clone()
+                            * (m.query_advice(pd[e], Rotation::cur()) - fp * (kp + sh.clone())),
+                    );
+                    let fc = m.query_advice(part_pad[e + 1][2], Rotation::cur());
+                    let kc = m.query_advice(part_pad[e + 1][0], Rotation::cur());
+                    cs.push(
+                        q.clone()
+                            * (m.query_advice(ps[e], Rotation::cur()) - fc * (kc + sh.clone())),
+                    );
+                }
+                cs
+            });
+        }
+
+        let mut pw_edge = |name: &'static str,
+                           q_in: Selector,
+                           in_col: Column<Advice>,
+                           q_t: Selector,
+                           tbl_col: Column<Advice>| {
+            meta.lookup_any(name, move |m| {
+                let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
+                let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                vec![(lhs, rhs)]
+            });
+        };
+
+        let pw_names: [[&'static str; 2]; 3] = [
+            ["pw: r1^c dst in r2^c src", "pw: r2^c src in r1^c dst"],
+            ["pw: r2^c dst in r3^c src", "pw: r3^c src in r2^c dst"],
+            ["pw: r3^c dst in r4^c src", "pw: r4^c src in r3^c dst"],
+        ];
+        for e in 0..3 {
+            // parent of edge e is r_{e+1}, child is r_{e+2}
+            let par_key = pw_dst[e]; // masked dst of the parent
+            let chi_key = pw_src[e]; // masked src of the child
+            pw_edge(pw_names[e][0], q_pw_in[e], par_key, q_pw_in[e + 1], chi_key);
+            pw_edge(pw_names[e][1], q_pw_in[e + 1], chi_key, q_pw_in[e], par_key);
+        }
+
+        // =========== condition (4): Cardinality Preservation Check ===========
+        // Shifted keys first: key 0 is reserved for the gadget's dummy row.
+        let sk: [[Column<Advice>; 2]; 4] = [cols2(meta), cols2(meta), cols2(meta), cols2(meta)];
+        let q_shift = meta.selector();
+        meta.create_gate("shifted keys for the cardinality check", move |m| {
+            let q = m.query_selector(q_shift);
+            let sh = Expression::Constant(F::from(SHIFT_ID));
+            let mut cs = Vec::with_capacity(8);
+            for k in 0..4 {
+                for j in 0..2 {
+                    cs.push(
+                        q.clone()
+                            * (m.query_advice(sk[k][j], Rotation::cur())
+                                - m.query_advice(r[k][j], Rotation::cur())
+                                - sh.clone()),
+                    );
+                }
+            }
+            cs
+        });
+
+        // One fixed column serves every Lt chip of the check, so the whole
+        // check costs a single u8 range table.
+        let cp_u8 = meta.fixed_column();
+
+        let cp_one = meta.advice_column();
+        let cp_mu: [[Column<Advice>; 2]; 2] = [cols2(meta), cols2(meta)];
+
+        // Child side of each edge, over the child relation's own rows. The leaf
+        // r4 carries (1, c_4); the internal nodes r3 and r2 carry the fresh mu
+        // columns the recurrence gate below ties to their own child edge.
+        let cp_agg = [
+            configure_cp_agg::<F, NUM_BYTES>(
+                meta,
+                cp_u8,
+                sk[3][0], // r4.src
+                cp_one,
+                filt_pad[3][2],
+                PAD_KEY,
+            ),
+            configure_cp_agg::<F, NUM_BYTES>(
+                meta,
+                cp_u8,
+                sk[2][0], // r3.src
+                cp_mu[0][0],
+                cp_mu[0][1],
+                PAD_KEY,
+            ),
+            configure_cp_agg::<F, NUM_BYTES>(
+                meta,
+                cp_u8,
+                sk[1][0], // r2.src
+                cp_mu[1][0],
+                cp_mu[1][1],
+                PAD_KEY,
+            ),
+        ];
+
+        // Parent side of each edge, over the parent relation's own rows.
+        let parent_key = [sk[2][1], sk[1][1], sk[0][1]]; // r3.dst, r2.dst, r1.dst
+        let cp_join = [
+            configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, parent_key[0]),
+            configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, parent_key[1]),
+            configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, parent_key[2]),
+        ];
+        for e in 0..3 {
+            wire_cp_edge(meta, &cp_join[e], &cp_agg[e], parent_key[e]);
+        }
+
+        let cp_root = configure_cp_root::<F>(meta);
+
+        // The recurrences of both channels, one selector for all of them since
+        // every relation occupies the same rows. Degree 3 each.
+        let q_cp_mu = meta.selector();
+        {
+            let s_all = [cp_join[0].s_all, cp_join[1].s_all, cp_join[2].s_all];
+            let s_cln = [cp_join[0].s_cln, cp_join[1].s_cln, cp_join[2].s_cln];
+            // the bound keep * c of r3, r2, r1
+            let cf = [filt_pad[2][2], filt_pad[1][2], filt_pad[0][2]];
+            let mu_all = [cp_mu[0][0], cp_mu[1][0], cp_root.mu_all];
+            let mu_cln = [cp_mu[0][1], cp_mu[1][1], cp_root.mu_cln];
+            let pred = [lt_cd, lt_bc, lt_ab];
+            meta.create_gate("cp: multiplicity recurrences along the path", move |m| {
+                let q = m.query_selector(q_cp_mu);
+                let mut cs = Vec::with_capacity(7);
+
+                // leaf r4: one input-channel extension per tuple
+                cs.push(
+                    q.clone()
+                        * (m.query_advice(cp_one, Rotation::cur()) - Expression::Constant(F::ONE)),
+                );
+
+                // r3, then r2, then the root r1
+                for i in 0..3 {
+                    let p = pred[i].is_lt(m, None);
+                    cs.push(
+                        q.clone()
+                            * (m.query_advice(mu_all[i], Rotation::cur())
+                                - p * m.query_advice(s_all[i], Rotation::cur())),
+                    );
+                    cs.push(
+                        q.clone()
+                            * (m.query_advice(mu_cln[i], Rotation::cur())
+                                - m.query_advice(cf[i], Rotation::cur())
+                                    * m.query_advice(s_cln[i], Rotation::cur())),
+                    );
+                }
+                cs
+            });
+        }
+
         GraphPath4OrderConfig {
             instance,
             r,
@@ -595,11 +1045,34 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             lt_bc,
             q_r1_contrib,
             lt_ab,
+            q_r4_val_one,
             contrib,
             q_sum_first,
             q_sum_accu,
             sum,
             out,
+            q_out,
+
+            cflag,
+            filt_pad,
+            part_pad,
+            perm_cons,
+            q_cln_flag,
+            q_res_flag,
+            q_flag,
+
+            q_pw_in,
+            pw_dst,
+            pw_src,
+
+            sk,
+            q_shift,
+            cp_agg,
+            cp_join,
+            cp_root,
+            cp_one,
+            cp_mu,
+            q_cp_mu,
         }
     }
 
@@ -671,6 +1144,56 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         m
     }
 
+    /// The honest prover's clean instance: the fully reduced instance of the
+    /// 4-path, i.e. the tuples of each relation that extend to a full join
+    /// result. One up sweep along the chain, then one down sweep from the root,
+    /// which is exact for a tree. `out[k]` is the indicator of relation
+    /// `r_{k+1}`, in base row order.
+    ///
+    /// `drop_r1` removes one root tuple before the down sweep and is used only
+    /// by the negative test: the result is still the fully reduced instance of
+    /// a smaller instance, so Conservation, and pairwise consistency between
+    /// the clean projections, both still hold, and only the clean join is
+    /// smaller than the input join.
+    fn reduce_clean(edges: &[Edge], drop_r1: Option<usize>) -> [Vec<u64>; 4] {
+        let n = edges.len();
+        // all four relations are the same Edge table, so the three ordering
+        // predicates are the same per-row bit src < dst
+        let lt: Vec<bool> = edges.iter().map(|e| e.src < e.dst).collect();
+
+        // up sweep: which tuples extend downwards
+        let keys4: HashSet<u64> = edges.iter().map(|e| e.src).collect();
+        let up3: Vec<bool> = (0..n)
+            .map(|i| lt[i] && keys4.contains(&edges[i].dst))
+            .collect();
+        let keys3: HashSet<u64> = (0..n).filter(|&i| up3[i]).map(|i| edges[i].src).collect();
+        let up2: Vec<bool> = (0..n)
+            .map(|i| lt[i] && keys3.contains(&edges[i].dst))
+            .collect();
+        let keys2: HashSet<u64> = (0..n).filter(|&i| up2[i]).map(|i| edges[i].src).collect();
+        let mut cl1: Vec<bool> = (0..n)
+            .map(|i| lt[i] && keys2.contains(&edges[i].dst))
+            .collect();
+        if let Some(i) = drop_r1 {
+            cl1[i] = false;
+        }
+
+        // down sweep: which of those also extend upwards
+        let d1: HashSet<u64> = (0..n).filter(|&i| cl1[i]).map(|i| edges[i].dst).collect();
+        let cl2: Vec<bool> = (0..n)
+            .map(|i| up2[i] && d1.contains(&edges[i].src))
+            .collect();
+        let d2: HashSet<u64> = (0..n).filter(|&i| cl2[i]).map(|i| edges[i].dst).collect();
+        let cl3: Vec<bool> = (0..n)
+            .map(|i| up3[i] && d2.contains(&edges[i].src))
+            .collect();
+        let d3: HashSet<u64> = (0..n).filter(|&i| cl3[i]).map(|i| edges[i].dst).collect();
+        let cl4: Vec<bool> = (0..n).map(|i| d3.contains(&edges[i].src)).collect();
+
+        let b2u = |v: Vec<bool>| v.into_iter().map(|b| b as u64).collect::<Vec<u64>>();
+        [b2u(cl1), b2u(cl2), b2u(cl3), b2u(cl4)]
+    }
+
     fn gap_witness(keys_sorted_with_pad: &[u64], x: u64) -> (u64, u64, u64) {
         match keys_sorted_with_pad.binary_search(&x) {
             Ok(_) => (1, 0, PAD_KEY),
@@ -708,6 +1231,16 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone()).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_cd.clone()).load(layouter)?;
 
+        // Every Lt chip of the Cardinality Preservation Check shares one u8
+        // fixed column, so a single load covers all twelve of them.
+        LtChip::<F, NUM_BYTES>::construct(cfg.cp_agg[0].lt_key_cur_next).load(layouter)?;
+
+        // The empty-input layout enables no selector at all, so under a
+        // verifying key generated for n == 0 nothing is constrained and the
+        // published cell is free. That is not a hole this file can close: with no
+        // rows there is no accumulator to tie `out` to, and every condition of
+        // the gate is equally empty. Any deployment has to fix the verifying key
+        // for the relation size it verifies.
         if n == 0 {
             let cell = layouter.assign_region(
                 || "out0",
@@ -859,7 +1392,75 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             contrib[i] = v * ab;
             answer_u128 += contrib[i] as u128;
         }
+        // Host-side truncation: the answer and the running sum are both carried
+        // as u64, so a count past 2^64 would wrap. The in-circuit accumulator
+        // adds in F and does not wrap, so the honest prover simply cannot satisfy
+        // "sum_accu" past that point: this is a completeness limit at
+        // astronomically large counts, not a soundness hole, and contorting the
+        // circuit into u128 limbs would cost far more than it is worth.
         let answer = answer_u128 as u64;
+
+        // -------- the partition, condition (1) --------
+        // keep bits per relation: the ordering predicate of r1/r2/r3, and the
+        // constant 1 of r4, which has none
+        let lt_bit: Vec<u64> = edges.iter().map(|e| (e.src < e.dst) as u64).collect();
+        let keep: [Vec<u64>; 4] = [
+            lt_bit.clone(),
+            lt_bit.clone(),
+            lt_bit.clone(),
+            vec![1u64; n],
+        ];
+
+        // The honest prover's R^c is the fully reduced instance: exactly the
+        // tuples that extend to a full join result.
+        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+        let mark_all = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let drop_r1 = if tamper {
+            let honest = Self::reduce_clean(edges, None);
+            (0..n).find(|&i| honest[0][i] == 1)
+        } else {
+            None
+        };
+        let cln: [Vec<u64>; 4] = if mark_all {
+            // the escape condition (3) closes: no reduction at all, every real
+            // tuple clean and the residual section empty
+            std::array::from_fn(|k| keep[k].clone())
+        } else {
+            Self::reduce_clean(edges, drop_r1)
+        };
+
+        // the two sides of each Conservation Check: the filtered base rows, and
+        // the partition laid out as [R^c rows | R^r rows | PAD rows]
+        let mut filt_rows: Vec<Vec<[u64; 3]>> = Vec::with_capacity(4);
+        let mut part_rows: Vec<Vec<[u64; 3]>> = Vec::with_capacity(4);
+        let mut n_cln = [0usize; 4];
+        let mut n_res = [0usize; 4];
+        for k in 0..4 {
+            let mut filt: Vec<[u64; 3]> = Vec::with_capacity(n);
+            let mut cl: Vec<[u64; 3]> = Vec::new();
+            let mut res: Vec<[u64; 3]> = Vec::new();
+            for i in 0..n {
+                if keep[k][i] == 1 {
+                    filt.push([edges[i].src, edges[i].dst, cln[k][i]]);
+                    if cln[k][i] == 1 {
+                        cl.push([edges[i].src, edges[i].dst, 1]);
+                    } else {
+                        res.push([edges[i].src, edges[i].dst, 0]);
+                    }
+                } else {
+                    filt.push([PAD_KEY, PAD_KEY, 0]);
+                }
+            }
+            n_cln[k] = cl.len();
+            n_res[k] = res.len();
+            let mut part = cl;
+            part.extend(res);
+            while part.len() < n {
+                part.push([PAD_KEY, PAD_KEY, 0]);
+            }
+            filt_rows.push(filt);
+            part_rows.push(part);
+        }
 
         // -------- assignment region --------
         let out_cell = layouter.assign_region(
@@ -1124,11 +1725,19 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     }
                     a.q_map_last.enable(&mut region, base_len)?;
 
-                    // enable sortedness checks
-                    for i in 0..base_len.saturating_sub(1) {
+                    // enable sortedness checks. q_sort covers the comparison
+                    // into the pinned sentinel row too, so the sorted key column
+                    // is nondecreasing all the way to PAD.
+                    for i in 0..base_len {
                         a.q_sort.enable(&mut region, i)?;
+                    }
+                    for i in 0..base_len.saturating_sub(1) {
                         a.q_tbl_sort.enable(&mut region, i)?;
                     }
+                    // pin the sentinel cell the emit gate reads on the last real
+                    // row, so the highest-key group is always recognised as a
+                    // group end and cannot be suppressed
+                    a.q_sentinel.enable(&mut region, base_len)?;
 
                     // group gates
                     if base_len > 0 {
@@ -1149,13 +1758,21 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     let lt_tbl_chip =
                         LtChip::<F, NUM_BYTES>::construct(a.lt_tbl_key_cur_next.clone());
 
-                    for i in 0..base_len.saturating_sub(1) {
+                    // the last comparison reads the PAD sentinel at row base_len
+                    for i in 0..base_len {
+                        let next_src = if i + 1 < base_len {
+                            sorted_rows[i + 1][0]
+                        } else {
+                            PAD_KEY
+                        };
                         lt_src_chip.assign(
                             &mut region,
                             i,
                             Value::known(F::from(sorted_rows[i][0])),
-                            Value::known(F::from(sorted_rows[i + 1][0])),
+                            Value::known(F::from(next_src)),
                         )?;
+                    }
+                    for i in 0..base_len.saturating_sub(1) {
                         lt_tbl_chip.assign(
                             &mut region,
                             i,
@@ -1176,8 +1793,13 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                         let diff = F::from(next_src) - F::from(sorted_rows[i][0]);
                         iz_same_next_chip.assign(&mut region, i, Value::known(diff))?;
                     }
-                    for i in 0..base_len.saturating_sub(1) {
-                        let diff = F::from(sorted_rows[i + 1][0]) - F::from(sorted_rows[i][0]);
+                    for i in 0..base_len {
+                        let next_src = if i + 1 < base_len {
+                            sorted_rows[i + 1][0]
+                        } else {
+                            PAD_KEY
+                        };
+                        let diff = F::from(next_src) - F::from(sorted_rows[i][0]);
                         iz_src_eq_chip.assign(&mut region, i, Value::known(diff))?;
                     }
                     for i in 0..base_len.saturating_sub(1) {
@@ -1185,13 +1807,27 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                         iz_tbl_eq_chip.assign(&mut region, i, Value::known(diff))?;
                     }
 
-                    // NOTE: enabling perm selectors depends on your PermAnyConfig API.
-                    // If your PermAnyChip uses fixed columns or internal selectors, keep your existing enable logic here.
+                    // The two shuffles of the stage. Leaving these selectors off
+                    // made both arguments 0-vs-0 on every row, i.e. dead: the
+                    // sorted view was then unrelated to (src, dst, val_in) and
+                    // the T-table unrelated to the emitted group pairs, so the
+                    // whole DP chain was severed from the base relation and any
+                    // constant could be added to every table value without the
+                    // map or gap lookups noticing. Both sides of each shuffle are
+                    // enabled on exactly the same base rows [0, base_len), so the
+                    // rows past the relation contribute an all-zero tuple to both
+                    // sides and cancel.
+                    for i in 0..base_len {
+                        a.perm_sort.q_perm1.enable(&mut region, i)?;
+                        a.perm_sort.q_perm2.enable(&mut region, i)?;
+                        a.perm_tbl.q_perm1.enable(&mut region, i)?;
+                        a.perm_tbl.q_perm2.enable(&mut region, i)?;
+                    }
 
                     Ok(())
                 };
 
-                // agg[0] r4 -> T4 with val_in=1
+                // agg[0] r4 -> T4 with val_in=1, pinned below by "r4 val_in is 1"
                 let r4_vals = vec![1u64; n];
                 assign_agg_stage(
                     &cfg.agg[0],
@@ -1224,6 +1860,11 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     &t2_tbl,
                     &r2_val_filt,
                 )?;
+
+                // the leaf stage's input multiplicity is one per r4 tuple
+                for i in 0..n {
+                    cfg.q_r4_val_one.enable(&mut region, i)?;
+                }
 
                 // assign r3 filter lt witnesses
                 {
@@ -1273,6 +1914,166 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     }
                 }
 
+                // ================= condition (1): the partition =================
+                // clean indicator and shifted keys on the base rows
+                for k in 0..4 {
+                    for i in 0..n {
+                        region.assign_advice(
+                            || "cflag",
+                            cfg.cflag[k],
+                            i,
+                            || Value::known(F::from(cln[k][i])),
+                        )?;
+                        region.assign_advice(
+                            || "sk_src",
+                            cfg.sk[k][0],
+                            i,
+                            || Value::known(F::from(edges[i].src + SHIFT_ID)),
+                        )?;
+                        region.assign_advice(
+                            || "sk_dst",
+                            cfg.sk[k][1],
+                            i,
+                            || Value::known(F::from(edges[i].dst + SHIFT_ID)),
+                        )?;
+                    }
+                }
+                for i in 0..n {
+                    cfg.q_shift.enable(&mut region, i)?;
+                }
+
+                // Conservation Check per relation. The link gate turns the raw
+                // indicator on the base rows into keep * indicator on the filt
+                // side, and q_cln_flag / q_res_flag pin the partition side.
+                for k in 0..4 {
+                    for i in 0..n {
+                        for j in 0..3 {
+                            region.assign_advice(
+                                || "filt_pad",
+                                cfg.filt_pad[k][j],
+                                i,
+                                || Value::known(F::from(filt_rows[k][i][j])),
+                            )?;
+                            region.assign_advice(
+                                || "part_pad",
+                                cfg.part_pad[k][j],
+                                i,
+                                || Value::known(F::from(part_rows[k][i][j])),
+                            )?;
+                        }
+                        cfg.perm_cons[k].q_perm1.enable(&mut region, i)?;
+                        cfg.perm_cons[k].q_perm2.enable(&mut region, i)?;
+                    }
+                    for i in 0..n_cln[k] {
+                        cfg.q_cln_flag[k].enable(&mut region, i)?;
+                    }
+                    for i in n_cln[k]..(n_cln[k] + n_res[k]) {
+                        cfg.q_res_flag[k].enable(&mut region, i)?;
+                    }
+                }
+
+                // ============= condition (3): Pairwise Consistency =============
+                // The six lookups read one masked key column per side,
+                // flag * (key + SHIFT_ID) over the partition group's rows, so the
+                // clean row set they range over is the indicator column itself
+                // and the selectors are enabled on all n rows. A row whose
+                // indicator is 0 masks to 0, which every table contains.
+                for k in 0..4 {
+                    for i in 0..n {
+                        cfg.q_pw_in[k].enable(&mut region, i)?;
+                    }
+                }
+                for i in 0..n {
+                    cfg.q_flag.enable(&mut region, i)?;
+                    for e in 0..3 {
+                        // parent of edge e is relation e, child is relation e + 1
+                        let fp = F::from(part_rows[e][i][2]);
+                        let kp = F::from(part_rows[e][i][1]) + F::from(SHIFT_ID);
+                        region.assign_advice(
+                            || "pw masked dst",
+                            cfg.pw_dst[e],
+                            i,
+                            || Value::known(fp * kp),
+                        )?;
+                        let fc = F::from(part_rows[e + 1][i][2]);
+                        let kc = F::from(part_rows[e + 1][i][0]) + F::from(SHIFT_ID);
+                        region.assign_advice(
+                            || "pw masked src",
+                            cfg.pw_src[e],
+                            i,
+                            || Value::known(fc * kc),
+                        )?;
+                    }
+                }
+
+                // ============= CARDINALITY PRESERVATION CHECK =============
+                // condition (4): one traversal of the chain r4 -> r3 -> r2 -> r1
+                // carrying two multiplicities per tuple, then one equality
+                // between the two root sums.
+                for i in 0..n {
+                    region.assign_advice(|| "cp_one", cfg.cp_one, i, || Value::known(F::ONE))?;
+                    cfg.q_cp_mu.enable(&mut region, i)?;
+                }
+
+                let shifted_src: Vec<u64> = edges.iter().map(|e| e.src + SHIFT_ID).collect();
+                let shifted_dst: Vec<u64> = edges.iter().map(|e| e.dst + SHIFT_ID).collect();
+
+                // the leaf carries (key, v_all, v_cln) = (r4.src, 1, c_4)
+                let mut rows: Vec<[u64; 3]> =
+                    (0..n).map(|i| [shifted_src[i], 1, cln[3][i]]).collect();
+                let mut cp_sums = (0u64, 0u64);
+
+                for e in 0..3 {
+                    let stage = build_cp_stage(&rows, PAD_KEY);
+                    assign_cp_agg(&mut region, &cfg.cp_agg[e], &rows, &stage)?;
+                    let fetched = assign_cp_join(
+                        &mut region,
+                        &cfg.cp_join[e],
+                        &shifted_dst,
+                        &stage,
+                        PAD_KEY,
+                    )?;
+
+                    // parent of edge e: r3, then r2, then the root r1
+                    let par = 2 - e;
+                    let mu: Vec<(u64, u64)> = (0..n)
+                        .map(|i| (keep[par][i] * fetched[i].0, cln[par][i] * fetched[i].1))
+                        .collect();
+
+                    if e < 2 {
+                        for i in 0..n {
+                            region.assign_advice(
+                                || "cp mu_all",
+                                cfg.cp_mu[e][0],
+                                i,
+                                || Value::known(F::from(mu[i].0)),
+                            )?;
+                            region.assign_advice(
+                                || "cp mu_cln",
+                                cfg.cp_mu[e][1],
+                                i,
+                                || Value::known(F::from(mu[i].1)),
+                            )?;
+                        }
+                        // the parent becomes the child of the next edge, keyed
+                        // by its own src
+                        rows = (0..n).map(|i| [shifted_src[i], mu[i].0, mu[i].1]).collect();
+                    } else {
+                        cp_sums = assign_cp_root(&mut region, &cfg.cp_root, &mu)?;
+                    }
+                }
+
+                if !tamper && !mark_all {
+                    debug_assert_eq!(
+                        cp_sums.0, cp_sums.1,
+                        "cardinality preservation: |R^c join| != |R join|"
+                    );
+                    debug_assert_eq!(
+                        cp_sums.0, answer,
+                        "the input channel of condition (4) must count the query answer"
+                    );
+                }
+
                 // sum
                 let mut running: u128 = 0;
                 for i in 0..n {
@@ -1289,13 +2090,15 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     cfg.q_sum_accu.enable(&mut region, i)?;
                 }
 
-                // output at last row
+                // output at the last row, tied to the accumulator by "out equals
+                // sum" so the published cell is the count the circuit computed
                 let out_cell = region.assign_advice(
                     || "out",
                     cfg.out,
                     n - 1,
                     || Value::known(F::from(answer)),
                 )?;
+                cfg.q_out.enable(&mut region, n - 1)?;
                 Ok(out_cell)
             },
         )?;
@@ -1309,7 +2112,9 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
 /// Extracted verbatim so the circuit and any wrapper that embeds it
 /// (see `crate::inline_bind`) configure IDENTICAL constraints -- the
 /// chip's own `configure` alone is NOT sufficient here.
-pub fn configure_path4order_full<F: Field + Ord>(meta: &mut ConstraintSystem<F>) -> GraphPath4OrderConfig<F> {
+pub fn configure_path4order_full<F: Field + Ord>(
+    meta: &mut ConstraintSystem<F>,
+) -> GraphPath4OrderConfig<F> {
     let mut cfg = GraphPath4OrderChip::<F>::configure(meta);
 
     // Tables:
@@ -1321,46 +2126,45 @@ pub fn configure_path4order_full<F: Field + Ord>(meta: &mut ConstraintSystem<F>)
     let t2 = cfg.agg[2].clone();
 
     // helper: add join lookups (gap + map)
-    let mut add_join =
-        |step: usize, rel_dst: Column<Advice>, j: JoinConfig<F>, t: AggConfig<F>| {
-            // Gap pair: (low, high) are consecutive keys around dst, when in_next=0
-            meta.lookup_any(format!("gap pair step {}", step), move |m| {
-                let q_in = m.query_selector(j.q_lookup_complex); // complex
-                let inx = m.query_advice(j.in_next, Rotation::cur());
-                let gate = q_in * (Expression::Constant(F::ONE) - inx);
+    let mut add_join = |step: usize, rel_dst: Column<Advice>, j: JoinConfig<F>, t: AggConfig<F>| {
+        // Gap pair: (low, high) are consecutive keys around dst, when in_next=0
+        meta.lookup_any(format!("gap pair step {}", step), move |m| {
+            let q_in = m.query_selector(j.q_lookup_complex); // complex
+            let inx = m.query_advice(j.in_next, Rotation::cur());
+            let gate = q_in * (Expression::Constant(F::ONE) - inx);
 
-                let low = m.query_advice(j.low, Rotation::cur());
-                let high = m.query_advice(j.high, Rotation::cur());
+            let low = m.query_advice(j.low, Rotation::cur());
+            let high = m.query_advice(j.high, Rotation::cur());
 
-                let q_tbl = m.query_selector(t.q_map_tbl); // complex
-                let key = m.query_advice(t.map_pair[0], Rotation::cur());
-                let keyn = m.query_advice(t.map_key_next, Rotation::cur());
+            let q_tbl = m.query_selector(t.q_map_tbl); // complex
+            let key = m.query_advice(t.map_pair[0], Rotation::cur());
+            let keyn = m.query_advice(t.map_key_next, Rotation::cur());
 
-                vec![
-                    (gate.clone() * low, q_tbl.clone() * key),
-                    (gate * high, q_tbl * keyn),
-                ]
-            });
+            vec![
+                (gate.clone() * low, q_tbl.clone() * key),
+                (gate * high, q_tbl * keyn),
+            ]
+        });
 
-            // Map: (in*dst, val) exists in (map_key, map_val)
-            // If in=0, we force val=0 and in*dst=0, so (0,0) hits dummy row0.
-            meta.lookup_any(format!("map step {}", step), move |m| {
-                let q_in = m.query_selector(j.q_lookup_complex); // complex
-                let inx = m.query_advice(j.in_next, Rotation::cur());
+        // Map: (in*dst, val) exists in (map_key, map_val)
+        // If in=0, we force val=0 and in*dst=0, so (0,0) hits dummy row0.
+        meta.lookup_any(format!("map step {}", step), move |m| {
+            let q_in = m.query_selector(j.q_lookup_complex); // complex
+            let inx = m.query_advice(j.in_next, Rotation::cur());
 
-                let dst = m.query_advice(rel_dst, Rotation::cur());
-                let v = m.query_advice(j.val, Rotation::cur());
+            let dst = m.query_advice(rel_dst, Rotation::cur());
+            let v = m.query_advice(j.val, Rotation::cur());
 
-                let q_tbl = m.query_selector(t.q_map_tbl); // complex
-                let tk = m.query_advice(t.map_pair[0], Rotation::cur());
-                let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+            let q_tbl = m.query_selector(t.q_map_tbl); // complex
+            let tk = m.query_advice(t.map_pair[0], Rotation::cur());
+            let tv = m.query_advice(t.map_pair[1], Rotation::cur());
 
-                vec![
-                    (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
-                    (q_in * v, q_tbl * tv),
-                ]
-            });
-        };
+            vec![
+                (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
+                (q_in * v, q_tbl * tv),
+            ]
+        });
+    };
 
     // r3.dst -> T4
     add_join(2, cfg.r[2][1], cfg.join[2].clone(), t4);
@@ -1402,7 +2206,7 @@ mod tests {
     use crate::data::graph_data_processing::read_edges;
     use crate::data::graph_data_processing::read_edges_csv;
 
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
 
     use halo2_proofs::{
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
@@ -1421,6 +2225,7 @@ mod tests {
     };
     use halo2curves::pasta::{vesta, EqAffine, Fp};
     use rand::rngs::OsRng;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
     use std::{fs::File, io::Write, path::Path};
 
@@ -1520,6 +2325,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "inherited heavy end-to-end proof; the fast check is test_cardinality_preservation"]
     fn test() {
         // Use REAL dataset R1.tsv as requested
         let base_path = &crate::paths::graph_dir();
@@ -1544,10 +2350,14 @@ mod tests {
         };
 
         let public_input = vec![Fp::from(cnt)];
-        let k = 16;
+        // MockProver branch only: the full wiki_Vote slice is 103_689 rows, so
+        // it needs 2^17, the same degree as the param file the proof path loads.
+        let k = 17;
 
-        // let test = true;
-        let test = false;
+        // VPJOIN_MOCK=1 runs the MockProver check instead of a real proof.
+        let test = std::env::var("VPJOIN_MOCK")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
         if test {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
@@ -1556,5 +2366,159 @@ mod tests {
             let proof_path = &crate::paths::proof_file("wiki_proof_q2");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
+    }
+
+    /// The maximum gate degree of the whole constraint system. Every fix in this
+    /// file has to stay at or below the degree the circuit already had, since a
+    /// rise doubles every FFT of the prover.
+    #[test]
+    fn test_max_gate_degree() {
+        use halo2_proofs::plonk::ConstraintSystem;
+
+        let mut cs = ConstraintSystem::<Fp>::default();
+        let _ = <GraphPath4OrderCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
+        let degree = cs.degree();
+        println!("cs.degree() = {}", degree);
+        println!(
+            "advice = {}, fixed = {}, selectors = {}, lookups = {}, shuffles = {}, gates = {}",
+            cs.num_advice_columns(),
+            cs.num_fixed_columns(),
+            cs.num_selectors(),
+            cs.lookups().len(),
+            cs.shuffles().len(),
+            cs.gates().len()
+        );
+        assert!(
+            degree <= 7,
+            "the maximum gate degree rose to {}, which costs more than any fix \
+             in this file is worth",
+            degree
+        );
+    }
+
+    /// Fast correctness check of the One-Pass OBJ conditions this file carries:
+    /// a truncated slice of the real dataset under MockProver, which verifies
+    /// every gate, shuffle and lookup of the circuit without paying for a real
+    /// proof, then the negative direction of condition (4), then the all-clean
+    /// escape that condition (3) closes.
+    #[test]
+    fn test_cardinality_preservation() {
+        // small enough for MockProver, large enough that the reduction really
+        // drops tuples on every relation of the chain
+        const N_EDGES: usize = 4000;
+        let k = 14;
+
+        let base_path = &crate::paths::graph_dir();
+        let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
+        assert!(
+            !edges.is_empty(),
+            "dataset not found under {}/wiki/wiki_Vote.txt",
+            base_path
+        );
+        edges.truncate(N_EDGES);
+
+        // Non-vacuity of the third direction below: the slice must contain a
+        // tuple that passes its ordering predicate yet is not in the reduced
+        // instance, i.e. a dangling tuple the all-clean partition keeps. On an
+        // acyclic query a pairwise consistent instance is exactly a fully
+        // reduced one, so as soon as one relation's clean part is strictly
+        // smaller than its filtered part, the all-clean partition violates
+        // condition (3) on some edge.
+        let honest = GraphPath4OrderChip::<Fp>::reduce_clean(&edges, None);
+        let n_keep = edges.iter().filter(|e| e.src < e.dst).count();
+        let n_cln: Vec<usize> = (0..4)
+            .map(|r| honest[r].iter().filter(|&&c| c == 1).count())
+            .collect();
+        println!(
+            "slice: {} edges, {} pass src<dst, |R^c| = {:?}",
+            edges.len(),
+            n_keep,
+            n_cln
+        );
+        assert!(
+            n_cln[0] < n_keep,
+            "the slice has no dangling r1 tuple, so the all-clean partition \
+             would legitimately satisfy condition (3)"
+        );
+
+        let cnt = dp_count_path4_order(&edges);
+        let circuit = GraphPath4OrderCircuit::<Fp> {
+            edges,
+            _marker: PhantomData,
+        };
+        let public_input = vec![Fp::from(cnt)];
+
+        let prover = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
+        prover.assert_satisfied();
+
+        // Negative direction: the same witness with one joinable r1 tuple
+        // hidden in the residual side and the relations re-reduced around it,
+        // so the partition still satisfies Conservation and the clean
+        // projections still agree on every tree edge. Only condition (4) can
+        // see this, so the circuit must now reject.
+        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
+        let verdict = tampered.verify();
+        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
+        {
+            let mut kinds: Vec<String> = failures
+                .iter()
+                .map(|f| match f {
+                    VerifyFailure::ConstraintNotSatisfied { constraint, .. } => {
+                        format!("gate {}", constraint)
+                    }
+                    VerifyFailure::Lookup { name, .. } => format!("lookup {}", name),
+                    other => format!("{}", other),
+                })
+                .collect();
+            kinds.sort();
+            kinds.dedup();
+            println!("hidden joinable tuple rejected by: {:#?}", kinds);
+        }
+        assert!(
+            failures
+                .iter()
+                .any(|f| format!("{:?}", f).contains("cardinality preservation")),
+            "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: the all-clean partition. No reduction at all, every
+        // real tuple declared clean and the residual section empty.
+        // Conservation still holds and both channels of condition (4) compute
+        // the same number on every row, so condition (4) alone accepts this.
+        // Pairwise Consistency is what must reject it, through a "pw: " lookup.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let all_clean = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+        let verdict = all_clean.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
+        {
+            let mut kinds: Vec<String> = failures
+                .iter()
+                .map(|f| match f {
+                    VerifyFailure::ConstraintNotSatisfied { constraint, .. } => {
+                        format!("gate {}", constraint)
+                    }
+                    VerifyFailure::Lookup { name, .. } => format!("lookup {}", name),
+                    other => format!("{}", other),
+                })
+                .collect();
+            kinds.sort();
+            kinds.dedup();
+            println!("all-clean partition rejected by: {:#?}", kinds);
+        }
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected the all-clean partition, but not through a \
+             Pairwise Consistency lookup: {:?}",
+            failures
+        );
     }
 }

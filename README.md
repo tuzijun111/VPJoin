@@ -195,27 +195,40 @@ VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-
 VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
 ```
 
-**8. The two realizations of the One-Pass OBJ.** Every query ships twice. `*_obj.rs` is the
-earlier circuit and `*_obj_test.rs` the current one, with the same witness, the same aggregation
-and the same degree, so the two are directly comparable. `VPJOIN_OBJ=test` selects the second
-everywhere, and the reported `config` column gains a `+cp` suffix so a results file keeps the two
-apart:
+**8. The key-edge specialization.** Every query circuit in `sql/` and `graph_sql/` certifies the
+One-Pass OBJ: (7) Conservation, (9) Pairwise Consistency and (10) Cardinality Preservation, the
+last by the two-channel multiplicity count of `circuits/card_preserve.rs`. The five TPC-H queries
+additionally ship as `*_obj_key.rs`, which specializes (10) on *key edges*: an edge whose child
+holds at most one tuple per join key, where every multiplicity is a bit, so the per-key aggregation
+collapses and, when every edge of the tree is such an edge, the clean channel disappears entirely.
+The precondition is certified rather than assumed, by constraining the child's key column to be
+strictly increasing, and absence certification is kept, so a parent whose key occurs in no child
+tuple still exhibits its gap witness.
+
+`VPJOIN_OBJ=key` selects that variant and the reported `config` column gains a `+cpk` suffix.
+GQ1, GQ2 and GQ4 have no key edge, so they always run the general circuit:
 
 ```bash
-VPJOIN_OBJ=test cargo run --bin vpjoin_bench -- baseline
+VPJOIN_OBJ=key cargo run --bin vpjoin_bench -- baseline
 ```
 
-Each `*_obj_test.rs` carries its own fast correctness test, which checks the circuit under
-`MockProver` on a truncated slice of the dataset and then re-runs it with one joinable tuple
-hidden in the residual side and the neighbours re-reduced around it, so that conditions (1)-(3)
-still hold and only condition (4) can catch the cheat:
+Each circuit carries a fast correctness test that checks it under `MockProver` on a truncated
+slice, then re-runs it twice with a tampered witness: once with a joinable tuple hidden in the
+residual side and the neighbours re-reduced around it, so only condition (10) can catch it, and
+once with no reduction at all, so only condition (9) can:
 
 ```bash
 RUST_MIN_STACK=33554432 cargo test --lib test_cardinality_preservation
 ```
 
-What the two differ by in the arithmetization, per query and independently of the data, is
-reported by:
+`VPJOIN_MOCK=1` runs a circuit's heavy test under `MockProver` at full dataset scale instead of
+generating a real proof, which checks every gate, lookup and shuffle in seconds:
+
+```bash
+RUST_MIN_STACK=33554432 VPJOIN_MOCK=1 cargo test --release --lib sql::q3_obj::tests::test_1 -- --exact --ignored
+```
+
+What the two realizations cost in the arithmetization, per query and independently of the data:
 
 ```bash
 cargo run --release --bin obj_gate_cost

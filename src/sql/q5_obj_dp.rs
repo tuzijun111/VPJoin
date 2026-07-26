@@ -6,13 +6,18 @@ use crate::chips::lessthan_or_equal_generic::{
     LtEqGenericChip, LtEqGenericConfig, LtEqGenericInstruction,
 };
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
+use crate::circuits::card_preserve::{
+    assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
+    configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
+use std::collections::HashSet;
 use std::marker::PhantomData;
 
 // One shared definition of the PAD/sentinel discipline (from q5_obj).
 use super::q5_obj::{
-    q5_derive, Q5Chip, Q5Derived, MAX_SENTINEL, NUM_BYTES, PAD_REV, PAD_U64, SCALE, SHIFT_NATION,
+    q5_derive, Q5Chip, Q5Derived, NUM_BYTES, PAD_REV, PAD_U64, SCALE, SHIFT_NATION,
 };
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
@@ -82,6 +87,41 @@ pub enum Tamper {
     /// Overwrite one merge sentinel's nation key (merge sentinel gate and
     /// the drain shuffle must both reject).
     MergeSentinel,
+    /// Move one joinable LS tuple to the residual side and re-reduce the CO and
+    /// NR bags around it, so the partition still passes Conservation and
+    /// Pairwise Consistency and ONLY condition (10) can catch it. This is
+    /// exactly the cheat a residual-side-only argument misses, so the negative
+    /// test using it is what shows the Cardinality Preservation Check is not
+    /// vacuous. Multi-lane on purpose: the hidden tuple's contribution is
+    /// removed from one lane, and the check has to notice at the global root sum.
+    HideOneCleanTuple,
+    /// Skip the semijoin reduction entirely and declare every tuple that passes
+    /// its predicate clean, so all three residual sections are empty.
+    /// Conservation still holds and both channels of condition (10) then agree
+    /// row by row, so this is the escape only Pairwise Consistency can close,
+    /// and it is the non-vacuity witness for condition (9).
+    MarkAllClean,
+    /// Keep the honest partition but write `cflag_ls = 1` on one RESIDUAL
+    /// lineitem row, i.e. claim on the input side that one more occurrence went
+    /// to `LS^c` than the partition side carries. Only the LS Conservation
+    /// shuffle, which now carries the indicator as its fifth column, can see
+    /// this, so it is the non-vacuity witness for condition (7).
+    CleanFlagLie,
+    /// Break the canonical pad tuple on the very last lane row, which is past
+    /// `|LS^c|` and so outside every copy constraint. Before the repair those
+    /// rows were free advice that `perm_lsort` still carried into the lane
+    /// aggregation, the drain and the reported revenue.
+    LanePadRow,
+    /// Set the boundary cell one row past every lane's sorted view to that
+    /// lane's LAST sorted nation key, and derive the whole rest of the lane
+    /// witness consistently from it. Every gate then agrees: the group-boundary
+    /// detector reports "same group" on the last row, the emit gate FORCES the
+    /// sentinel there, the drain shuffle carries one fewer real partial and the
+    /// merge is built from it, so the lane's last group silently loses its tail
+    /// contribution and the reported revenue is wrong. Before the repair that
+    /// cell was free advice and this was accepted; now the boundary gate is the
+    /// only thing that rejects it.
+    LaneSentinel,
 }
 
 /// One lane: a full structural replica of q5_obj's ls_join + aggregation
@@ -101,6 +141,10 @@ pub struct LaneConfig<F: Field + Ord> {
     res_pad: Vec<Column<Advice>>,
     // fixed marker of this lane's merge segment [l*SEG, (l+1)*SEG)
     seg: Column<Fixed>,
+    // rows of THIS lane past the global clean prefix: the canonical PAD tuple.
+    // The boundary is lane-dependent (lane l is all-pad once l*lane_rows is past
+    // |LS^c|), so unlike every other lane selector this one cannot be shared.
+    q_ls_pad: Selector,
 }
 
 #[derive(Clone, Debug)]
@@ -117,68 +161,90 @@ pub struct Q5DpConfig<F: Field + Ord> {
     cond_europe: Column<Advice>,
     cond_start: Column<Advice>,
     cond_end: Column<Advice>,
+    // one per-proof choice instead of one per-row choice
+    q_cond_eu: Selector,
+    q_cond_dt: Selector,
 
     // ---------------- bag materialization: NR ----------------
     q_nr_join: Selector,
     q_nr_pred: Selector,
+    q_region_tbl: Selector, // TABLE side of the nation->region lookup
+    q_nr_pad: Selector,     // rows [nation.len(), nr_total): keep == 0
     nr_rname: Column<Advice>,
     nr_keep: Column<Advice>,
+    cflag_nr: Column<Advice>, // clean indicator per nation row
     nr_pair: Vec<Column<Advice>>,
     nr_filt_pad: Vec<Column<Advice>>,
-    nr_out_pad: Vec<Column<Advice>>,
+    nr_out_pad: Vec<Column<Advice>>, // [clean rows | residual rows | pad rows]
     perm_nr: PermAnyConfig,
     iz_nr: IsZeroConfig<F>,
 
     // ---------------- bag materialization: CO ----------------
     q_oc_join: Selector,
+    q_cust_tbl: Selector, // TABLE side of the orders->customer lookup
     q_co_ge: Selector,
     q_co_lt: Selector,
     q_co_and: Selector,
+    q_co_pad: Selector, // rows [orders.len(), co_total): keep == 0
     co_ge_ok: Column<Advice>,
     co_lt_ok: Column<Advice>,
     co_keep: Column<Advice>,
+    cflag_co: Column<Advice>, // clean indicator per order row
     co_nk: Column<Advice>,
     co_pair: Vec<Column<Advice>>,
+    co_pkey: Column<Advice>, // co_pair[0]*SHIFT_NATION + co_pair[1]
     co_filt_pad: Vec<Column<Advice>>,
-    co_out_pad: Vec<Column<Advice>>,
+    co_out_pad: Vec<Column<Advice>>, // [clean rows | residual rows | pad rows]
     perm_co: PermAnyConfig,
     lteq_start_le_odate: LtEqGenericConfig<F, NUM_BYTES>,
     lt_odate_lt_end: LtConfig<F, NUM_BYTES>,
 
     // ---------------- bag materialization: LS ----------------
     q_ls_join: Selector,
+    q_supp_tbl: Selector, // TABLE side of the lineitem->supplier lookup
     ls_mat: Vec<Column<Advice>>,
+    cflag_ls: Column<Advice>, // clean indicator per LS row
+    ls_pkey: Column<Advice>,  // ls_mat[0]*SHIFT_NATION + ls_mat[1]
 
     // ---------------- LS partition: disjoin side ----------------
     ls_disjoin: Vec<Column<Advice>>,
+    // 5 cols: the tuple plus the clean flag. Rows [0, |LS^c|) are copy-equal,
+    // in GLOBAL pipeline order, to the lanes' clean `ls_join` cells, which is
+    // what makes this the union-of-lanes view of `LS^c`.
     ls_part_pad: Vec<Column<Advice>>,
     perm_ls: PermAnyConfig,
 
-    // ---------------- membership + gap proof on ls_disjoin ----------------
-    q_flagged_lookup: Selector,
-    q_lookup_complex: Selector,
-    flags_in: Vec<Column<Advice>>,
-    range_low_high: Vec<Column<Advice>>,
+    // -------- condition (9), Pairwise Consistency --------
+    // One complex selector per relation of the cluster tree, enabled over
+    // exactly the clean section of that relation's partition group.
+    q_pw_ls: Selector, // rows [0, |LS^c|) of ls_part_pad (union of the lanes)
+    q_pw_co: Selector, // rows [0, |CO^c|) of co_out_pad
+    q_pw_nr: Selector, // rows [0, |NR^c|) of nr_out_pad
 
-    lt_co_gap_low: LtConfig<F, NUM_BYTES>,
-    lt_co_gap_high: LtConfig<F, NUM_BYTES>,
-    lt_nr_gap_low: LtConfig<F, NUM_BYTES>,
-    lt_nr_gap_high: LtConfig<F, NUM_BYTES>,
+    // -------- condition (10), Cardinality Preservation --------
+    // |R^c join| == |R join| over the cluster tree rooted at LS, accumulated
+    // over the whole root relation and compared ONCE.
+    cp_agg_co: CpAggConfig<F, NUM_BYTES>,
+    cp_agg_nr: CpAggConfig<F, NUM_BYTES>,
+    cp_join_co: CpJoinConfig<F, NUM_BYTES>,
+    cp_join_nr: CpJoinConfig<F, NUM_BYTES>,
+    cp_root: CpRootConfig,
+    q_cp_mu: Selector,
 
-    co_key: Column<Advice>,
-    co_key_next: Column<Advice>,
-    nr_key: Column<Advice>,
-    nr_key_next: Column<Advice>,
+    // clean/residual flag on the partition side of each Conservation Check
+    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1   [NR, CO, LS]
+    q_res_flag: Vec<Selector>, // rows of R^r: flag == 0   [NR, CO, LS]
+    q_pad_flag: Vec<Selector>, // pad tail: the whole row is the PAD tuple
 
     // ---------------- lanes (shared selectors, per-lane columns) ----------
     // All lanes are active on the SAME rows 0..lane_rows, so one selector of
     // each kind serves every lane; only the columns replicate.
     lanes: Vec<LaneConfig<F>>,
-    q_join_member: Selector, // membership lookups, all lane rows
     q_lane_line: Selector,
     q_lane_first: Selector,
     q_lane_accu: Selector,
-    q_drain: Selector, // LHS gate of the per-lane drain shuffles (complex)
+    q_lane_sentinel: Selector, // row lane_rows of every lane's ls_sorted
+    q_drain: Selector,         // LHS gate of the per-lane drain shuffles (complex)
 
     // ---------------- cross-lane merge ----------------
     merge_nk: Column<Advice>,
@@ -187,6 +253,12 @@ pub struct Q5DpConfig<F: Field + Ord> {
     q_merge: Selector,
     msort: Vec<Column<Advice>>, // merge sorted by nk, sentinels last
     perm_merge: PermAnyConfig,
+    // msort[0] is nondecreasing: this is the LAST grouping before the answer,
+    // so unlike the lane-local sorts its order has to be proved
+    q_sort_m: Selector,
+    q_m_sentinel: Selector, // row m_total of msort, read by iz_m_same_next
+    lt_m_cur_next: LtConfig<F, NUM_BYTES>,
+    iz_m_key_eq: IsZeroConfig<F>,
 
     // ---------------- final aggregation over the merge region -------------
     q_m_line: Selector,
@@ -198,6 +270,9 @@ pub struct Q5DpConfig<F: Field + Ord> {
     // [nationkey_shift, n_name_hash, revenue], as q5_obj's res_pad
     m_res_pad: Vec<Column<Advice>>,
     q_m_res_lookup: Selector,
+    // degree-1 stand-in for `1 - iz_m_same_next.expr()`, so the name lookup can
+    // afford to gate its TABLE side without raising the circuit's degree
+    m_res_is_last: Column<Advice>,
 
     // ORDER BY revenue DESC
     m_res_sorted: Vec<Column<Advice>>,
@@ -261,33 +336,76 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let cond_start = meta.advice_column();
         let cond_end = meta.advice_column();
 
+        // -------- query parameters are constant down the column --------
+        // The three parameter columns are plain advice read at Rotation::cur
+        // inside the per-row predicate chips. Without a cross-row tie each row
+        // carries its OWN window: `co_keep = ge * lt` accepts an out-of-window
+        // order by widening `cond_start`/`cond_end` on that row alone, and
+        // `nr_keep` accepts a non-European nation by setting `cond_europe` to
+        // that row's `nr_rname`. The circuit would then certify the answer of no
+        // single Q5 instance. These two gates turn the per-row prover choice
+        // into one per-proof choice.
+        let q_cond_eu = meta.selector();
+        let q_cond_dt = meta.selector();
+        meta.create_gate("cond_europe is constant", |m| {
+            let q = m.query_selector(q_cond_eu);
+            vec![
+                q * (m.query_advice(cond_europe, Rotation::cur())
+                    - m.query_advice(cond_europe, Rotation::next())),
+            ]
+        });
+        meta.create_gate("date window is constant", |m| {
+            let q = m.query_selector(q_cond_dt);
+            vec![
+                q.clone()
+                    * (m.query_advice(cond_start, Rotation::cur())
+                        - m.query_advice(cond_start, Rotation::next())),
+                q * (m.query_advice(cond_end, Rotation::cur())
+                    - m.query_advice(cond_end, Rotation::next())),
+            ]
+        });
+
         // ---------------- NR materialization (as q5_obj) ----------------
         let q_nr_join = meta.complex_selector();
         let q_nr_pred = meta.selector();
+        // The TABLE side of a `lookup_any` is 0 on rows where its selector is
+        // off, so gating it with a selector enabled over exactly the dimension
+        // table's real rows is what makes the lookup relation the ASSIGNED
+        // prefix instead of the whole (mostly free-advice) column.
+        let q_region_tbl = meta.complex_selector();
+        // The NR permutation runs over nr_total >= nation.len() rows, so the
+        // link gate below is live on rows that carry no nation. There `nr_keep`
+        // is free advice, and keep = 1 injects an arbitrary triple straight into
+        // nr_filt_pad and, through the Conservation shuffle, into nr_out_pad.
+        let q_nr_pad = meta.selector();
 
         let nr_rname = meta.advice_column();
         let nr_keep = meta.advice_column();
+        let cflag_nr = meta.advice_column();
 
         let nr_pair = vec![meta.advice_column(), meta.advice_column()];
+        // One column wider than before: the last column of each side carries the
+        // clean indicator, so the Conservation Check binds it.
         let (nr_filt_pad, nr_out_pad, perm_nr) = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
-            let a = vec![meta.advice_column(), meta.advice_column()];
-            let b = vec![meta.advice_column(), meta.advice_column()];
+            let a = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+            let b = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
             let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
             (a, b, perm)
         };
 
         meta.lookup_any("nation_region_join", |m| {
             let q = m.query_selector(q_nr_join);
+            let qt = m.query_selector(q_region_tbl);
             vec![
                 (
                     q.clone() * m.query_advice(nation[2], Rotation::cur()),
-                    m.query_advice(region_file[0], Rotation::cur()),
+                    qt.clone() * m.query_advice(region_file[0], Rotation::cur()),
                 ),
                 (
                     q * m.query_advice(nr_rname, Rotation::cur()),
-                    m.query_advice(region_file[1], Rotation::cur()),
+                    qt * m.query_advice(region_file[1], Rotation::cur()),
                 ),
             ]
         });
@@ -321,16 +439,42 @@ impl<F: Field + Ord> Q5DpChip<F> {
             vec![q.clone() * (p0 - nk), q * (p1 - nm)]
         });
 
+        // The clean indicator is a BIT. Nothing else says so: the link gate
+        // bool-checks `nr_keep` only, `q_cln_flag`/`q_res_flag` pin the flag on
+        // the clean and residual sections of the partition side but not on its
+        // pad tail, and `card_preserve` puts no range check on v_cln. A value
+        // such as 1 + 1/k parked in that tail inflates the clean channel of
+        // condition (10) by a fraction, which is exactly the compensation the
+        // check exists to forbid.
+        meta.create_gate("cflag_nr is a bit", |m| {
+            let q = m.query_selector(q_nr_pred);
+            let c = m.query_advice(cflag_nr, Rotation::cur());
+            vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+        });
+
+        // NR padding rows carry no nation, so their predicate bit is 0 and the
+        // link gate then forces the whole nr_filt_pad row to the PAD tuple.
+        meta.create_gate("NR pad row keeps nothing", |m| {
+            let q = m.query_selector(q_nr_pad);
+            vec![q * m.query_advice(nr_keep, Rotation::cur())]
+        });
+
+        // link nr_filt_pad = keep? [nr_pair, cflag_nr] : [PAD, PAD, 0]
+        // The indicator column pads with 0, so a nation dropped by the EUROPE
+        // predicate is never clean and contributes to neither channel of the
+        // Cardinality Preservation Check.
+        let nr_base = [nr_pair[0], nr_pair[1], cflag_nr];
+        let nr_base_pad = [PAD_U64, PAD_U64, 0u64];
         meta.create_gate("link nr_filt_pad", |m| {
             let q = m.query_selector(perm_nr.q_perm1);
             let keep = m.query_advice(nr_keep, Rotation::cur());
             let one = Expression::Constant(F::ONE);
             let drop = one.clone() - keep.clone();
             let mut cs = vec![q.clone() * keep.clone() * (one.clone() - keep.clone())];
-            for j in 0..2 {
-                let b = m.query_advice(nr_pair[j], Rotation::cur());
+            for j in 0..3 {
+                let b = m.query_advice(nr_base[j], Rotation::cur());
                 let f = m.query_advice(nr_filt_pad[j], Rotation::cur());
-                let p = Expression::Constant(F::from(PAD_U64));
+                let p = Expression::Constant(F::from(nr_base_pad[j]));
                 cs.push(q.clone() * (f - (keep.clone() * b + drop.clone() * p)));
             }
             cs
@@ -338,35 +482,40 @@ impl<F: Field + Ord> Q5DpChip<F> {
 
         // ---------------- CO materialization (as q5_obj) ----------------
         let q_oc_join = meta.complex_selector();
+        let q_cust_tbl = meta.complex_selector();
         let q_co_ge = meta.selector();
         let q_co_lt = meta.selector();
         let q_co_and = meta.selector();
+        let q_co_pad = meta.selector();
 
         let co_ge_ok = meta.advice_column();
         let co_lt_ok = meta.advice_column();
         let co_keep = meta.advice_column();
+        let cflag_co = meta.advice_column();
 
         let co_nk = meta.advice_column();
         let co_pair = vec![meta.advice_column(), meta.advice_column()];
+        let co_pkey = meta.advice_column();
         let (co_filt_pad, co_out_pad, perm_co) = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
-            let a = vec![meta.advice_column(), meta.advice_column()];
-            let b = vec![meta.advice_column(), meta.advice_column()];
+            let a = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+            let b = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
             let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
             (a, b, perm)
         };
 
         meta.lookup_any("orders_customer_join", |m| {
             let q = m.query_selector(q_oc_join);
+            let qt = m.query_selector(q_cust_tbl);
             vec![
                 (
                     q.clone() * m.query_advice(orders[1], Rotation::cur()),
-                    m.query_advice(customer[0], Rotation::cur()),
+                    qt.clone() * m.query_advice(customer[0], Rotation::cur()),
                 ),
                 (
                     q * m.query_advice(co_nk, Rotation::cur()),
-                    m.query_advice(customer[1], Rotation::cur()),
+                    qt * m.query_advice(customer[1], Rotation::cur()),
                 ),
             ]
         });
@@ -378,6 +527,18 @@ impl<F: Field + Ord> Q5DpChip<F> {
             let p0 = m.query_advice(co_pair[0], Rotation::cur());
             let p1 = m.query_advice(co_pair[1], Rotation::cur());
             vec![q.clone() * (p0 - ok), q * (p1 - nk)]
+        });
+
+        // The CO edge of the cluster tree is keyed by the composite
+        // (orderkey, nationkey_shift), packed exactly the way the rest of the
+        // file packs it. The Cardinality Preservation Check indexes the child
+        // bag by a single column, so the packed key gets one.
+        meta.create_gate("co_pkey = okey*SHIFT_NATION + nk", |m| {
+            let q = m.query_selector(q_co_and);
+            let ok = m.query_advice(co_pair[0], Rotation::cur());
+            let nk = m.query_advice(co_pair[1], Rotation::cur());
+            let pk = m.query_advice(co_pkey, Rotation::cur());
+            vec![q * (pk - (ok * Expression::Constant(F::from(SHIFT_NATION)) + nk))]
         });
 
         let lteq_start_le_odate = LtEqGenericChip::<F, NUM_BYTES>::configure(
@@ -424,16 +585,32 @@ impl<F: Field + Ord> Q5DpChip<F> {
             ]
         });
 
+        // same two patches as on the NR side: the clean indicator is a bit, and
+        // a CO padding row (one past orders.len(), still inside the Conservation
+        // permutation) keeps nothing, so its co_filt_pad row is the PAD tuple.
+        meta.create_gate("cflag_co is a bit", |m| {
+            let q = m.query_selector(q_co_and);
+            let c = m.query_advice(cflag_co, Rotation::cur());
+            vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+        });
+        meta.create_gate("CO pad row keeps nothing", |m| {
+            let q = m.query_selector(q_co_pad);
+            vec![q * m.query_advice(co_keep, Rotation::cur())]
+        });
+
+        // link co_filt_pad = keep? [co_pair, cflag_co] : [PAD, PAD, 0]
+        let co_base = [co_pair[0], co_pair[1], cflag_co];
+        let co_base_pad = [PAD_U64, PAD_U64, 0u64];
         meta.create_gate("link co_filt_pad", |m| {
             let q = m.query_selector(perm_co.q_perm1);
             let keep = m.query_advice(co_keep, Rotation::cur());
             let one = Expression::Constant(F::ONE);
             let drop = one.clone() - keep.clone();
             let mut cs = vec![q.clone() * keep.clone() * (one.clone() - keep.clone())];
-            for j in 0..2 {
-                let b = m.query_advice(co_pair[j], Rotation::cur());
+            for j in 0..3 {
+                let b = m.query_advice(co_base[j], Rotation::cur());
                 let f = m.query_advice(co_filt_pad[j], Rotation::cur());
-                let p = Expression::Constant(F::from(PAD_U64));
+                let p = Expression::Constant(F::from(co_base_pad[j]));
                 cs.push(q.clone() * (f - (keep.clone() * b + drop.clone() * p)));
             }
             cs
@@ -441,6 +618,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
 
         // ---------------- LS materialization (as q5_obj) ----------------
         let q_ls_join = meta.complex_selector();
+        let q_supp_tbl = meta.complex_selector();
         let ls_mat = vec![
             meta.advice_column(),
             meta.advice_column(),
@@ -450,16 +628,37 @@ impl<F: Field + Ord> Q5DpChip<F> {
 
         meta.lookup_any("lineitem_supplier_join", |m| {
             let q = m.query_selector(q_ls_join);
+            let qt = m.query_selector(q_supp_tbl);
             vec![
                 (
                     q.clone() * m.query_advice(lineitem[1], Rotation::cur()),
-                    m.query_advice(supplier[0], Rotation::cur()),
+                    qt.clone() * m.query_advice(supplier[0], Rotation::cur()),
                 ),
                 (
                     q * m.query_advice(ls_mat[1], Rotation::cur()),
-                    m.query_advice(supplier[1], Rotation::cur()),
+                    qt * m.query_advice(supplier[1], Rotation::cur()),
                 ),
             ]
+        });
+
+        let cflag_ls = meta.advice_column();
+        let ls_pkey = meta.advice_column();
+
+        // `cflag_ls` is the factor of the root clean multiplicity, so state its
+        // booleanity directly rather than argue it from the partition layout.
+        meta.create_gate("cflag_ls is a bit", |m| {
+            let q = m.query_selector(q_ls_join);
+            let c = m.query_advice(cflag_ls, Rotation::cur());
+            vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+        });
+
+        // the same packed key on the parent side of the LS -> CO edge
+        meta.create_gate("ls_pkey = okey*SHIFT_NATION + nk", |m| {
+            let q = m.query_selector(q_ls_join);
+            let ok = m.query_advice(ls_mat[0], Rotation::cur());
+            let nk = m.query_advice(ls_mat[1], Rotation::cur());
+            let pk = m.query_advice(ls_pkey, Rotation::cur());
+            vec![q * (pk - (ok * Expression::Constant(F::from(SHIFT_NATION)) + nk))]
         });
 
         meta.create_gate("ls_mat copies lineitem cols", |m| {
@@ -479,20 +678,22 @@ impl<F: Field + Ord> Q5DpChip<F> {
             ]
         });
 
-        // ---------------- LS partition permutation ----------------
-        // ls_join is now laned; ls_disjoin and ls_part_pad stay one group.
+        // ---------------- LS partition permutation, condition (7) ----------
+        // ls_join is laned; ls_disjoin and ls_part_pad stay ONE column group.
+        // That is the whole reason condition (7) survives the lane split: the
+        // partition side of the shuffle is a single group of |lineitem| rows
+        // whose clean prefix is copy-linked, in global pipeline order, to the
+        // lanes' ls_join cells, so the multiset the shuffle fixes is the UNION
+        // over lanes and not one lane at a time.
         let ls_disjoin = vec![
             meta.advice_column(),
             meta.advice_column(),
             meta.advice_column(),
             meta.advice_column(),
         ];
-        let ls_part_pad = vec![
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        ];
+        // One column wider than before: the clean indicator rides along, so the
+        // LS Conservation Check binds it.
+        let ls_part_pad = (0..5).map(|_| meta.advice_column()).collect::<Vec<_>>();
         for &c in ls_disjoin.iter().chain(ls_part_pad.iter()) {
             meta.enable_equality(c);
         }
@@ -500,144 +701,183 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let perm_ls = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
-            PermAnyChip::configure(meta, q1, q2, ls_mat.clone(), ls_part_pad.clone())
+            let mut ls_in = ls_mat.clone();
+            ls_in.push(cflag_ls);
+            PermAnyChip::configure(meta, q1, q2, ls_in, ls_part_pad.clone())
         };
 
-        // ---------------- membership + gap proof (as q5_obj) ----------------
-        let q_flagged_lookup = meta.selector();
-        let q_lookup_complex = meta.complex_selector();
-        let q_join_member = meta.complex_selector();
+        // -------- partition side of the clean indicator: 1 on R^c, 0 on R^r ----
+        // Each partition column group is laid out as [clean rows | residual rows
+        // | pad rows], so one selector per section pins the indicator. Without
+        // these the prover could mark a residual row clean and inflate the clean
+        // channel of condition (10).
+        let q_cln_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
+        let q_res_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
+        // ... and one for the third section. Without it the pad tail of
+        // nr_out_pad / co_out_pad is the one place a flag = 1 row can sit while
+        // being outside the clean section: the Conservation shuffle only fixes the
+        // MULTISET, so the count of flag = 1 rows on the input side could exceed
+        // |R^c| with the surplus parked in the tail, and each surplus row still
+        // feeds the clean channel of condition (10) through `*_filt_pad[2]`. Those
+        // rows are also inside the table of the name-attachment lookup, so pinning
+        // the whole row (not just the flag) to the canonical PAD tuple is what
+        // stops a fabricated (nationkey, name) pair from living there.
+        let q_pad_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
 
-        let flags_in = vec![meta.advice_column(), meta.advice_column()];
-        let range_low_high = vec![
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        ];
+        for (idx, part) in [nr_out_pad.clone(), co_out_pad.clone(), ls_part_pad.clone()]
+            .iter()
+            .enumerate()
+        {
+            let cols = part.clone();
+            let flag_col = *part.last().unwrap();
+            let q_c = q_cln_flag[idx];
+            let q_r = q_res_flag[idx];
+            let q_p = q_pad_flag[idx];
+            meta.create_gate("clean indicator on the partition side", move |m| {
+                let qc = m.query_selector(q_c);
+                let qr = m.query_selector(q_r);
+                let qp = m.query_selector(q_p);
+                let f = m.query_advice(flag_col, Rotation::cur());
+                let mut cs = vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f];
+                let last = cols.len() - 1;
+                for (j, &c) in cols.iter().enumerate() {
+                    let v = m.query_advice(c, Rotation::cur());
+                    let want = if j == last {
+                        Expression::Constant(F::ZERO)
+                    } else {
+                        Expression::Constant(F::from(PAD_U64))
+                    };
+                    cs.push(qp.clone() * (v - want));
+                }
+                cs
+            });
+        }
 
-        let lt_co_gap_low = LtChip::<F, NUM_BYTES>::configure(
+        // ---------------- condition (9), Pairwise Consistency ----------------
+        // Two mutual Membership Checks per edge of the cluster tree, each looking
+        // one clean relation's key column up DIRECTLY in the adjacent clean
+        // relation's key column. The previous version of this file had, per lane,
+        // only the LS -> child direction, and it looked into plain advice columns
+        // (`co_key` / `nr_key`) filled from the FULL filtered bags. Three holes:
+        //
+        //  * nothing bound those tables to the relation they claimed to
+        //    enumerate, so a prover could fill them with pi_K(LS^c) and pass;
+        //  * the mirror direction was missing, so a CO^c or NR^c tuple whose key
+        //    matched no clean LS tuple contributed to neither channel of
+        //    condition (10) and was invisible;
+        //  * being per lane, the LS side spoke about a lane, not about LS^c.
+        //
+        // All three go away by running both directions of both edges between the
+        // clean key columns themselves, with the LS side taken on `ls_part_pad`,
+        // which is the union of the lanes (see the module header).
+        //
+        // A lookup input is 0 on every row where its selector is off, and the
+        // table side is 0 on those rows too, so 0 is always in the table and the
+        // gated-off rows cost nothing. Real orderkeys are at least 1 in TPC-H and
+        // every nationkey is stored shifted by +1, so both keys are nonzero on the
+        // rows that matter and the containment is over the real keys.
+        let q_pw_ls = meta.complex_selector();
+        let q_pw_co = meta.complex_selector();
+        let q_pw_nr = meta.complex_selector();
+
+        let ls_ok = ls_part_pad[0];
+        let ls_nk = ls_part_pad[1];
+        let co_ok = co_out_pad[0];
+        let co_nk_p = co_out_pad[1];
+        let nr_nk = nr_out_pad[0];
+
+        // edge (LS, CO) on the packed (o_orderkey, nationkey_shift) key
+        meta.lookup_any("pw: LS^c pkey in CO^c pkey", move |m| {
+            let s = Expression::Constant(F::from(SHIFT_NATION));
+            let lhs = m.query_selector(q_pw_ls)
+                * (m.query_advice(ls_ok, Rotation::cur()) * s.clone()
+                    + m.query_advice(ls_nk, Rotation::cur()));
+            let rhs = m.query_selector(q_pw_co)
+                * (m.query_advice(co_ok, Rotation::cur()) * s
+                    + m.query_advice(co_nk_p, Rotation::cur()));
+            vec![(lhs, rhs)]
+        });
+        meta.lookup_any("pw: CO^c pkey in LS^c pkey", move |m| {
+            let s = Expression::Constant(F::from(SHIFT_NATION));
+            let lhs = m.query_selector(q_pw_co)
+                * (m.query_advice(co_ok, Rotation::cur()) * s.clone()
+                    + m.query_advice(co_nk_p, Rotation::cur()));
+            let rhs = m.query_selector(q_pw_ls)
+                * (m.query_advice(ls_ok, Rotation::cur()) * s
+                    + m.query_advice(ls_nk, Rotation::cur()));
+            vec![(lhs, rhs)]
+        });
+
+        // edge (LS, NR) on nationkey_shift
+        meta.lookup_any("pw: LS^c nationkey in NR^c nationkey", move |m| {
+            let lhs = m.query_selector(q_pw_ls) * m.query_advice(ls_nk, Rotation::cur());
+            let rhs = m.query_selector(q_pw_nr) * m.query_advice(nr_nk, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
+        meta.lookup_any("pw: NR^c nationkey in LS^c nationkey", move |m| {
+            let lhs = m.query_selector(q_pw_nr) * m.query_advice(nr_nk, Rotation::cur());
+            let rhs = m.query_selector(q_pw_ls) * m.query_advice(ls_nk, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
+
+        // ------------- condition (10), Cardinality Preservation -------------
+        // One fixed column serves every Lt chip of the check (and the merge
+        // sortedness ladder below), so the whole thing costs one u8 range table.
+        let cp_u8 = meta.fixed_column();
+
+        // Children of the root. Both are leaves, so their two multiplicity
+        // columns are columns the circuit already has: the predicate bit is the
+        // input channel and the BOUND indicator (keep * c, the last column of the
+        // filt_pad side of the Conservation Check) is the clean one.
+        let cp_agg_co = configure_cp_agg::<F, NUM_BYTES>(
             meta,
-            |m| {
-                let q = m.query_selector(q_flagged_lookup);
-                let in_co = m.query_advice(flags_in[0], Rotation::cur());
-                q * (Expression::Constant(F::ONE) - in_co)
-            },
-            |m| m.query_advice(range_low_high[0], Rotation::cur()),
-            |m| {
-                m.query_advice(ls_disjoin[0], Rotation::cur())
-                    * Expression::Constant(F::from(SHIFT_NATION))
-                    + m.query_advice(ls_disjoin[1], Rotation::cur())
-            },
+            cp_u8,
+            co_pkey,
+            co_keep,
+            co_filt_pad[2],
+            PAD_U64,
         );
-        let lt_co_gap_high = LtChip::<F, NUM_BYTES>::configure(
+        let cp_agg_nr = configure_cp_agg::<F, NUM_BYTES>(
             meta,
-            |m| {
-                let q = m.query_selector(q_flagged_lookup);
-                let in_co = m.query_advice(flags_in[0], Rotation::cur());
-                q * (Expression::Constant(F::ONE) - in_co)
-            },
-            |m| {
-                m.query_advice(ls_disjoin[0], Rotation::cur())
-                    * Expression::Constant(F::from(SHIFT_NATION))
-                    + m.query_advice(ls_disjoin[1], Rotation::cur())
-            },
-            |m| m.query_advice(range_low_high[1], Rotation::cur()),
+            cp_u8,
+            nr_pair[0],
+            nr_keep,
+            nr_filt_pad[2],
+            PAD_U64,
         );
 
-        let lt_nr_gap_low = LtChip::<F, NUM_BYTES>::configure(
-            meta,
-            |m| {
-                let q = m.query_selector(q_flagged_lookup);
-                let in_nr = m.query_advice(flags_in[1], Rotation::cur());
-                q * (Expression::Constant(F::ONE) - in_nr)
-            },
-            |m| m.query_advice(range_low_high[2], Rotation::cur()),
-            |m| m.query_advice(ls_disjoin[1], Rotation::cur()),
-        );
-        let lt_nr_gap_high = LtChip::<F, NUM_BYTES>::configure(
-            meta,
-            |m| {
-                let q = m.query_selector(q_flagged_lookup);
-                let in_nr = m.query_advice(flags_in[1], Rotation::cur());
-                q * (Expression::Constant(F::ONE) - in_nr)
-            },
-            |m| m.query_advice(ls_disjoin[1], Rotation::cur()),
-            |m| m.query_advice(range_low_high[3], Rotation::cur()),
-        );
+        // Parent side, on the rows of LS (one per lineitem row). These columns
+        // are NOT laned: the root traversal runs over the whole root relation in
+        // base-relation order, so both channels are accumulated globally and the
+        // single equality below compares two totals over the union of the lanes.
+        let cp_join_co = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, ls_pkey);
+        let cp_join_nr = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, ls_mat[1]);
+        wire_cp_edge(meta, &cp_join_co, &cp_agg_co, ls_pkey);
+        wire_cp_edge(meta, &cp_join_nr, &cp_agg_nr, ls_mat[1]);
 
-        let co_key = meta.advice_column();
-        let co_key_next = meta.advice_column();
-        let nr_key = meta.advice_column();
-        let nr_key_next = meta.advice_column();
-
-        meta.lookup_any("CO member (ls_disjoin)", |m| {
-            let q = m.query_selector(q_lookup_complex);
-            let in_co = m.query_advice(flags_in[0], Rotation::cur());
-            let key = (m.query_advice(ls_disjoin[0], Rotation::cur())
-                * Expression::Constant(F::from(SHIFT_NATION)))
-                + m.query_advice(ls_disjoin[1], Rotation::cur());
-            vec![(q * in_co * key, m.query_advice(co_key, Rotation::cur()))]
-        });
-        meta.lookup_any("CO gap pair (ls_disjoin)", |m| {
-            let q = m.query_selector(q_lookup_complex);
-            let in_co = m.query_advice(flags_in[0], Rotation::cur());
-            let gate = q * (Expression::Constant(F::ONE) - in_co);
-            vec![
-                (
-                    gate.clone() * m.query_advice(range_low_high[0], Rotation::cur()),
-                    m.query_advice(co_key, Rotation::cur()),
-                ),
-                (
-                    gate * m.query_advice(range_low_high[1], Rotation::cur()),
-                    m.query_advice(co_key_next, Rotation::cur()),
-                ),
-            ]
-        });
-
-        meta.lookup_any("NR member (ls_disjoin)", |m| {
-            let q = m.query_selector(q_lookup_complex);
-            let in_nr = m.query_advice(flags_in[1], Rotation::cur());
-            let nk = m.query_advice(ls_disjoin[1], Rotation::cur());
-            vec![(q * in_nr * nk, m.query_advice(nr_key, Rotation::cur()))]
-        });
-        meta.lookup_any("NR gap pair (ls_disjoin)", |m| {
-            let q = m.query_selector(q_lookup_complex);
-            let in_nr = m.query_advice(flags_in[1], Rotation::cur());
-            let gate = q * (Expression::Constant(F::ONE) - in_nr);
-            vec![
-                (
-                    gate.clone() * m.query_advice(range_low_high[2], Rotation::cur()),
-                    m.query_advice(nr_key, Rotation::cur()),
-                ),
-                (
-                    gate * m.query_advice(range_low_high[3], Rotation::cur()),
-                    m.query_advice(nr_key_next, Rotation::cur()),
-                ),
-            ]
-        });
-
-        meta.create_gate("LS disjoin emptiness (not both memberships)", |m| {
-            let q = m.query_selector(q_flagged_lookup);
-            let in_co = m.query_advice(flags_in[0], Rotation::cur());
-            let in_nr = m.query_advice(flags_in[1], Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-
-            let co_low_ok = lt_co_gap_low.is_lt(m, None);
-            let co_high_ok = lt_co_gap_high.is_lt(m, None);
-            let nr_low_ok = lt_nr_gap_low.is_lt(m, None);
-            let nr_high_ok = lt_nr_gap_high.is_lt(m, None);
-
-            vec![
-                q.clone() * in_co.clone() * (one.clone() - in_co.clone()),
-                q.clone() * in_nr.clone() * (one.clone() - in_nr.clone()),
-                q.clone() * in_co.clone() * in_nr.clone(),
-                q.clone() * (one.clone() - in_co.clone()) * (one.clone() - co_low_ok),
-                q.clone() * (one.clone() - in_co.clone()) * (one.clone() - co_high_ok),
-                q.clone() * (one.clone() - in_nr.clone()) * (one.clone() - nr_low_ok),
-                q * (one.clone() - in_nr) * (one - nr_high_ok),
-            ]
-        });
+        let cp_root = configure_cp_root::<F>(meta);
+        let q_cp_mu = meta.selector();
+        {
+            let s_all_co = cp_join_co.s_all;
+            let s_cln_co = cp_join_co.s_cln;
+            let s_all_nr = cp_join_nr.s_all;
+            let s_cln_nr = cp_join_nr.s_cln;
+            let mu_all = cp_root.mu_all;
+            let mu_cln = cp_root.mu_cln;
+            meta.create_gate("cp: root multiplicities over LS", move |m| {
+                let q = m.query_selector(q_cp_mu);
+                // LS carries no in-relation predicate, so pred_LS == 1 and every
+                // lineitem row contributes exactly one LS tuple.
+                let all = m.query_advice(mu_all, Rotation::cur())
+                    - m.query_advice(s_all_co, Rotation::cur())
+                        * m.query_advice(s_all_nr, Rotation::cur());
+                let cln = m.query_advice(mu_cln, Rotation::cur())
+                    - m.query_advice(cflag_ls, Rotation::cur())
+                        * m.query_advice(s_cln_co, Rotation::cur())
+                        * m.query_advice(s_cln_nr, Rotation::cur());
+                vec![q.clone() * all, q * cln]
+            });
+        }
 
         // ---------------- cross-lane merge columns ----------------
         // Declared before the lanes so each lane's drain shuffle can target
@@ -655,6 +895,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let q_lane_line = meta.selector();
         let q_lane_first = meta.selector();
         let q_lane_accu = meta.selector();
+        let q_lane_sentinel = meta.selector();
         let q_lane_perm1 = meta.complex_selector();
         let q_lane_perm2 = meta.complex_selector();
 
@@ -677,23 +918,62 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 meta.enable_equality(c);
             }
 
-            // join rows must be members of both sets (as q5_obj, per lane;
-            // pad rows carry the MAX_SENTINEL keys, which both key tables
-            // contain, so the selector covers ALL lane rows)
-            meta.lookup_any("CO member (ls_join lane)", |m| {
-                let q = m.query_selector(q_join_member);
-                let key = (m.query_advice(ls_join[0], Rotation::cur())
-                    * Expression::Constant(F::from(SHIFT_NATION)))
-                    + m.query_advice(ls_join[1], Rotation::cur());
-                vec![(q * key, m.query_advice(co_key, Rotation::cur()))]
-            });
-            meta.lookup_any("NR member (ls_join lane)", |m| {
-                let q = m.query_selector(q_join_member);
-                let nk = m.query_advice(ls_join[1], Rotation::cur());
-                vec![(q * nk, m.query_advice(nr_key, Rotation::cur()))]
-            });
+            // Rows of this lane past the global clean prefix. `ls_part_pad`'s
+            // copy constraints stop at |LS^c| and the Pairwise Consistency
+            // selectors stop there too, so these rows are outside every other
+            // argument -- yet `perm_lsort` carries whatever sits in them into
+            // ls_sorted, hence into line_rev, run_sum, res_pad, the drain
+            // shuffle, the merge sum and the reported revenue. As free advice
+            // they are a direct forgery of the query answer, and at the
+            // benchmarked release most lane rows ARE pad rows. Pinning them to
+            // the canonical pad tuple [0, PAD, 0, 0] is what makes them inert;
+            // gating them out of `perm_lsort` instead would change what the
+            // lane pipeline proves.
+            let q_ls_pad = meta.selector();
+            {
+                let cols = ls_join.clone();
+                meta.create_gate("lane ls_join pad tail is PAD", move |m| {
+                    let q = m.query_selector(q_ls_pad);
+                    let want = [F::ZERO, F::from(PAD_U64), F::ZERO, F::ZERO];
+                    cols.iter()
+                        .zip(want.iter())
+                        .map(|(&c, &w)| {
+                            q.clone()
+                                * (m.query_advice(c, Rotation::cur()) - Expression::Constant(w))
+                        })
+                        .collect::<Vec<_>>()
+                });
+            }
 
-            // lane-local sort by nation key
+            // The sentinel row `lane_rows` of this lane's ls_sorted, which
+            // `iz_same_next` reads at row lane_rows-1 to close the last group.
+            // Unpinned, setting it equal to the last sorted nationkey makes
+            // iz_same_next report "same group" on the last real row; the lane
+            // emit gate then FORCES res_pad to the SENTINEL there and that
+            // group's partial revenue silently disappears from the merge, so a
+            // whole nation loses its tail contribution. The pinned value is 0,
+            // not PAD: real nationkeys are stored shifted by +1 and pad rows are
+            // keyed at PAD_U64, so 0 differs from every key that can appear at
+            // row lane_rows-1 and closes BOTH a real last group and a trailing
+            // PAD-keyed group (whose emitted sum is then 0 = the sentinel).
+            {
+                let nk_col = ls_sorted[1];
+                meta.create_gate("lane ls_sorted group-by sentinel is 0", move |m| {
+                    let q = m.query_selector(q_lane_sentinel);
+                    vec![q * m.query_advice(nk_col, Rotation::cur())]
+                });
+            }
+
+            // Lane-local sort by nation key. Deliberately NOT proved sorted,
+            // and that is sound here: the run_sum ladder splits the lane's rows
+            // into maximal runs of equal nationkey and emits each run's total at
+            // its last row, so whatever the order, the emitted partials for a
+            // nation sum to exactly the sum of that nation's rows in this lane,
+            // and the merge stage below re-groups and re-SUMS them per nation.
+            // A mis-ordered lane can only emit MORE partials, never fewer and
+            // never smaller ones, and more than SEG of them makes the drain
+            // shuffle unsatisfiable. The merge stage's own sorted view is the
+            // last grouping before the answer, so THAT one is proved.
             let perm_lsort = PermAnyChip::configure(
                 meta,
                 q_lane_perm1,
@@ -809,6 +1089,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 iz_same_next,
                 res_pad,
                 seg,
+                q_ls_pad,
             });
         }
 
@@ -836,6 +1117,52 @@ impl<F: Field + Ord> Q5DpChip<F> {
             let q2 = meta.complex_selector();
             PermAnyChip::configure(meta, q1, q2, vec![merge_nk, merge_sum], msort.clone())
         };
+
+        // The merge grouping finds group boundaries by comparing msort[0] with
+        // its neighbours, and it is the LAST grouping before the answer: nothing
+        // downstream re-sums. `perm_merge` ties msort to the merge region as a
+        // MULTISET and says nothing about ORDER, so without this ladder a prover
+        // lays one nationkey out as two non-adjacent runs, each run looks like
+        // its own group, and the answer carries that nation TWICE with its
+        // revenue split between the two rows -- a wrong answer that every other
+        // constraint in this file accepts. Same shape as `configure_cp_agg`'s
+        // "cp: sorted key nondecreasing", sharing the same u8 range table, and
+        // the merge region is only c * SEG <= 512 rows so it is nearly free.
+        let q_sort_m = meta.selector();
+        let aux_m_key_eq = meta.advice_column();
+        let iz_m_key_eq = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(q_sort_m),
+            |m| {
+                m.query_advice(msort[0], Rotation::next())
+                    - m.query_advice(msort[0], Rotation::cur())
+            },
+            aux_m_key_eq,
+        );
+        let lt_m_cur_next = LtChip::<F, NUM_BYTES>::configure_with_u8(
+            meta,
+            cp_u8,
+            |m| m.query_selector(q_sort_m),
+            |m| m.query_advice(msort[0], Rotation::cur()),
+            |m| m.query_advice(msort[0], Rotation::next()),
+        );
+        meta.create_gate("sorted merge nk is nondecreasing", |m| {
+            let q = m.query_selector(q_sort_m);
+            let le = lt_m_cur_next.is_lt(m, None) + iz_m_key_eq.expr();
+            vec![q * (le - Expression::Constant(F::ONE))]
+        });
+
+        // Row m_total of msort, which `iz_m_same_next` reads at row m_total-1.
+        // `q_sort_m` stops at the pair (m_total-2, m_total-1) and `perm_merge`
+        // covers rows 0..m_total, so nothing else touches it. Unpinned, setting
+        // it equal to the last nationkey in msort makes the final emit gate write
+        // PAD instead of that group's revenue and the corresponding nation
+        // vanishes from the answer, with the name lookup going vacuous with it.
+        let q_m_sentinel = meta.selector();
+        meta.create_gate("msort group-by sentinel is 0", |m| {
+            let q = m.query_selector(q_m_sentinel);
+            vec![q * m.query_advice(msort[0], Rotation::cur())]
+        });
 
         let q_m_line = meta.selector();
         let q_m_first = meta.selector();
@@ -912,21 +1239,48 @@ impl<F: Field + Ord> Q5DpChip<F> {
             ]
         });
 
-        // attach (nk,name) via lookup into nr_out_pad, ONCE for all lanes
-        meta.lookup_any("attach name from NR_out (merge)", |m| {
-            let q_in = m.query_selector(q_m_res_lookup);
+        // `m_res_is_last` is `1 - iz_m_same_next.expr()` copied into an advice
+        // cell on every row the merge grouping covers. It exists purely for
+        // degree: the lookup below needs a gated TABLE side, and with the
+        // degree-2 IsZero expression still on the input side that lookup would
+        // cost 2 + 4 + 2 = 8 and push the whole circuit's degree up. Through this
+        // column the input side is degree 3 and the lookup stays at 7, which is
+        // what the Cardinality Preservation Check's own gap lookup already costs.
+        let m_res_is_last = meta.advice_column();
+        meta.create_gate("m_res_is_last = is_last", |m| {
+            let q = m.query_selector(q_m_line);
             let one = Expression::Constant(F::ONE);
             let is_last = one - iz_m_same_next.expr();
-            let gate = q_in * is_last;
+            vec![q * (m.query_advice(m_res_is_last, Rotation::cur()) - is_last)]
+        });
+
+        // attach (nk,name) via lookup into nr_out_pad, ONCE for all lanes
+        //
+        // The table side is gated by `perm_nr.q_perm2`, the selector of the
+        // nr_out_pad side of the NR Conservation Check, which is enabled over
+        // exactly rows [0, nr_total) -- the assigned rows of that table. Ungated,
+        // the table was the whole column, so rows past nr_total were
+        // prover-chosen entries and ANY group could be labelled with a fabricated
+        // nation name; the emit gate constrains m_res_pad[1] only through
+        // `not_last * (out_nm - PAD)`, which vanishes on exactly the rows that
+        // carry a real group, so on those rows this lookup is the name's only
+        // tether.
+        let q_nr_tbl = perm_nr.q_perm2;
+        let (m_res_nk, m_res_nm) = (m_res_pad[0], m_res_pad[1]);
+        let (out_nk_col, out_nm_col) = (nr_out_pad[0], nr_out_pad[1]);
+        meta.lookup_any("attach name from NR_out (merge)", move |m| {
+            let q_in = m.query_selector(q_m_res_lookup);
+            let gate = q_in * m.query_advice(m_res_is_last, Rotation::cur());
+            let q_tbl = m.query_selector(q_nr_tbl);
 
             vec![
                 (
-                    gate.clone() * m.query_advice(m_res_pad[0], Rotation::cur()),
-                    m.query_advice(nr_out_pad[0], Rotation::cur()),
+                    gate.clone() * m.query_advice(m_res_nk, Rotation::cur()),
+                    q_tbl.clone() * m.query_advice(out_nk_col, Rotation::cur()),
                 ),
                 (
-                    gate * m.query_advice(m_res_pad[1], Rotation::cur()),
-                    m.query_advice(nr_out_pad[1], Rotation::cur()),
+                    gate * m.query_advice(m_res_nm, Rotation::cur()),
+                    q_tbl * m.query_advice(out_nm_col, Rotation::cur()),
                 ),
             ]
         });
@@ -966,11 +1320,16 @@ impl<F: Field + Ord> Q5DpChip<F> {
             cond_europe,
             cond_start,
             cond_end,
+            q_cond_eu,
+            q_cond_dt,
 
             q_nr_join,
             q_nr_pred,
+            q_region_tbl,
+            q_nr_pad,
             nr_rname,
             nr_keep,
+            cflag_nr,
             nr_pair,
             nr_filt_pad,
             nr_out_pad,
@@ -978,14 +1337,18 @@ impl<F: Field + Ord> Q5DpChip<F> {
             iz_nr,
 
             q_oc_join,
+            q_cust_tbl,
             q_co_ge,
             q_co_lt,
             q_co_and,
+            q_co_pad,
             co_ge_ok,
             co_lt_ok,
             co_keep,
+            cflag_co,
             co_nk,
             co_pair,
+            co_pkey,
             co_filt_pad,
             co_out_pad,
             perm_co,
@@ -993,32 +1356,34 @@ impl<F: Field + Ord> Q5DpChip<F> {
             lt_odate_lt_end,
 
             q_ls_join,
+            q_supp_tbl,
             ls_mat,
+            cflag_ls,
+            ls_pkey,
 
             ls_disjoin,
             ls_part_pad,
             perm_ls,
 
-            q_flagged_lookup,
-            q_lookup_complex,
-            flags_in,
-            range_low_high,
+            q_pw_ls,
+            q_pw_co,
+            q_pw_nr,
 
-            lt_co_gap_low,
-            lt_co_gap_high,
-            lt_nr_gap_low,
-            lt_nr_gap_high,
-
-            co_key,
-            co_key_next,
-            nr_key,
-            nr_key_next,
+            cp_agg_co,
+            cp_agg_nr,
+            cp_join_co,
+            cp_join_nr,
+            cp_root,
+            q_cp_mu,
+            q_cln_flag,
+            q_res_flag,
+            q_pad_flag,
 
             lanes,
-            q_join_member,
             q_lane_line,
             q_lane_first,
             q_lane_accu,
+            q_lane_sentinel,
             q_drain,
 
             merge_nk,
@@ -1027,6 +1392,10 @@ impl<F: Field + Ord> Q5DpChip<F> {
             q_merge,
             msort,
             perm_merge,
+            q_sort_m,
+            q_m_sentinel,
+            lt_m_cur_next,
+            iz_m_key_eq,
 
             q_m_line,
             q_m_first,
@@ -1036,6 +1405,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
             iz_m_same_next,
             m_res_pad,
             q_m_res_lookup,
+            m_res_is_last,
 
             m_res_sorted,
             perm_mres,
@@ -1066,8 +1436,11 @@ impl<F: Field + Ord> Q5DpChip<F> {
         lane_rows: usize,
         tamper: Tamper,
     ) -> Result<AssignedCell<F, F>, Error> {
-        // chips (same 7 u8-range loads as q5_obj: 7*256 rows before the main
-        // region)
+        // chips. Four u8-range loads now, not seven: the Cardinality
+        // Preservation Check shares ONE fixed column across all of its Lt chips
+        // and the merge sortedness ladder, where the deleted residual-side gap
+        // argument used four columns of its own. `CHIP_LOAD_ROWS` below is left
+        // at the old 7 * 256 as a conservative row budget.
         let iz_nr_chip = IsZeroChip::construct(self.config.iz_nr.clone());
 
         let lteq_ge_chip =
@@ -1077,14 +1450,14 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let lt_end_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_odate_lt_end.clone());
         lt_end_chip.load(layouter)?;
 
-        let lt_co_low_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_co_gap_low.clone());
-        lt_co_low_chip.load(layouter)?;
-        let lt_co_high_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_co_gap_high.clone());
-        lt_co_high_chip.load(layouter)?;
-        let lt_nr_low_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_nr_gap_low.clone());
-        lt_nr_low_chip.load(layouter)?;
-        let lt_nr_high_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_nr_gap_high.clone());
-        lt_nr_high_chip.load(layouter)?;
+        // Every Lt chip of the Cardinality Preservation Check shares one u8 fixed
+        // column, and the merge sortedness ladder shares it too, so a single load
+        // covers all of them. This replaces the four gap chips (and their four
+        // separate u8 loads) of the deleted residual-side argument.
+        LtChip::<F, NUM_BYTES>::construct(self.config.cp_agg_co.lt_key_cur_next).load(layouter)?;
+
+        let lt_m_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_m_cur_next);
+        let iz_m_key_eq_chip = IsZeroChip::construct(self.config.iz_m_key_eq.clone());
 
         let iz_m_same_prev_chip = IsZeroChip::construct(self.config.iz_m_same_prev.clone());
         let iz_m_same_next_chip = IsZeroChip::construct(self.config.iz_m_same_next.clone());
@@ -1129,14 +1502,17 @@ impl<F: Field + Ord> Q5DpChip<F> {
             co_pair_u64,
             co_filtered,
             ls_mat_u64,
-            ls_join_u64,
-            ls_dis_u64,
+            // the partition is rebuilt below from the per-row clean indicator,
+            // which is what the Cardinality Preservation Check needs
+            ls_join_u64: _,
+            ls_dis_u64: _,
             nr_filt_pad_u64_ext,
             co_filt_pad_u64_ext,
             nr_total,
             co_total,
-            nr_out_pad_u64,
-            co_out_pad_u64,
+            // the *_out_pad tables gain the clean/residual layout below
+            nr_out_pad_u64: _,
+            co_out_pad_u64: _,
         } = q5_derive(
             &customer,
             &orders,
@@ -1151,24 +1527,169 @@ impl<F: Field + Ord> Q5DpChip<F> {
             co_pad_extra,
         );
 
-        // key vectors for membership+gap
-        let mut valid_co_keys: Vec<u64> = co_filtered
+        // ---------------- clean/residual witness over the cluster tree --------
+        // The honest clean instance is the fully reduced one: an LS tuple is
+        // clean iff it joins both bags, a CO tuple iff its packed key occurs in a
+        // clean LS tuple, an NR tuple iff its nationkey does. That is a fixed
+        // point of the semijoin reduction, so Conservation and Pairwise
+        // Consistency both hold on it and condition (10) holds with equality.
+        //
+        // Nothing here is lane-aware: the partition is a property of the
+        // relations, and only the aggregation over LS^c is laned.
+        let co_set: HashSet<u64> = co_filtered
             .iter()
             .map(|r| r[0] * SHIFT_NATION + r[1])
             .collect();
-        valid_co_keys.push(0);
-        valid_co_keys.push(MAX_SENTINEL);
-        valid_co_keys.sort();
-        valid_co_keys.dedup();
+        let nr_set: HashSet<u64> = nr_filtered.iter().map(|r| r[0]).collect();
 
-        let mut valid_nr_keys: Vec<u64> = nr_filtered.iter().map(|r| r[0]).collect();
-        valid_nr_keys.push(0);
-        valid_nr_keys.push(MAX_SENTINEL);
-        valid_nr_keys.sort();
-        valid_nr_keys.dedup();
+        let mut ls_cln_b: Vec<u64> = ls_mat_u64
+            .iter()
+            .map(|r| {
+                (co_set.contains(&(r[0] * SHIFT_NATION + r[1])) && nr_set.contains(&r[1])) as u64
+            })
+            .collect();
 
-        let pad4 = vec![PAD_U64; 4];
-        let ls_part_pad_u64 = pad_partition_u64(&ls_join_u64, &ls_dis_u64, lineitem.len(), &pad4);
+        // test hook only: hide one joinable LS tuple in the residual side. The
+        // CO and NR indicators below are then recomputed from the reduced clean
+        // LS set, so the neighbours are re-reduced around it.
+        if tamper == Tamper::HideOneCleanTuple {
+            let i = ls_cln_b
+                .iter()
+                .position(|&b| b == 1)
+                .expect("HideOneCleanTuple needs at least one clean LS tuple");
+            ls_cln_b[i] = 0;
+        }
+
+        // test hook only: no reduction at all. Every tuple that passes its own
+        // predicate is declared clean, so all three residual sections come out
+        // empty and both channels of condition (10) agree row by row. Only
+        // condition (9) can reject this.
+        let all_clean = tamper == Tamper::MarkAllClean;
+        if all_clean {
+            for b in ls_cln_b.iter_mut() {
+                *b = 1;
+            }
+        }
+
+        let mut ls_join_u64: Vec<Vec<u64>> = vec![];
+        let mut ls_dis_u64: Vec<Vec<u64>> = vec![];
+        for (i, r) in ls_mat_u64.iter().enumerate() {
+            if ls_cln_b[i] == 1 {
+                ls_join_u64.push(r.clone());
+            } else {
+                ls_dis_u64.push(r.clone());
+            }
+        }
+
+        // What the `cflag_ls` COLUMN carries. Honestly this is `ls_cln_b`; the
+        // CleanFlagLie hook makes the input side of the LS Conservation shuffle
+        // disagree with its partition side by exactly one flag.
+        let mut ls_cflag_written = ls_cln_b.clone();
+        if tamper == Tamper::CleanFlagLie {
+            let i = ls_cflag_written
+                .iter()
+                .position(|&b| b == 0)
+                .expect("CleanFlagLie needs at least one residual LS tuple");
+            ls_cflag_written[i] = 1;
+        }
+
+        let cln_ls_keys: HashSet<u64> = ls_join_u64
+            .iter()
+            .map(|r| r[0] * SHIFT_NATION + r[1])
+            .collect();
+        let cln_ls_nks: HashSet<u64> = ls_join_u64.iter().map(|r| r[1]).collect();
+
+        // clean indicator per input row of the two children (keep folded in)
+        let cln_co: Vec<u64> = (0..orders.len())
+            .map(|i| {
+                (co_keep_b[i]
+                    && (all_clean
+                        || cln_ls_keys
+                            .contains(&(co_pair_u64[i][0] * SHIFT_NATION + co_pair_u64[i][1]))))
+                    as u64
+            })
+            .collect();
+        let cln_nr: Vec<u64> = (0..nation.len())
+            .map(|i| {
+                (nr_keep_b[i] && (all_clean || cln_ls_nks.contains(&nr_pair_u64[i][0]))) as u64
+            })
+            .collect();
+
+        // ---- clean indicator on both sides of the three Conservation Checks ----
+        // input side: the link gates turn the base indicator into keep * c
+        let nr_filt_pad_u64_ext: Vec<Vec<u64>> = nr_filt_pad_u64_ext
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut v = r.clone();
+                v.push(if i < nation.len() { cln_nr[i] } else { 0 });
+                v
+            })
+            .collect();
+        let co_filt_pad_u64_ext: Vec<Vec<u64>> = co_filt_pad_u64_ext
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut v = r.clone();
+                v.push(if i < orders.len() { cln_co[i] } else { 0 });
+                v
+            })
+            .collect();
+
+        // partition side: [clean rows | residual rows | pad rows], the flag a
+        // constant 1 then 0 then 0
+        fn split_clean(
+            pair: &[Vec<u64>],
+            keep: &[bool],
+            cln: &[u64],
+            total: usize,
+        ) -> (Vec<Vec<u64>>, usize, usize) {
+            let mut out: Vec<Vec<u64>> = vec![];
+            let mut res: Vec<Vec<u64>> = vec![];
+            for i in 0..pair.len() {
+                if !keep[i] {
+                    continue;
+                }
+                let mut v = pair[i].clone();
+                if cln[i] == 1 {
+                    v.push(1);
+                    out.push(v);
+                } else {
+                    v.push(0);
+                    res.push(v);
+                }
+            }
+            let n_cln = out.len();
+            let n_res = res.len();
+            out.extend(res);
+            while out.len() < total {
+                out.push(vec![PAD_U64, PAD_U64, 0]);
+            }
+            (out, n_cln, n_res)
+        }
+        let (nr_out_pad_u64, nr_cln_len, nr_res_len) =
+            split_clean(&nr_pair_u64, &nr_keep_b, &cln_nr, nr_total);
+        let (co_out_pad_u64, co_cln_len, co_res_len) =
+            split_clean(&co_pair_u64, &co_keep_b, &cln_co, co_total);
+
+        // the partition side of the LS Conservation Check carries the flag as a
+        // fifth column: 1 on the clean rows, 0 on the residual and pad rows
+        let with_flag = |rows: &[Vec<u64>], f: u64| -> Vec<Vec<u64>> {
+            rows.iter()
+                .map(|r| {
+                    let mut v = r.clone();
+                    v.push(f);
+                    v
+                })
+                .collect()
+        };
+        let pad5 = vec![PAD_U64, PAD_U64, PAD_U64, PAD_U64, 0];
+        let ls_part_pad_u64 = pad_partition_u64(
+            &with_flag(&ls_join_u64, 1),
+            &with_flag(&ls_dis_u64, 0),
+            lineitem.len(),
+            &pad5,
+        );
         let ls_part_pad_f: Vec<Vec<F>> = to_field_rows::<F>(&ls_part_pad_u64);
 
         // ---------- lane witnesses ----------
@@ -1200,6 +1721,13 @@ impl<F: Field + Ord> Q5DpChip<F> {
         while ls_join_full.len() < cap {
             ls_join_full.push(vec![0u64, PAD_U64, 0u64, 0u64]);
         }
+        if tamper == Tamper::LanePadRow {
+            assert!(
+                join_len < cap,
+                "LanePadRow tamper needs at least one pad row"
+            );
+            ls_join_full[cap - 1] = vec![0u64, PAD_U64, 12_345u64, 0u64];
+        }
 
         struct LaneWit {
             sorted: Vec<Vec<u64>>,
@@ -1207,6 +1735,9 @@ impl<F: Field + Ord> Q5DpChip<F> {
             run_sum: Vec<u64>,
             res_pad: Vec<[u64; 2]>,
             drained: Vec<[u64; 2]>,
+            /// value written one row past the sorted view; honestly 0, and
+            /// `q_lane_sentinel` pins it there
+            sentinel_nk: u64,
         }
 
         let mut lane_wit: Vec<LaneWit> = Vec::with_capacity(c);
@@ -1214,6 +1745,12 @@ impl<F: Field + Ord> Q5DpChip<F> {
             let mut sorted: Vec<Vec<u64>> =
                 ls_join_full[l * lane_rows..(l + 1) * lane_rows].to_vec();
             sorted.sort_by_key(|r| r[1]); // by nationkey_shift (PAD_U64 last)
+
+            let sentinel_nk = if tamper == Tamper::LaneSentinel {
+                sorted[lane_rows - 1][1]
+            } else {
+                0
+            };
 
             let mut line_rev = vec![0u64; lane_rows];
             let mut run_sum = vec![0u64; lane_rows];
@@ -1239,7 +1776,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 let next_nk = if i + 1 < lane_rows {
                     sorted[i + 1][1]
                 } else {
-                    0
+                    sentinel_nk
                 };
 
                 // don't emit for PAD_U64 groups; keep res_pad as SENTINEL
@@ -1262,6 +1799,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 run_sum,
                 res_pad,
                 drained,
+                sentinel_nk,
             });
         }
 
@@ -1359,6 +1897,11 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         )?;
                     }
                 }
+                // TABLE side of the orders->customer lookup: exactly the assigned
+                // customer rows
+                for i in 0..customer.len() {
+                    self.config.q_cust_tbl.enable(&mut region, i)?;
+                }
                 for i in 0..orders.len() {
                     for j in 0..3 {
                         region.assign_advice(
@@ -1381,6 +1924,10 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         || Value::known(F::from(end_ts)),
                     )?;
                 }
+                // the date window is one per-proof choice, not one per row
+                for i in 0..orders.len().saturating_sub(1) {
+                    self.config.q_cond_dt.enable(&mut region, i)?;
+                }
                 for i in 0..lineitem.len() {
                     for j in 0..4 {
                         region.assign_advice(
@@ -1390,6 +1937,10 @@ impl<F: Field + Ord> Q5DpChip<F> {
                             || Value::known(F::from(lineitem[i][j])),
                         )?;
                     }
+                }
+                // TABLE side of the lineitem->supplier lookup
+                for i in 0..supplier.len() {
+                    self.config.q_supp_tbl.enable(&mut region, i)?;
                 }
                 for i in 0..supplier.len() {
                     for j in 0..2 {
@@ -1425,6 +1976,10 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         i,
                         || Value::known(F::from(nation[i][2] + 1)),
                     )?;
+                }
+                // TABLE side of the nation->region lookup
+                for i in 0..region_file.len() {
+                    self.config.q_region_tbl.enable(&mut region, i)?;
                 }
                 for i in 0..region_file.len() {
                     region.assign_advice(
@@ -1477,6 +2032,12 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         i,
                         || Value::known(F::from(nr_pair_u64[i][1])),
                     )?;
+                    region.assign_advice(
+                        || "cflag_nr",
+                        self.config.cflag_nr,
+                        i,
+                        || Value::known(F::from(cln_nr[i])),
+                    )?;
 
                     iz_nr_chip.assign(
                         &mut region,
@@ -1485,8 +2046,16 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     )?;
                 }
 
+                // the EUROPE hash is one per-proof choice, not one per row
+                for i in 0..nation.len().saturating_sub(1) {
+                    self.config.q_cond_eu.enable(&mut region, i)?;
+                }
+
                 // NR extra padding rows (as q5_obj)
                 for i in nation.len()..nr_total {
+                    // q_nr_* not enabled, but the link gate IS live here, so the
+                    // predicate bit has to be pinned to 0
+                    self.config.q_nr_pad.enable(&mut region, i)?;
                     region.assign_advice(
                         || "cond_europe_pad",
                         self.config.cond_europe,
@@ -1517,11 +2086,27 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         i,
                         || Value::known(F::from(PAD_U64)),
                     )?;
+                    region.assign_advice(
+                        || "cflag_nr_pad",
+                        self.config.cflag_nr,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
                 }
 
                 for i in 0..nr_total {
                     self.config.perm_nr.q_perm1.enable(&mut region, i)?;
                     self.config.perm_nr.q_perm2.enable(&mut region, i)?;
+                }
+                // partition side: 1 on the clean NR rows, 0 on the residual ones
+                for i in 0..nr_cln_len {
+                    self.config.q_cln_flag[0].enable(&mut region, i)?;
+                }
+                for i in nr_cln_len..(nr_cln_len + nr_res_len) {
+                    self.config.q_res_flag[0].enable(&mut region, i)?;
+                }
+                for i in (nr_cln_len + nr_res_len)..nr_total {
+                    self.config.q_pad_flag[0].enable(&mut region, i)?;
                 }
                 Q5Chip::assign_table_f(
                     &mut region,
@@ -1580,6 +2165,22 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         i,
                         || Value::known(F::from(co_pair_u64[i][1])),
                     )?;
+                    region.assign_advice(
+                        || "co_pkey",
+                        self.config.co_pkey,
+                        i,
+                        || {
+                            Value::known(F::from(
+                                co_pair_u64[i][0] * SHIFT_NATION + co_pair_u64[i][1],
+                            ))
+                        },
+                    )?;
+                    region.assign_advice(
+                        || "cflag_co",
+                        self.config.cflag_co,
+                        i,
+                        || Value::known(F::from(cln_co[i])),
+                    )?;
 
                     lteq_ge_chip.assign(
                         &mut region,
@@ -1597,6 +2198,9 @@ impl<F: Field + Ord> Q5DpChip<F> {
 
                 // CO extra padding rows (as q5_obj)
                 for i in orders.len()..co_total {
+                    // q_co_* not enabled, but the link gate IS live here, so the
+                    // predicate bit has to be pinned to 0
+                    self.config.q_co_pad.enable(&mut region, i)?;
                     region.assign_advice(
                         || "co_nk_pad",
                         self.config.co_nk,
@@ -1633,11 +2237,27 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         i,
                         || Value::known(F::from(PAD_U64)),
                     )?;
+                    region.assign_advice(
+                        || "cflag_co_pad",
+                        self.config.cflag_co,
+                        i,
+                        || Value::known(F::ZERO),
+                    )?;
                 }
 
                 for i in 0..co_total {
                     self.config.perm_co.q_perm1.enable(&mut region, i)?;
                     self.config.perm_co.q_perm2.enable(&mut region, i)?;
+                }
+                // partition side: 1 on the clean CO rows, 0 on the residual ones
+                for i in 0..co_cln_len {
+                    self.config.q_cln_flag[1].enable(&mut region, i)?;
+                }
+                for i in co_cln_len..(co_cln_len + co_res_len) {
+                    self.config.q_res_flag[1].enable(&mut region, i)?;
+                }
+                for i in (co_cln_len + co_res_len)..co_total {
+                    self.config.q_pad_flag[1].enable(&mut region, i)?;
                 }
                 Q5Chip::assign_table_f(
                     &mut region,
@@ -1663,12 +2283,30 @@ impl<F: Field + Ord> Q5DpChip<F> {
                             || Value::known(F::from(ls_mat_u64[i][j])),
                         )?;
                     }
+                    region.assign_advice(
+                        || "ls_pkey",
+                        self.config.ls_pkey,
+                        i,
+                        || {
+                            Value::known(F::from(
+                                ls_mat_u64[i][0] * SHIFT_NATION + ls_mat_u64[i][1],
+                            ))
+                        },
+                    )?;
+                    region.assign_advice(
+                        || "cflag_ls",
+                        self.config.cflag_ls,
+                        i,
+                        || Value::known(F::from(ls_cflag_written[i])),
+                    )?;
                 }
 
                 // ---------- LS join lanes ----------
                 // Lane l hosts global pipeline rows [l*lane_rows,
                 // (l+1)*lane_rows); cells of REAL join rows are collected in
-                // global order for the block-wise part_pad linkage below.
+                // global order for the block-wise part_pad linkage below, which
+                // is what makes the union of the lanes the partition side of the
+                // LS Conservation Check.
                 let mut ls_join_cells: Vec<Vec<AssignedCell<F, F>>> = Vec::with_capacity(join_len);
                 for (l, lane) in self.config.lanes.iter().enumerate() {
                     for r in 0..lane_rows {
@@ -1685,6 +2323,10 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         }
                         if g < join_len {
                             ls_join_cells.push(row_cells);
+                        } else {
+                            // past |LS^c|: outside the copy constraints, so pinned
+                            // to the canonical pad tuple instead
+                            lane.q_ls_pad.enable(&mut region, r)?;
                         }
                     }
                 }
@@ -1713,165 +2355,113 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     &ls_dis_cells,
                 )?;
 
-                // ---------- key tables (row0 dummy, as q5_obj) ----------
-                region.assign_advice(
-                    || "co_key0",
-                    self.config.co_key,
-                    0,
-                    || Value::known(F::from(0)),
-                )?;
-                region.assign_advice(
-                    || "co_keyn0",
-                    self.config.co_key_next,
-                    0,
-                    || Value::known(F::from(0)),
-                )?;
-                region.assign_advice(
-                    || "nr_key0",
-                    self.config.nr_key,
-                    0,
-                    || Value::known(F::from(0)),
-                )?;
-                region.assign_advice(
-                    || "nr_keyn0",
-                    self.config.nr_key_next,
-                    0,
-                    || Value::known(F::from(0)),
-                )?;
-
-                for i in 0..valid_co_keys.len() {
-                    let k = valid_co_keys[i];
-                    let kn = if i + 1 < valid_co_keys.len() {
-                        valid_co_keys[i + 1]
-                    } else {
-                        MAX_SENTINEL
-                    };
-                    region.assign_advice(
-                        || "co_key",
-                        self.config.co_key,
-                        i + 1,
-                        || Value::known(F::from(k)),
-                    )?;
-                    region.assign_advice(
-                        || "co_key_next",
-                        self.config.co_key_next,
-                        i + 1,
-                        || Value::known(F::from(kn)),
-                    )?;
+                // partition side of the LS Conservation Check: 1 on the clean LS
+                // rows, 0 on the residual ones. These are rows of ls_part_pad,
+                // the ONE global group, so the flag count is a count over the
+                // union of the lanes.
+                for i in 0..ls_join_u64.len() {
+                    self.config.q_cln_flag[2].enable(&mut region, i)?;
                 }
-                for i in 0..valid_nr_keys.len() {
-                    let k = valid_nr_keys[i];
-                    let kn = if i + 1 < valid_nr_keys.len() {
-                        valid_nr_keys[i + 1]
-                    } else {
-                        MAX_SENTINEL
-                    };
-                    region.assign_advice(
-                        || "nr_key",
-                        self.config.nr_key,
-                        i + 1,
-                        || Value::known(F::from(k)),
-                    )?;
-                    region.assign_advice(
-                        || "nr_key_next",
-                        self.config.nr_key_next,
-                        i + 1,
-                        || Value::known(F::from(kn)),
-                    )?;
+                for i in ls_join_u64.len()..(ls_join_u64.len() + ls_dis_u64.len()) {
+                    self.config.q_res_flag[2].enable(&mut region, i)?;
+                }
+                // the LS partition is padded only to lineitem.len(), which the
+                // clean and residual sections already fill exactly, so this range
+                // is empty. Enabled for uniformity with the two child bags.
+                for i in (ls_join_u64.len() + ls_dis_u64.len())..lineitem.len() {
+                    self.config.q_pad_flag[2].enable(&mut region, i)?;
                 }
 
-                // ---------- disjoin emptiness witnesses (as q5_obj) --------
-                for i in 0..ls_dis_u64.len() {
-                    self.config.q_flagged_lookup.enable(&mut region, i)?;
-                    self.config.q_lookup_complex.enable(&mut region, i)?;
+                // ---------- condition (9), Pairwise Consistency ----------
+                // One selector per relation, enabled over exactly the clean
+                // section of its partition group. The LS one runs over
+                // ls_part_pad, NOT over a lane, so a single enabling covers the
+                // union of the lanes and there is nothing to split across them.
+                for i in 0..ls_join_u64.len() {
+                    self.config.q_pw_ls.enable(&mut region, i)?;
+                }
+                for i in 0..co_cln_len {
+                    self.config.q_pw_co.enable(&mut region, i)?;
+                }
+                for i in 0..nr_cln_len {
+                    self.config.q_pw_nr.enable(&mut region, i)?;
+                }
 
-                    let ok = ls_dis_u64[i][0];
-                    let nk = ls_dis_u64[i][1];
-                    let packed = ok * SHIFT_NATION + nk;
+                // ============ CARDINALITY PRESERVATION CHECK, condition (10) ===
+                // Over the cluster tree rooted at LS: both multiplicity channels
+                // are propagated from the two child bags to LS, accumulated over
+                // ALL lineitem rows, and the two totals compared once. Nothing
+                // here is per lane.
+                let cp_rows_co: Vec<[u64; 3]> = (0..orders.len())
+                    .map(|i| {
+                        [
+                            co_pair_u64[i][0] * SHIFT_NATION + co_pair_u64[i][1],
+                            co_keep_b[i] as u64,
+                            cln_co[i],
+                        ]
+                    })
+                    .collect();
+                let cp_rows_nr: Vec<[u64; 3]> = (0..nation.len())
+                    .map(|i| [nr_pair_u64[i][0], nr_keep_b[i] as u64, cln_nr[i]])
+                    .collect();
 
-                    let co_idx = valid_co_keys.binary_search(&packed);
-                    let (in_co, low_co, high_co) = match co_idx {
-                        Ok(_) => (1u64, 0u64, MAX_SENTINEL),
-                        Err(idx) => (0u64, valid_co_keys[idx - 1], valid_co_keys[idx]),
-                    };
+                let cp_stage_co = build_cp_stage(&cp_rows_co, PAD_U64);
+                let cp_stage_nr = build_cp_stage(&cp_rows_nr, PAD_U64);
 
-                    let nr_idx = valid_nr_keys.binary_search(&nk);
-                    let (in_nr, low_nr, high_nr) = match nr_idx {
-                        Ok(_) => (1u64, 0u64, MAX_SENTINEL),
-                        Err(idx) => (0u64, valid_nr_keys[idx - 1], valid_nr_keys[idx]),
-                    };
+                assign_cp_agg(
+                    &mut region,
+                    &self.config.cp_agg_co,
+                    &cp_rows_co,
+                    &cp_stage_co,
+                )?;
+                assign_cp_agg(
+                    &mut region,
+                    &self.config.cp_agg_nr,
+                    &cp_rows_nr,
+                    &cp_stage_nr,
+                )?;
 
-                    region.assign_advice(
-                        || "in_co",
-                        self.config.flags_in[0],
-                        i,
-                        || Value::known(F::from(in_co)),
-                    )?;
-                    region.assign_advice(
-                        || "in_nr",
-                        self.config.flags_in[1],
-                        i,
-                        || Value::known(F::from(in_nr)),
-                    )?;
+                let ls_pkeys: Vec<u64> = ls_mat_u64
+                    .iter()
+                    .map(|r| r[0] * SHIFT_NATION + r[1])
+                    .collect();
+                let ls_nks: Vec<u64> = ls_mat_u64.iter().map(|r| r[1]).collect();
+                let fetched_co = assign_cp_join(
+                    &mut region,
+                    &self.config.cp_join_co,
+                    &ls_pkeys,
+                    &cp_stage_co,
+                    PAD_U64,
+                )?;
+                let fetched_nr = assign_cp_join(
+                    &mut region,
+                    &self.config.cp_join_nr,
+                    &ls_nks,
+                    &cp_stage_nr,
+                    PAD_U64,
+                )?;
 
-                    region.assign_advice(
-                        || "co_low",
-                        self.config.range_low_high[0],
-                        i,
-                        || Value::known(F::from(low_co)),
-                    )?;
-                    region.assign_advice(
-                        || "co_high",
-                        self.config.range_low_high[1],
-                        i,
-                        || Value::known(F::from(high_co)),
-                    )?;
-                    region.assign_advice(
-                        || "nr_low",
-                        self.config.range_low_high[2],
-                        i,
-                        || Value::known(F::from(low_nr)),
-                    )?;
-                    region.assign_advice(
-                        || "nr_high",
-                        self.config.range_low_high[3],
-                        i,
-                        || Value::known(F::from(high_nr)),
-                    )?;
-
-                    lt_co_low_chip.assign(
-                        &mut region,
-                        i,
-                        Value::known(F::from(low_co)),
-                        Value::known(F::from(packed)),
-                    )?;
-                    lt_co_high_chip.assign(
-                        &mut region,
-                        i,
-                        Value::known(F::from(packed)),
-                        Value::known(F::from(high_co)),
-                    )?;
-                    lt_nr_low_chip.assign(
-                        &mut region,
-                        i,
-                        Value::known(F::from(low_nr)),
-                        Value::known(F::from(nk)),
-                    )?;
-                    lt_nr_high_chip.assign(
-                        &mut region,
-                        i,
-                        Value::known(F::from(nk)),
-                        Value::known(F::from(high_nr)),
-                    )?;
+                let cp_mu: Vec<(u64, u64)> = (0..lineitem.len())
+                    .map(|i| {
+                        (
+                            fetched_co[i].0 * fetched_nr[i].0,
+                            ls_cflag_written[i] * fetched_co[i].1 * fetched_nr[i].1,
+                        )
+                    })
+                    .collect();
+                for i in 0..lineitem.len() {
+                    self.config.q_cp_mu.enable(&mut region, i)?;
+                }
+                let (cp_all, cp_cln) = assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
+                if tamper == Tamper::None {
+                    debug_assert_eq!(
+                        cp_all, cp_cln,
+                        "cardinality preservation: |R^c join| != |R join|"
+                    );
                 }
 
                 // ---------- shared lane selectors ----------
-                // ALL lane rows carry the membership lookups: pad rows hold
-                // the MAX_SENTINEL keys, which both key tables contain, so
-                // (unlike q5_obj's join-rows-only enabling) the selector
-                // pattern is independent of the true join size.
                 for i in 0..lane_rows {
-                    self.config.q_join_member.enable(&mut region, i)?;
                     self.config.q_lane_line.enable(&mut region, i)?;
                     self.config.q_drain.enable(&mut region, i)?;
                     // every lane shares the same q_perm1/q_perm2 pair, so
@@ -1889,6 +2479,9 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 for i in 1..lane_rows {
                     self.config.q_lane_accu.enable(&mut region, i)?;
                 }
+                // every lane's ls_sorted sentinel sits at the same row, so one
+                // selector pins all of them (the gate is per-lane)
+                self.config.q_lane_sentinel.enable(&mut region, lane_rows)?;
 
                 // ---------- per-lane aggregation ----------
                 for (lane, w) in self.config.lanes.iter().zip(lane_wit.iter()) {
@@ -1926,13 +2519,15 @@ impl<F: Field + Ord> Q5DpChip<F> {
                             || Value::known(F::from(w.res_pad[i][1])),
                         )?;
                     }
-                    // sentinel row for same_next (as q5_obj)
+                    // sentinel row for same_next, pinned by
+                    // "lane ls_sorted group-by sentinel is 0"
                     for j in 0..4 {
+                        let v = if j == 1 { w.sentinel_nk } else { 0 };
                         region.assign_advice(
                             || "ls_sorted_lane_sentinel",
                             lane.ls_sorted[j],
                             lane_rows,
-                            || Value::known(F::ZERO),
+                            || Value::known(F::from(v)),
                         )?;
                     }
 
@@ -1947,7 +2542,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         let next_nk = if i + 1 < lane_rows {
                             w.sorted[i + 1][1]
                         } else {
-                            0u64
+                            w.sentinel_nk
                         };
                         let diff = F::from(next_nk) - F::from(w.sorted[i][1]);
                         iz_next_chip.assign(&mut region, i, Value::known(diff))?;
@@ -2030,7 +2625,8 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         )?;
                     }
                 }
-                // sentinel row for merge same_next
+                // sentinel row for merge same_next, pinned by
+                // "msort group-by sentinel is 0"
                 for j in 0..2 {
                     region.assign_advice(
                         || "msort_sentinel",
@@ -2039,6 +2635,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                         || Value::known(F::ZERO),
                     )?;
                 }
+                self.config.q_m_sentinel.enable(&mut region, m_total)?;
 
                 for i in 1..m_total {
                     let diff = F::from(msort_u64[i][0]) - F::from(msort_u64[i - 1][0]);
@@ -2052,6 +2649,33 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     };
                     let diff = F::from(next_nk) - F::from(msort_u64[i][0]);
                     iz_m_same_next_chip.assign(&mut region, i, Value::known(diff))?;
+                    // the degree-1 copy of is_last that the name lookup reads
+                    region.assign_advice(
+                        || "m_res_is_last",
+                        self.config.m_res_is_last,
+                        i,
+                        || Value::known(F::from((next_nk != msort_u64[i][0]) as u64)),
+                    )?;
+                }
+
+                // msort[0] nondecreasing over the m_total real rows. Row m_total
+                // is the pinned sentinel, so the ladder stops at the pair
+                // (m_total-2, m_total-1).
+                for i in 0..m_total.saturating_sub(1) {
+                    self.config.q_sort_m.enable(&mut region, i)?;
+                    let cur = msort_u64[i][0];
+                    let next = msort_u64[i + 1][0];
+                    lt_m_chip.assign(
+                        &mut region,
+                        i,
+                        Value::known(F::from(cur)),
+                        Value::known(F::from(next)),
+                    )?;
+                    iz_m_key_eq_chip.assign(
+                        &mut region,
+                        i,
+                        Value::known(F::from(next) - F::from(cur)),
+                    )?;
                 }
 
                 // m_res_pad <-> m_res_sorted permutation and ORDER BY
@@ -2213,8 +2837,10 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 /// absorbed by lanes, not by a bigger domain.
 pub const DP_LANE_K: u32 = 16;
 
-/// k = 16 leaves this many rows to the range-chip loads before the main region
-/// (7 u8 tables of 256 rows each).
+/// k = 16 leaves this many rows to the range-chip loads before the main region.
+/// Kept at 7 u8 tables of 256 rows even though the repaired circuit loads only
+/// four: shrinking it would let releases through that the old feasibility check
+/// rejected, and the DP capacity scheme is meant to be preserved exactly.
 const CHIP_LOAD_ROWS: usize = 7 * 256;
 
 /// Build the Q5 DP lane circuit and the plan describing it, or explain why the
@@ -2353,11 +2979,7 @@ pub fn run_dp_lanes(
     proof_path: Option<&str>,
 ) -> crate::dp_lane::DpLaneRun {
     use halo2_proofs::poly::{
-        ipa::{
-            commitment::IPACommitmentScheme,
-            multiopen::ProverIPA,
-            strategy::SingleStrategy,
-        },
+        ipa::{commitment::IPACommitmentScheme, multiopen::ProverIPA, strategy::SingleStrategy},
         VerificationStrategy,
     };
     use halo2_proofs::transcript::{
@@ -2450,7 +3072,8 @@ pub fn run_dp_lanes(
 mod tests {
     use super::{lanes_for, set_config_lanes, MyCircuit, Tamper, LANE_ROWS, MAX_LANES};
 
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
+    use halo2_proofs::plonk::Circuit;
     use halo2curves::pasta::Fp;
 
     use std::marker::PhantomData;
@@ -2509,6 +3132,39 @@ mod tests {
         )
     }
 
+    /// One synthetic circuit at an explicit lane geometry.
+    ///
+    /// `c` is passed in rather than derived, because two of the negative hooks
+    /// change `|LS^c|` and therefore the released length `n`; the lane count is
+    /// circuit STRUCTURE and must be stamped before `configure` either way.
+    fn lane_circuit(
+        tamper: Tamper,
+        lane_rows: usize,
+        ls_pad_extra: usize,
+        c: usize,
+    ) -> MyCircuit<Fp> {
+        let (customer, orders, lineitem, supplier, nation, region, eur, start_ts, end_ts) =
+            synthetic_tables();
+        MyCircuit::<Fp> {
+            customer,
+            orders,
+            lineitem,
+            supplier,
+            nation,
+            region,
+            europe_hash: eur,
+            start_ts,
+            end_ts,
+            nr_pad_extra: 0,
+            co_pad_extra: 0,
+            ls_pad_extra,
+            lane_rows,
+            num_lanes: c,
+            tamper,
+            _marker: PhantomData,
+        }
+    }
+
     fn three_lane_circuit(tamper: Tamper) -> (MyCircuit<Fp>, usize) {
         let (customer, orders, lineitem, supplier, nation, region, eur, start_ts, end_ts) =
             synthetic_tables();
@@ -2526,25 +3182,50 @@ mod tests {
         let c = lanes_for(6 + ls_pad_extra, lane_rows);
         assert_eq!(c, 3);
 
-        let circuit = MyCircuit::<Fp> {
-            customer,
-            orders,
-            lineitem,
-            supplier,
-            nation,
-            region,
-            europe_hash: eur,
-            start_ts,
-            end_ts,
-            nr_pad_extra: 0,
-            co_pad_extra: 0,
-            ls_pad_extra,
-            lane_rows,
-            num_lanes: c,
-            tamper,
-            _marker: PhantomData,
-        };
-        (circuit, c)
+        (lane_circuit(tamper, lane_rows, ls_pad_extra, c), c)
+    }
+
+    /// The maximum gate degree of this circuit, at the WIDEST lane count the
+    /// structural cap allows. Every soundness patch in this file is written to
+    /// fit under the ceiling the Cardinality Preservation Check's own lookups
+    /// already set, because a degree rise doubles every FFT of the prover and
+    /// at 16 lanes that is the dominant cost of the whole DP sweep.
+    ///
+    /// The lane count does not change the degree (the lanes replicate columns,
+    /// not gate shapes), which this probe also records by measuring both ends.
+    #[test]
+    fn test_max_gate_degree() {
+        use halo2_proofs::plonk::ConstraintSystem;
+
+        for c in [1usize, MAX_LANES] {
+            set_config_lanes(c);
+            let mut cs = ConstraintSystem::<Fp>::default();
+            let _ = <MyCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
+            let degree = cs.degree();
+            println!("lanes={} cs.degree() = {}", c, degree);
+            println!(
+                "  advice={} fixed={} instance={} selectors={} gates={} polys={} lookups={} shuffles={}",
+                cs.num_advice_columns(),
+                cs.num_fixed_columns(),
+                cs.num_instance_columns(),
+                cs.num_selectors(),
+                cs.gates().len(),
+                cs.gates()
+                    .iter()
+                    .map(|g| g.polynomials().len())
+                    .sum::<usize>(),
+                cs.lookups().len(),
+                cs.shuffles().len(),
+            );
+            assert!(
+                degree <= 7,
+                "the maximum gate degree rose to {} at {} lanes, so a soundness \
+                 patch is costing more than it is worth",
+                degree,
+                c
+            );
+        }
+        set_config_lanes(1);
     }
 
     #[test]
@@ -2593,6 +3274,138 @@ mod tests {
         assert!(
             prover.verify().is_err(),
             "tampered merge sentinel must not verify"
+        );
+    }
+
+    /// Condition (10), Cardinality Preservation, ACROSS LANES.
+    ///
+    /// One joinable LS tuple is moved to the residual side and the CO and NR
+    /// bags are re-reduced around it, so Conservation and Pairwise Consistency
+    /// both still hold and the only thing left to notice is that the clean join
+    /// lost an occurrence. The hidden tuple's contribution disappears from lane
+    /// 0 alone, which is exactly the shape a PER-LANE equality would let a
+    /// prover rebalance; the root sum here is accumulated over all of lineitem
+    /// and compared once, so it cannot be.
+    #[test]
+    fn mock_reject_hidden_clean_tuple() {
+        // |LS^c| drops to 5, so n = 11 and the 3 four-row lanes still hold it
+        let circuit = lane_circuit(Tamper::HideOneCleanTuple, 4, 6, 3);
+        set_config_lanes(3);
+        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(1u64)]]).unwrap();
+        let failures = prover
+            .verify()
+            .expect_err("condition (10) accepted a hidden joinable tuple");
+        // `all`, not `any`: this direction must reject through the single
+        // root-sum equality of the Cardinality Preservation Check and through
+        // NOTHING else. A new constraint that made this witness fail for some
+        // other reason would silently destroy the evidence that condition (10)
+        // is doing the work, and an `any` assertion would not notice.
+        assert!(
+            !failures.is_empty()
+                && failures
+                    .iter()
+                    .all(|f| format!("{:?}", f).contains("cardinality preservation")),
+            "the circuit rejected, but not (only) through the Cardinality \
+             Preservation Check: {:?}",
+            failures
+        );
+    }
+
+    /// Condition (9), Pairwise Consistency, ACROSS LANES.
+    ///
+    /// No reduction at all: every tuple that passes its own predicate is
+    /// declared clean, so all three residual sections are empty, Conservation
+    /// holds and both channels of condition (10) agree row by row. The dangling
+    /// clean LS tuples land in lane 1 and lane 2 (global pipeline rows 6, 7 and
+    /// 8 with four-row lanes), so a per-lane version of this check could be
+    /// satisfied lane by lane; the LS side of all four lookups is `ls_part_pad`,
+    /// the union of the lanes, so one lookup sees all of them.
+    #[test]
+    fn mock_reject_unreduced_clean_instance() {
+        // |LS^c| rises to 9, so n = 15 and the release needs a 4th lane
+        let circuit = lane_circuit(Tamper::MarkAllClean, 4, 6, 4);
+        set_config_lanes(4);
+        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(1u64)]]).unwrap();
+        let failures = prover
+            .verify()
+            .expect_err("condition (9) accepted an unreduced clean instance");
+        // "attach name from NR_out (merge)" fires alongside the Pairwise
+        // Consistency lookups, because a non-European group has no
+        // (nationkey, name) row to be labelled from; that is a downstream
+        // consequence of the same unreduced witness, not a substitute for
+        // condition (9), so the assertion still demands a "pw: " lookup.
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected, but not through a Pairwise Consistency \
+             lookup: {:?}",
+            failures
+        );
+    }
+
+    /// Condition (7), Conservation, and specifically the clean indicator riding
+    /// as the fifth column of the LS shuffle: claiming one extra clean
+    /// occurrence on the INPUT side while the partition side keeps the honest
+    /// sections must break the multiset equality. Without this binding the
+    /// `HideOneCleanTuple` direction above would be escapable by simply lying
+    /// about `cflag_ls`.
+    #[test]
+    fn mock_reject_clean_flag_lie() {
+        let (circuit, c) = three_lane_circuit(Tamper::CleanFlagLie);
+        set_config_lanes(c);
+        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(1u64)]]).unwrap();
+        let failures = prover
+            .verify()
+            .expect_err("condition (7) accepted an unbound clean indicator");
+        assert!(
+            failures
+                .iter()
+                .any(|f| matches!(f, VerifyFailure::Shuffle { .. })),
+            "the clean-indicator lie did not break a Conservation shuffle: {:?}",
+            failures
+        );
+    }
+
+    /// The lane padding tail is past |LS^c| and so outside every copy
+    /// constraint, yet `perm_lsort` carries it into the lane aggregation and on
+    /// into the reported revenue. Breaking the canonical pad tuple there must
+    /// be rejected.
+    #[test]
+    fn mock_reject_tampered_lane_pad_row() {
+        let (circuit, c) = three_lane_circuit(Tamper::LanePadRow);
+        set_config_lanes(c);
+        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(1u64)]]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "a lane pad row outside the canonical pad tuple must not verify"
+        );
+    }
+
+    /// The cell one row past each lane's sorted view. The whole rest of the lane
+    /// witness is derived consistently from the tampered value, so this is the
+    /// real attack and not just an inconsistent assignment: lane 0's sorted view
+    /// is [nk1, nk1, nk2, nk2], the boundary cell claims nk2 again, the last row
+    /// stops being a group end and nation nk2 loses its 12000 from lane 0's
+    /// partial. Everything else -- the emit gate, the drain shuffle, the merge --
+    /// agrees with it, so the boundary gate is the ONLY thing that can reject.
+    #[test]
+    fn mock_reject_tampered_lane_sentinel() {
+        let (circuit, c) = three_lane_circuit(Tamper::LaneSentinel);
+        set_config_lanes(c);
+        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(1u64)]]).unwrap();
+        let failures = prover
+            .verify()
+            .expect_err("an unpinned sorted-view boundary cell was accepted");
+        assert!(
+            !failures.is_empty()
+                && failures
+                    .iter()
+                    .all(|f| format!("{:?}", f).contains("group-by sentinel is 0")),
+            "the circuit rejected, but not (only) through the sorted-view \
+             boundary gate: {:?}",
+            failures
         );
     }
 

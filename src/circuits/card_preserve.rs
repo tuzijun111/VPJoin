@@ -98,6 +98,7 @@ pub struct CpAggConfig<F: Field + Ord, const N_BYTES: usize> {
     pub perm_sort: PermAnyConfig,
 
     pub q_sort: Selector,
+    pub q_sentinel: Selector,
     pub lt_key_cur_next: LtConfig<F, N_BYTES>,
     pub iz_key_eq: IsZeroConfig<F>,
 
@@ -198,6 +199,31 @@ pub fn configure_cp_agg<F: Field + Ord, const N_BYTES: usize>(
         let q = m.query_selector(q_sort);
         let le = lt_key_cur_next.is_lt(m, None) + iz_key_eq.expr();
         vec![q * (le - Expression::Constant(F::ONE))]
+    });
+
+    // The group-boundary detector on the last real row reads the sentinel cell at
+    // row n, and nondecreasing alone does not pin that cell. A prover may set it
+    // equal to the last real key; then `iz_same_next` reports "same group" on the
+    // last real row, the emit gate below writes PAD instead of that group's sums,
+    // and the highest-key group disappears from the table the parent looks into.
+    // A parent carrying that key would then certify its ABSENCE with a gap
+    // witness that really does hold in the forged table and take sigma = 0,
+    // lowering the input-side count; combined with a clean tuple hidden on the
+    // other side, that is a way to satisfy the equality with an incomplete clean
+    // instance.
+    //
+    // Pinning the sentinel to PAD closes it. Note this is deliberately NOT a
+    // strict-increase requirement on the last comparison: a stage whose rows
+    // include padding keyed at PAD (the bag stages of the cyclic queries do)
+    // legitimately ends with real rows at PAD, and those must NOT be emitted as
+    // a group. With the sentinel pinned, every group whose key is below PAD is
+    // recognised as a group end, and a PAD-keyed padding group is correctly
+    // skipped. It costs one selector and one degree-1 gate: no advice column,
+    // no Lt chip and no lookup.
+    let q_sentinel = meta.selector();
+    meta.create_gate("cp: sorted view sentinel is PAD", |m| {
+        let q = m.query_selector(q_sentinel);
+        vec![q * (m.query_advice(sorted[0], Rotation::cur()) - Expression::Constant(F::from(pad_key)))]
     });
 
     // group-by over the sorted key column, one running sum per channel
@@ -398,6 +424,7 @@ pub fn configure_cp_agg<F: Field + Ord, const N_BYTES: usize>(
         sorted,
         perm_sort,
         q_sort,
+        q_sentinel,
         lt_key_cur_next,
         iz_key_eq,
         q_first,
@@ -577,6 +604,398 @@ pub fn wire_cp_edge<F: Field + Ord, const N_BYTES: usize>(
             (q_in * s_cln, q_tbl * t_cln),
         ]
     });
+}
+
+// ---------------------------------------------------------------------------
+// Key edges: the specialization for an edge whose child holds at most one
+// tuple per join-key value.
+// ---------------------------------------------------------------------------
+//
+// On such an edge every sigma is 0 or 1, and two things collapse.
+//
+// The per-key aggregation disappears. With at most one child tuple per key,
+// `sigma_j(v)` is that tuple's own multiplicity, so the sorted view, the group
+// boundaries, the running sums, the emitted pairs and the emit-to-table
+// permutation of `configure_cp_agg` all reduce to one sorted, key-indexed copy
+// of the child's rows, which is the map table the parent already looks into.
+//
+// The clean channel disappears too, which is the larger saving and is worth
+// stating as a lemma, since it is what makes this a specialization rather than
+// an assumption:
+//
+//   On a tree all of whose edges are key edges, `mu_cln(t) = c(t) * pred(t)`
+//   at every tuple, so the clean root sum is just the number of clean root
+//   tuples and no clean multiplicity has to be propagated at all.
+//
+// Proof, by induction from the leaves. At a leaf `mu_cln = c * pred` by
+// definition. At an internal node, take a tuple `t` with `c(t) = 1`. Condition
+// (9), Pairwise Consistency, gives `pi_K(t) in pi_K(R_j^c)` on each child edge,
+// so some clean child tuple carries that key; because the child holds at most
+// one tuple per key, it is the only one, and it lies in `R_j^c`, hence its
+// indicator is 1 and, since the clean side is built from tuples that pass their
+// predicate, its predicate bit is 1 as well. By induction its `mu_cln` is 1, so
+// `sigma_cln_j(pi_K(t)) = 1` for every child and the product contributes
+// nothing. For `c(t) = 0` the whole product is multiplied by zero anyway. []
+//
+// So a key edge needs no `v_cln`, no `sigma_cln` and no third map column, and
+// the root's clean multiplicity is read straight off the bound indicator.
+//
+// The precondition is not assumed: the map's key column is constrained to be
+// STRICTLY increasing, which certifies that no two child rows share a key. If a
+// query circuit uses this on an edge whose child does have repeated keys, the
+// honest prover simply cannot satisfy it, so the specialization cannot be
+// applied where it does not hold.
+//
+// What does NOT collapse is absence certification on the parent side: a parent
+// whose key occurs in no child tuple must still exhibit a gap witness, or a
+// prover could under-report `sigma_all`, lower the input-side count and match it
+// against an incomplete clean side. `CpJoinConfig` is therefore reused
+// unchanged, and `s_cln` simply goes unread.
+
+#[derive(Clone, Debug)]
+pub struct CpKeyConfig<F: Field + Ord, const N_BYTES: usize> {
+    /// the child's input-channel multiplicity, on the child's own base rows;
+    /// caller-owned, exactly as for `configure_cp_agg`
+    pub v_all: Column<Advice>,
+
+    /// `(key, mu_all)` sorted by key, with the dummy row `(0, 0)` in front, so
+    /// this is both the sorted view and the lookup table
+    pub map: [Column<Advice>; 2],
+    pub map_key_next: Column<Advice>,
+    pub perm_map: PermAnyConfig,
+
+    pub q_sort: Selector,
+    pub lt_key_cur_next: LtConfig<F, N_BYTES>,
+
+    pub q_map_tbl: Selector,
+    pub q_map_first: Selector,
+    pub q_map_shift: Selector,
+    pub q_map_last: Selector,
+
+    pub pad_key: u64,
+}
+
+/// Configures the child side of a key edge. `key_col` and `v_all` are the
+/// child's join-key column and input-channel multiplicity on its base rows.
+pub fn configure_cp_key<F: Field + Ord, const N_BYTES: usize>(
+    meta: &mut ConstraintSystem<F>,
+    u8_col: Column<Fixed>,
+    key_col: Column<Advice>,
+    v_all: Column<Advice>,
+    pad_key: u64,
+) -> CpKeyConfig<F, N_BYTES> {
+    meta.enable_equality(v_all);
+
+    let map = [meta.advice_column(), meta.advice_column()];
+    let map_key_next = meta.advice_column();
+    for c in map {
+        meta.enable_equality(c);
+    }
+    meta.enable_equality(map_key_next);
+
+    // rows 1..=n of the map are a permutation of the child's (key, mu_all)
+    let q_perm_in = meta.complex_selector();
+    let q_perm_out = meta.complex_selector();
+    let perm_map = PermAnyChip::configure(
+        meta,
+        q_perm_in,
+        q_perm_out,
+        vec![key_col, v_all],
+        map.to_vec(),
+    );
+
+    // STRICTLY increasing keys: this both orders the table for the gap witness
+    // and certifies that the child holds at most one tuple per key, which is
+    // the precondition of the whole specialization
+    let q_sort = meta.selector();
+    let lt_key_cur_next = LtChip::<F, N_BYTES>::configure_with_u8(
+        meta,
+        u8_col,
+        |m| m.query_selector(q_sort),
+        |m| m.query_advice(map[0], Rotation::cur()),
+        |m| m.query_advice(map[0], Rotation::next()),
+    );
+    meta.create_gate("cp key: map keys strictly increasing", |m| {
+        let q = m.query_selector(q_sort);
+        vec![q * (lt_key_cur_next.is_lt(m, None) - Expression::Constant(F::ONE))]
+    });
+
+    let q_map_tbl = meta.complex_selector();
+    let q_map_first = meta.selector();
+    let q_map_shift = meta.selector();
+    let q_map_last = meta.selector();
+
+    meta.create_gate("cp key: map row 0 is the dummy (0, 0)", |m| {
+        let q = m.query_selector(q_map_first);
+        vec![
+            q.clone() * m.query_advice(map[0], Rotation::cur()),
+            q * m.query_advice(map[1], Rotation::cur()),
+        ]
+    });
+
+    meta.create_gate("cp key: map_key_next = next(map_key)", |m| {
+        let q = m.query_selector(q_map_shift);
+        vec![
+            q * (m.query_advice(map_key_next, Rotation::cur())
+                - m.query_advice(map[0], Rotation::next())),
+        ]
+    });
+
+    meta.create_gate("cp key: map_key_next of the last row is PAD", |m| {
+        let q = m.query_selector(q_map_last);
+        vec![
+            q * (m.query_advice(map_key_next, Rotation::cur())
+                - Expression::Constant(F::from(pad_key))),
+        ]
+    });
+
+    CpKeyConfig {
+        v_all,
+        map,
+        map_key_next,
+        perm_map,
+        q_sort,
+        lt_key_cur_next,
+        q_map_tbl,
+        q_map_first,
+        q_map_shift,
+        q_map_last,
+        pad_key,
+    }
+}
+
+/// Wires one key edge's two lookup arguments. `join` is the ordinary parent
+/// side; only its `s_all` output is read, since a key edge propagates no clean
+/// multiplicity.
+pub fn wire_cp_key_edge<F: Field + Ord, const N_BYTES: usize>(
+    meta: &mut ConstraintSystem<F>,
+    join: &CpJoinConfig<F, N_BYTES>,
+    key: &CpKeyConfig<F, N_BYTES>,
+    parent_key_col: Column<Advice>,
+) {
+    let j = join.clone();
+    let t = key.clone();
+
+    meta.lookup_any("cp key: gap pair in the child table", move |m| {
+        let q_in = m.query_selector(j.q_lookup_complex);
+        let inx = m.query_advice(j.in_tbl, Rotation::cur());
+        let gate = q_in * (Expression::Constant(F::ONE) - inx);
+
+        let q_tbl = m.query_selector(t.q_map_tbl);
+        vec![
+            (
+                gate.clone() * m.query_advice(j.low, Rotation::cur()),
+                q_tbl.clone() * m.query_advice(t.map[0], Rotation::cur()),
+            ),
+            (
+                gate * m.query_advice(j.high, Rotation::cur()),
+                q_tbl * m.query_advice(t.map_key_next, Rotation::cur()),
+            ),
+        ]
+    });
+
+    let j = join.clone();
+    let t = key.clone();
+
+    meta.lookup_any("cp key: key and its multiplicity in the child table", move |m| {
+        let q_in = m.query_selector(j.q_lookup_complex);
+        let inx = m.query_advice(j.in_tbl, Rotation::cur());
+        let q_tbl = m.query_selector(t.q_map_tbl);
+        vec![
+            (
+                q_in.clone() * inx * m.query_advice(parent_key_col, Rotation::cur()),
+                q_tbl.clone() * m.query_advice(t.map[0], Rotation::cur()),
+            ),
+            (
+                q_in * m.query_advice(j.s_all, Rotation::cur()),
+                q_tbl * m.query_advice(t.map[1], Rotation::cur()),
+            ),
+        ]
+    });
+}
+
+/// Host side of one key-edge child stage.
+#[derive(Clone, Debug, Default)]
+pub struct CpKeyStage {
+    /// `(key, mu_all)` sorted by key; the map occupies rows `1..=n`.
+    pub sorted: Vec<[u64; 2]>,
+    /// `key_next[i]` for map row `i`, so index 0 is the dummy row's next key.
+    pub key_next: Vec<u64>,
+    /// `key -> mu_all`, for the parent side.
+    pub map: HashMap<u64, u64>,
+    /// the map's key set including `0` and PAD, for gap witnesses.
+    pub keys: Vec<u64>,
+}
+
+/// Builds a key-edge child stage from `rows[i] = [key, mu_all]`. Panics if two
+/// rows share a key, since the circuit's strict-increase check would reject
+/// that witness anyway and failing here names the problem.
+pub fn build_cp_key_stage(rows: &[[u64; 2]], pad_key: u64) -> CpKeyStage {
+    let mut sorted = rows.to_vec();
+    sorted.sort_by_key(|r| r[0]);
+    for w in sorted.windows(2) {
+        assert!(
+            w[0][0] != w[1][0],
+            "cp key edge: the child holds two rows with key {}, so this edge is \
+             not a key edge and needs the general configure_cp_agg stage",
+            w[0][0]
+        );
+    }
+
+    let n = sorted.len();
+    // map row 0 is the dummy, rows 1..=n hold `sorted`
+    let mut key_next = vec![pad_key; n + 1];
+    for i in 0..=n {
+        key_next[i] = if i < n { sorted[i][0] } else { pad_key };
+    }
+
+    let mut map: HashMap<u64, u64> = HashMap::new();
+    for r in sorted.iter() {
+        map.insert(r[0], r[1]);
+    }
+
+    let mut keys: Vec<u64> = sorted.iter().map(|r| r[0]).collect();
+    keys.push(0);
+    keys.push(pad_key);
+    keys.sort();
+    keys.dedup();
+
+    CpKeyStage {
+        sorted,
+        key_next,
+        map,
+        keys,
+    }
+}
+
+/// Assigns one key-edge child stage. The caller has already assigned the key
+/// column and `v_all` on the child's `rows.len()` base rows.
+pub fn assign_cp_key<F: Field + Ord, const N_BYTES: usize>(
+    region: &mut Region<'_, F>,
+    a: &CpKeyConfig<F, N_BYTES>,
+    rows: &[[u64; 2]],
+    w: &CpKeyStage,
+) -> Result<(), Error> {
+    let n = rows.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let pad = a.pad_key;
+
+    // the dummy row, then the sorted child rows
+    region.assign_advice(|| "cp key map dummy k", a.map[0], 0, || Value::known(F::ZERO))?;
+    region.assign_advice(|| "cp key map dummy v", a.map[1], 0, || Value::known(F::ZERO))?;
+    for i in 0..n {
+        region.assign_advice(
+            || "cp key map k",
+            a.map[0],
+            i + 1,
+            || Value::known(F::from(w.sorted[i][0])),
+        )?;
+        region.assign_advice(
+            || "cp key map v",
+            a.map[1],
+            i + 1,
+            || Value::known(F::from(w.sorted[i][1])),
+        )?;
+    }
+    // a PAD sentinel one past the table, so the strict-increase gate at the
+    // last real row has a Rotation::next() to read
+    region.assign_advice(
+        || "cp key map k sentinel",
+        a.map[0],
+        n + 1,
+        || Value::known(F::from(pad)),
+    )?;
+
+    for i in 0..=n {
+        region.assign_advice(
+            || "cp key map_key_next",
+            a.map_key_next,
+            i,
+            || Value::known(F::from(w.key_next[i])),
+        )?;
+    }
+
+    for i in 0..=n {
+        a.q_map_tbl.enable(region, i)?;
+    }
+    a.q_map_first.enable(region, 0)?;
+    for i in 0..n {
+        a.q_map_shift.enable(region, i)?;
+    }
+    a.q_map_last.enable(region, n)?;
+
+    // the permutation runs over the child's base rows against map rows 1..=n
+    for i in 0..n {
+        a.perm_map.q_perm1.enable(region, i)?;
+        a.perm_map.q_perm2.enable(region, i + 1)?;
+    }
+
+    // strict increase over the whole table, dummy row included
+    let lt = LtChip::<F, N_BYTES>::construct(a.lt_key_cur_next);
+    for i in 0..=n {
+        a.q_sort.enable(region, i)?;
+        let cur = if i == 0 { 0 } else { w.sorted[i - 1][0] };
+        let next = if i < n { w.sorted[i][0] } else { pad };
+        lt.assign(
+            region,
+            i,
+            Value::known(F::from(cur)),
+            Value::known(F::from(next)),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Assigns one key-edge parent side and returns the fetched `mu_all` bit per
+/// parent row. `s_cln` is written as 0 on every row, since a key edge
+/// propagates no clean multiplicity and the gate reads only `s_all`.
+pub fn assign_cp_key_join<F: Field + Ord, const N_BYTES: usize>(
+    region: &mut Region<'_, F>,
+    j: &CpJoinConfig<F, N_BYTES>,
+    parent_keys: &[u64],
+    child: &CpKeyStage,
+    pad_key: u64,
+) -> Result<Vec<u64>, Error> {
+    let lt_low = LtChip::<F, N_BYTES>::construct(j.lt_low);
+    let lt_high = LtChip::<F, N_BYTES>::construct(j.lt_high);
+
+    let mut fetched = Vec::with_capacity(parent_keys.len());
+    for (i, &key) in parent_keys.iter().enumerate() {
+        let (inx, low, high) = cp_gap_witness(&child.keys, key, pad_key);
+        let s_all = if inx == 1 {
+            child.map.get(&key).copied().unwrap_or(0)
+        } else {
+            0
+        };
+
+        j.q_lookup.enable(region, i)?;
+        j.q_lookup_complex.enable(region, i)?;
+
+        region.assign_advice(|| "cp key in_tbl", j.in_tbl, i, || Value::known(F::from(inx)))?;
+        region.assign_advice(|| "cp key low", j.low, i, || Value::known(F::from(low)))?;
+        region.assign_advice(|| "cp key high", j.high, i, || Value::known(F::from(high)))?;
+        region.assign_advice(|| "cp key s_all", j.s_all, i, || Value::known(F::from(s_all)))?;
+        region.assign_advice(|| "cp key s_cln", j.s_cln, i, || Value::known(F::ZERO))?;
+
+        lt_low.assign(
+            region,
+            i,
+            Value::known(F::from(low)),
+            Value::known(F::from(key)),
+        )?;
+        lt_high.assign(
+            region,
+            i,
+            Value::known(F::from(key)),
+            Value::known(F::from(high)),
+        )?;
+
+        fetched.push(s_all);
+    }
+    Ok(fetched)
 }
 
 // ---------------------------------------------------------------------------
@@ -880,6 +1299,8 @@ pub fn assign_cp_agg<F: Field + Ord, const N_BYTES: usize>(
         a.q_sort.enable(region, i)?;
         a.q_emit.enable(region, i)?;
     }
+    // pin the sentinel, so the final group is recognised as a group end
+    a.q_sentinel.enable(region, n)?;
     for i in 0..n.saturating_sub(1) {
         a.q_tbl_sort.enable(region, i)?;
         a.q_tbl_shift.enable(region, i)?;

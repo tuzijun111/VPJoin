@@ -1,12 +1,13 @@
-//! Constraint-system cost of the One-Pass OBJ before and after the updated
-//! condition (4).
+//! Constraint-system cost of the One-Pass OBJ realizations.
 //!
-//! For every query it configures both circuits, the shipped `*_obj` one whose
-//! residual-side condition argued on the residual relations and the
-//! `*_obj_test` one whose Cardinality Preservation Check counts instead, and
-//! prints what the arithmetization costs in each case. Nothing is proved and no
-//! witness is generated, so this runs in well under a second and is the cheapest
-//! way to read off the constant factors the paper's cost accounting quotes.
+//! Every query has the general `*_obj` circuit, which certifies conditions (7),
+//! (9) and (10) with the two-channel Cardinality Preservation Check. The five
+//! TPC-H queries also have `*_obj_key`, which specializes that check on edges
+//! whose child holds at most one tuple per join key, so the report is a pair
+//! there and a single row for the graph queries.
+//! Nothing is proved and no witness is generated, so this runs in well under a
+//! second and is the cheapest way to read off the constant factors the paper's
+//! cost accounting quotes.
 //!
 //!   cargo run --release --bin obj_gate_cost
 //!
@@ -67,7 +68,7 @@ fn line(query: &str, variant: &str, c: &Cost) {
     );
 }
 
-fn delta(query: &str, old: &Cost, new: &Cost) {
+fn delta(query: &str, what: &str, old: &Cost, new: &Cost) {
     let d = |a: usize, b: usize| -> String {
         let x = b as i64 - a as i64;
         if x >= 0 {
@@ -79,7 +80,7 @@ fn delta(query: &str, old: &Cost, new: &Cost) {
     println!(
         "{:<6} {:<9} {:>6} {:>5} {:>4} {:>4} {:>6} {:>6} {:>8} {:>8}",
         query,
-        "delta",
+        what,
         d(old.advice, new.advice),
         d(old.fixed, new.fixed),
         d(old.selectors, new.selectors),
@@ -92,13 +93,22 @@ fn delta(query: &str, old: &Cost, new: &Cost) {
     println!();
 }
 
+/// One row, for a query with no key-edge variant.
+macro_rules! single {
+    ($q:expr, $gen:ty) => {{
+        line($q, "obj", &cost_of::<$gen>());
+        println!();
+    }};
+}
+
+/// A pair, for a query that also has a key-edge variant.
 macro_rules! pair {
-    ($q:expr, $old:ty, $new:ty) => {{
-        let o = cost_of::<$old>();
-        let n = cost_of::<$new>();
-        line($q, "obj", &o);
-        line($q, "obj_test", &n);
-        delta($q, &o, &n);
+    ($q:expr, $gen:ty, $key:ty) => {{
+        let g = cost_of::<$gen>();
+        let k = cost_of::<$key>();
+        line($q, "obj", &g);
+        line($q, "obj_key", &k);
+        delta($q, "key-saves", &g, &k);
     }};
 }
 
@@ -108,45 +118,30 @@ fn main() {
 
     header();
 
-    pair!("q3", q3_obj::MyCircuit<Fp>, q3_obj_test::MyCircuit<Fp>);
-    pair!("q5", q5_obj::MyCircuit<Fp>, q5_obj_test::MyCircuit<Fp>);
-    pair!("q8", q8_obj::MyCircuit<Fp>, q8_obj_test::MyCircuit<Fp>);
-    pair!("q9", q9_obj::MyCircuit<Fp>, q9_obj_test::MyCircuit<Fp>);
-    pair!("q18", q18_obj::MyCircuit<Fp>, q18_obj_test::MyCircuit<Fp>);
+    pair!("q3", q3_obj::MyCircuit<Fp>, q3_obj_key::MyCircuit<Fp>);
+    pair!("q5", q5_obj::MyCircuit<Fp>, q5_obj_key::MyCircuit<Fp>);
+    pair!("q8", q8_obj::MyCircuit<Fp>, q8_obj_key::MyCircuit<Fp>);
+    pair!("q9", q9_obj::MyCircuit<Fp>, q9_obj_key::MyCircuit<Fp>);
+    pair!("q18", q18_obj::MyCircuit<Fp>, q18_obj_key::MyCircuit<Fp>);
 
-    pair!(
-        "gq1",
-        g_sql1_obj::Path3OrdCircuit<Fp>,
-        g_sql1_obj_test::Path3OrdCircuit<Fp>
-    );
-    pair!(
-        "gq2",
-        g_sql2_obj::GraphPath4OrderCircuit<Fp>,
-        g_sql2_obj_test::GraphPath4OrderCircuit<Fp>
-    );
-    pair!("gq3", g_sql3_obj::MyCircuit<Fp>, g_sql3_obj_test::MyCircuit<Fp>);
-    pair!("gq4", g_sql4_obj::MyCircuit<Fp>, g_sql4_obj_test::MyCircuit<Fp>);
+    single!("gq1", g_sql1_obj::Path3OrdCircuit<Fp>);
+    single!("gq2", g_sql2_obj::GraphPath4OrderCircuit<Fp>);
+    single!("gq3", g_sql3_obj::MyCircuit<Fp>);
+    single!("gq4", g_sql4_obj::MyCircuit<Fp>);
 
     println!(
-        "Read the delta rows carefully: they are NOT all the same quantity.\n\
+        "The obj rows are the general One-Pass OBJ: conditions (7) Conservation, (9) Pairwise\n\
+         Consistency and (10) Cardinality Preservation, with (10) certified by the two-channel\n\
+         multiplicity count.\n\
          \n\
-         q3 and q5 already carried a clean/residual partition and a residual-side\n\
-         condition (4), so their delta is close to the swap the paper describes: the\n\
-         old residual-side argument out, the Cardinality Preservation Check in.\n\
+         The obj_key rows specialize (10) on key edges, where the child holds at most one tuple\n\
+         per join key so every sigma is a bit: the per-key aggregation collapses and, when every\n\
+         edge of the tree is such an edge, the clean channel disappears entirely. Absence\n\
+         certification is NOT removed, which is why key-saves is about a quarter rather than all\n\
+         of the check. GQ1, GQ2 and GQ4 have no key edge and GQ3 was not converted, so the graph\n\
+         queries have a single row.\n\
          \n\
-         The other seven never partitioned at all. Their `*_obj.rs` verifies the join\n\
-         with one-directional lookups from a root relation, so the delta there pays for\n\
-         the whole One-Pass OBJ that was missing: the partition, condition (1)\n\
-         Conservation, condition (3) Pairwise Consistency, and both channels of the\n\
-         propagation. It is not the incremental cost of condition (4) alone.\n\
-         \n\
-         gq1 is the one row that isolates the paper's claim that the clean channel costs\n\
-         only its own column, running sum and product: that circuit already ran the\n\
-         single-channel propagation over the inputs, so its delta adds the second channel\n\
-         to machinery that was already there.\n\
-         \n\
-         Rows and constraint totals also scale with the relation sizes, which this report\n\
-         does not see: it reports only what the constraint system fixes independently of\n\
-         the data."
+         Rows and constraint totals also scale with the relation sizes, which this report does not\n\
+         see: it reports only what the constraint system fixes independently of the data."
     );
 }

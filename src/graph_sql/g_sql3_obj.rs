@@ -1,46 +1,20 @@
-//! Triangle / 3-cycle COUNT(*) with ordering (A<B<C) over a single Edge table.
-//!
-//! SQL:
-//!   SELECT COUNT(*) AS cnt
-//!   FROM Edge r1
-//!   JOIN Edge r2 ON r1.dst = r2.src
-//!   JOIN Edge r3 ON r2.dst = r3.src AND r3.dst = r1.src
-//!   WHERE r1.src < r2.src AND r2.src < r3.src;
-//!
-//! Variables:
-//!   A = r1.src = r3.dst
-//!   B = r1.dst = r2.src
-//!   C = r2.dst = r3.src
-//!
-//! Acyclic decomposition (Path + Closer):
-//!   Bag1 {r1,r2}: materialize wedges A->B->C
-//!   Bag2 {r3}: edges C->A
-//!   Separator: (A,C)
-//!
-//! Message from Bag2 -> Bag1:
-//!   msg_key = pack2(A,C)
-//!   msg_val = COUNT(edges C->A) grouped by msg_key
-//!
-//! Final:
-//!   answer = Σ_{row in Bag1} msg_val(pack2(A,C)) * [A<B] * [B<C]
-//!
-//! Requires your existing chips:
-//!   crate::chips::is_zero::{IsZeroChip, IsZeroConfig}
-//!   crate::chips::less_than::{LtChip, LtConfig, LtInstruction}
-//!   crate::chips::permutation_any::{PermAnyChip, PermAnyConfig}
-
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
+use crate::circuits::card_preserve::{
+    assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
+    configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
 
 // ✅ Use the dataset Edge type directly.
 use crate::data::graph_data_processing::Edge;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // IMPORTANT: pack2(A,C) can exceed 5 bytes. Use 8 bytes to avoid LT gate failures.
 // `pub(crate)` so the multi-lane DP variant `g_sql3_obj_dp` inherits exactly the
@@ -58,6 +32,24 @@ pub(crate) const PACK_SHIFT: u64 = 1u64 << PACK_BITS;
 pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
     hi * PACK_SHIFT + lo
 }
+
+/// Test hook, off in every benchmark path: when set, the prover moves one
+/// joinable Bag2 tuple to the residual side and re-reduces the bags around it,
+/// so the partition still passes Conservation and stays pairwise consistent on
+/// the clean side, and only condition (4) can catch it. This is exactly the
+/// cheat a residual-side-only argument misses, so the negative test in this
+/// module is what shows the Cardinality Preservation Check is not vacuous.
+pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+
+/// Test hook, off in every benchmark path: when set, the prover skips the
+/// semijoin reduction entirely and declares every real tuple clean, so the
+/// residual side of both bags holds only what the bag's own predicate already
+/// dropped. Conservation still holds, and with the two channels then carrying
+/// the same multiplicity on every row both root sums of condition (4) agree for
+/// free. This is exactly the escape Pairwise Consistency has to close, so the
+/// third direction of the test in this module is what shows condition (3) is
+/// not vacuous.
+pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -201,6 +193,9 @@ pub struct AggSumByKeyConfig<F: Field + Ord> {
     perm_sort: PermAnyConfig,
 
     q_sort: Selector,
+    /// pins the one-past-the-end cells of the two sorted views to PAD; enabled
+    /// on row `n` only
+    q_sentinel: Selector,
     pub(crate) lt_key: LtConfig<F, NUM_BYTES>,
     iz_eq_key: IsZeroConfig<F>,
 
@@ -288,6 +283,25 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             let le = lt_key.is_lt(m, None) + iz_eq_key.expr();
             vec![q * (le - Expression::Constant(F::ONE))]
         });
+
+        // The one-past-the-end cell of the sorted view, row `n`. It is READ: the
+        // group-boundary detector `iz_same_next` on the last real row compares
+        // against it, and nondecreasing alone does not pin it. Left free, a
+        // prover sets it equal to the last real key, `iz_same_next` then reports
+        // "same group" on the last real row, the emit gate below writes
+        // (PAD, 0) instead of that group's sum, and the highest-key group
+        // disappears from the message table the answer is read off. The
+        // separate `cp_agg_msg` group-by over the same input columns has its own
+        // sentinel pinned, so condition (10) keeps that group and still
+        // balances; only the certified COUNT(*) comes out short.
+        //
+        // This is the same hole and the same fix as "cp: sorted view sentinel is
+        // PAD" in `crate::circuits::card_preserve`, and for the reason given
+        // there it pins the VALUE rather than requiring the last comparison to
+        // be strict: the Bag2 rows include padding keyed at PAD, so the sorted
+        // view legitimately ends with real rows at PAD and those must not be
+        // emitted as a group.
+        let q_sentinel = meta.selector();
 
         // run sum
         let run_sum = meta.advice_column();
@@ -399,6 +413,21 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             vec![q * (le - Expression::Constant(F::ONE))]
         });
 
+        // Both one-past-the-end sentinels, pinned to PAD by two degree-1
+        // constraints under one selector enabled on row `n` only. `sorted_key[n]`
+        // is the load-bearing one (see above); `out_key[n]` is read only by the
+        // last `q_out_sort` comparison and never reaches the map, but it costs
+        // nothing to pin it in the same gate and it removes the last free cell
+        // of the aggregator.
+        meta.create_gate("agg sorted view sentinels are PAD", |m| {
+            let q = m.query_selector(q_sentinel);
+            let pad = Expression::Constant(F::from(PAD_U64));
+            vec![
+                q.clone() * (m.query_advice(sorted_key, Rotation::cur()) - pad.clone()),
+                q * (m.query_advice(out_key, Rotation::cur()) - pad),
+            ]
+        });
+
         // map table
         let map_key = meta.advice_column();
         let map_val = meta.advice_column();
@@ -456,6 +485,7 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
             sorted_val,
             perm_sort,
             q_sort,
+            q_sentinel,
             lt_key,
             iz_eq_key,
             q_first,
@@ -646,6 +676,9 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         )?;
         region.assign_advice(|| "out_sum_s", cfg.out_sum, n, || Value::known(F::ZERO))?;
 
+        // both sentinels of this aggregator live on row `n` and are pinned to PAD
+        cfg.q_sentinel.enable(region, n)?;
+
         let mut out_ext = out.clone();
         out_ext.push((PAD_U64, 0));
         for i in 0..n {
@@ -733,6 +766,20 @@ pub struct IndexedViewConfig<F: Field + Ord> {
     pub sorted_eid: Column<Advice>,
     perm: PermAnyConfig,
 
+    /// Table selector of every join lookup that reads this view. It is enabled
+    /// on exactly the view's real rows [0, n_base) and must stay a complex
+    /// selector, since a simple one may not appear in a lookup expression.
+    ///
+    /// Without it the four columns (sorted_key, idx, sorted_val, sorted_eid)
+    /// are a live lookup table on EVERY row of the domain, including the
+    /// one-past-the-end sentinel row n_base and every row above it, none of
+    /// which any constraint of this chip touches (perm, q_sort, q_idx0 and
+    /// q_idx all stop at n_base). That is an unlimited supply of forged view
+    /// tuples: a prover picks any (key, idx, val, eid) it likes on a free row
+    /// and a bag row then "proves" a join it never had, which is a full count
+    /// inflation with no change to any fixed column.
+    pub q_tbl: Selector,
+
     q_sort: Selector,
     pub(crate) lt_key: LtConfig<F, NUM_BYTES>,
     iz_eq_key: IsZeroConfig<F>,
@@ -776,6 +823,8 @@ impl<F: Field + Ord> IndexedViewChip<F> {
             vec![in_key, in_val, in_eid],
             vec![sorted_key, sorted_val, sorted_eid],
         );
+
+        let q_tbl = meta.complex_selector();
 
         let q_sort = meta.selector();
         let lt_key = LtChip::<F, NUM_BYTES>::configure(
@@ -836,6 +885,7 @@ impl<F: Field + Ord> IndexedViewChip<F> {
             sorted_val,
             sorted_eid,
             perm,
+            q_tbl,
             q_sort,
             lt_key,
             iz_eq_key,
@@ -861,6 +911,10 @@ impl<F: Field + Ord> IndexedViewChip<F> {
         for i in 0..n {
             cfg.perm.q_perm1.enable(region, i)?;
             cfg.perm.q_perm2.enable(region, i)?;
+            // table side of the join lookups: exactly the rows the permutation
+            // and the sort/idx recurrences cover, so the sentinel row `n` and
+            // every row above it are NOT table entries
+            cfg.q_tbl.enable(region, i)?;
         }
 
         for i in 0..n {
@@ -1208,6 +1262,52 @@ pub struct TrianglePathCloserConfig<F: Field + Ord> {
 
     out: Column<Advice>,
     q_out: Selector,
+
+    // ---------------- clean/residual partition of the two bags ----------------
+    // bound clean indicator per bag row: 1 only on a row that passes the bag's
+    // own predicate and went to R^c
+    cln12: Column<Advice>,
+    cln3: Column<Advice>,
+    q_cln12_bind: Selector,
+    q_cln3_bind: Selector,
+
+    // `real == [the row carries a tuple at all]`: the two indicators that pin
+    // the real bit of a bag row to that row's own attributes, so a padding row
+    // cannot be promoted to a real input-channel tuple and a real row cannot be
+    // demoted while keeping its attributes. Node ids are SHIFT_ID-shifted, so a
+    // real tuple has B != 0 (Bag1) and C != 0 (Bag2) and only padding is zero.
+    iz_t12_pad: IsZeroConfig<F>,
+    iz_t3_pad: IsZeroConfig<F>,
+
+    // Conservation Check (condition (1)) per bag: the bag rows carrying the
+    // indicator are a permutation of [clean rows | residual rows | pad rows]
+    part12: Vec<Column<Advice>>, // 8: (A,B,C,i_r1,j_r2,r1_eid,r2_eid,flag)
+    part3: Vec<Column<Advice>>,  // 5: (C,A,j_r3,r3_eid,flag)
+    perm_bag1: PermAnyConfig,
+    perm_bag2: PermAnyConfig,
+    q_cln_flag: Vec<Selector>, // [bag1, bag2] rows of R^c: flag == 1
+    q_res_flag: Vec<Selector>, // [bag1, bag2] rows of R^r: flag == 0
+
+    // ---------------- Pairwise Consistency (condition (3)) ----------------
+    // packed (A,C) separator key of each partition group, pinned to that
+    // group's own attribute columns
+    pk12: Column<Advice>,
+    pk3: Column<Advice>,
+    q_pk12: Selector,
+    q_pk3: Selector,
+
+    // one complex selector per group, enabled over exactly the clean block of
+    // that group. Each one is the input selector of one direction and the table
+    // selector of the other, so no free advice is left to forge.
+    q_pw_in_12: Selector,
+    q_pw_in_3: Selector,
+
+    // ---------------- Cardinality Preservation Check ----------------
+    // condition (4): |Bag1^c |X| Bag2^c| == |Bag1 |X| Bag2|
+    cp_agg_msg: CpAggConfig<F, NUM_BYTES>, // child Bag2, keyed by pack2(A,C)
+    cp_join_msg: CpJoinConfig<F, NUM_BYTES>, // parent side, on the Bag1 rows
+    cp_root: CpRootConfig,
+    q_cp_mu: Selector, // the two root product gates
 }
 
 #[derive(Clone, Debug)]
@@ -1256,48 +1356,248 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
         let q_t3_lookup = meta.complex_selector();
         let q_t3_msg_in = meta.selector();
 
+        // ---------------- clean/residual partition of the two bags ----------------
+        // Neither bag was partitioned in g_sql3_obj.rs, and condition (4) needs
+        // two sides to compare, so the partition is introduced here. `cln12` /
+        // `cln3` are the bound indicators on the bag rows: the gates below pin
+        // them boolean and below the bag's own predicate, and the Conservation
+        // Check pins them to the partition itself.
+        let cln12 = meta.advice_column();
+        let cln3 = meta.advice_column();
+        meta.enable_equality(cln12);
+        meta.enable_equality(cln3);
+        let q_cln12_bind = meta.selector();
+        let q_cln3_bind = meta.selector();
+
+        // The real bit is the input-channel multiplicity of a bag row, so it
+        // decides on its own whether the row enters the message table and the
+        // input channel of condition (10). Boolean is not enough: neither real
+        // bit is inside its bag's Conservation shuffle (the shuffled tuple is
+        // (attributes, indicator)), so on a padding row it is free advice. With
+        // t3_real = 1 on a padding row the gate "msg input from bag2 edges"
+        // publishes in_key = pack2(0,0) = 0, the reserved dummy key, and with
+        // t3_real = 0 on a REAL row that row's key leaves the message map and
+        // the cp table at once, which is a load-bearing step of a count
+        // inflation.
+        //
+        // Both are closed by pinning the bit to the row's own attributes. Node
+        // ids are SHIFT_ID-shifted, so B (Bag1) and C (Bag2) are nonzero on
+        // every real tuple and zero on the all-zero padding tuple, and the join
+        // lookups only accept a zero key against the (0,0,0) dummy view row,
+        // whose val and eid are zero too. So `real == [attr != 0]` is exactly
+        // "this row carries a tuple", and it costs one advice column and one
+        // degree-3 constraint per bag rather than a wider shuffle.
+        let aux_t3_pad = meta.advice_column();
+        let iz_t3_pad = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(q_cln3_bind),
+            |m| m.query_advice(t3_c, Rotation::cur()),
+            aux_t3_pad,
+        );
+        let aux_t12_pad = meta.advice_column();
+        let iz_t12_pad = IsZeroChip::configure(
+            meta,
+            |m| m.query_selector(q_cln12_bind),
+            |m| m.query_advice(t12_b, Rotation::cur()),
+            aux_t12_pad,
+        );
+
+        meta.create_gate("bag2 clean indicator", |m| {
+            let q = m.query_selector(q_cln3_bind);
+            let cln = m.query_advice(cln3, Rotation::cur());
+            let real = m.query_advice(t3_real, Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+            vec![
+                // t3_real is a multiplicity of the input channel now, so it has
+                // to be boolean; g_sql3_obj.rs only ever used it as a factor
+                q.clone() * real.clone() * (one.clone() - real.clone()),
+                q.clone() * cln.clone() * (one.clone() - cln.clone()),
+                // clean implies real, i.e. cln3 == t3_real * c_3
+                q.clone() * cln * (one.clone() - real.clone()),
+                // real == [C != 0]: padding cannot be promoted to a real tuple
+                // at the reserved key, and a real tuple cannot be demoted
+                q * (real - (one - iz_t3_pad.expr())),
+            ]
+        });
+
+        // Conservation Check per bag: the bag rows, carrying the bound
+        // indicator, are a permutation of [clean rows | residual rows | pad
+        // rows]. The flag is a constant 1 over the clean rows and 0 over the
+        // residual rows, so the multiset equality forces the indicator on a bag
+        // row to mark exactly the tuples that went to R^c. Without it a prover
+        // could mark a residual row clean and inflate the clean channel.
+        let part12 = (0..8).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let part3 = (0..5).map(|_| meta.advice_column()).collect::<Vec<_>>();
+
+        let q_perm12_in = meta.complex_selector();
+        let q_perm12_out = meta.complex_selector();
+        let perm_bag1 = PermAnyChip::configure(
+            meta,
+            q_perm12_in,
+            q_perm12_out,
+            vec![
+                t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid, cln12,
+            ],
+            part12.clone(),
+        );
+
+        let q_perm3_in = meta.complex_selector();
+        let q_perm3_out = meta.complex_selector();
+        let perm_bag2 = PermAnyChip::configure(
+            meta,
+            q_perm3_in,
+            q_perm3_out,
+            vec![t3_c, t3_a, t3_j_r3, t3_r3_eid, cln3],
+            part3.clone(),
+        );
+
+        let q_cln_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
+        let q_res_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
+        for (idx, part) in [part12.clone(), part3.clone()].iter().enumerate() {
+            let flag_col = *part.last().unwrap();
+            let q_c = q_cln_flag[idx];
+            let q_r = q_res_flag[idx];
+            meta.create_gate("clean indicator on the partition side", move |m| {
+                let qc = m.query_selector(q_c);
+                let qr = m.query_selector(q_r);
+                let f = m.query_advice(flag_col, Rotation::cur());
+                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
+            });
+        }
+
+        // ---------------- Pairwise Consistency (condition (3)) ----------------
+        // pi_K(Bag1^c) == pi_K(Bag2^c) on the single edge of the cluster tree,
+        // the packed (A,C) separator, as two mutual Membership Checks.
+        //
+        // Both sides are read off the CLEAN block of the two partition groups,
+        // rows [0, n_cln), never off the bag rows. A lookup over the bag rows
+        // would only certify membership in the whole relation R_i, which is the
+        // weaker statement the message table already makes. A group's tuple
+        // columns are tied to its bag by that group's Conservation Check and the
+        // flag gate above pins flag == 1 on rows [0, n_cln) and 0 after them, so
+        // the group's own packed key restricted to that block is exactly
+        // pi_K(R^c).
+        //
+        // The key is composite, so it is packed with the same pack2 the rest of
+        // the file uses; the packed column is derived from the group's own A and
+        // C columns by one degree-2 gate rather than packed a second time by
+        // hand.
+        let pk12 = meta.advice_column();
+        let pk3 = meta.advice_column();
+        let q_pk12 = meta.selector();
+        let q_pk3 = meta.selector();
+        {
+            let p_a = part12[0];
+            let p_c = part12[2];
+            meta.create_gate("pw: bag1 partition packed key", move |m| {
+                let q = m.query_selector(q_pk12);
+                let key = m.query_advice(p_a, Rotation::cur())
+                    * Expression::Constant(F::from(PACK_SHIFT))
+                    + m.query_advice(p_c, Rotation::cur());
+                vec![q * (m.query_advice(pk12, Rotation::cur()) - key)]
+            });
+        }
+        {
+            let p_c = part3[0];
+            let p_a = part3[1];
+            meta.create_gate("pw: bag2 partition packed key", move |m| {
+                let q = m.query_selector(q_pk3);
+                let key = m.query_advice(p_a, Rotation::cur())
+                    * Expression::Constant(F::from(PACK_SHIFT))
+                    + m.query_advice(p_c, Rotation::cur());
+                vec![q * (m.query_advice(pk3, Rotation::cur()) - key)]
+            });
+        }
+
+        // One complex selector per group, enabled over exactly the clean block
+        // [0, n_cln) of that group. Each one is the input selector of one
+        // direction and the table selector of the other, so the two containments
+        // hold between the two clean key columns themselves. An earlier version
+        // routed each direction through an intermediate advice column holding
+        // the deduplicated key set, but nothing in the circuit bound those
+        // columns to the relation they claimed to enumerate: setting each table
+        // to the key column that looks into it satisfies both lookups for an
+        // arbitrary partition, which made condition (3) vacuous. There is no
+        // free advice left here, so there is nothing to forge. The selectors
+        // must stay complex, since a simple selector may not appear in a lookup
+        // expression, so they are fresh rather than the q_cln_flag pair.
+        //
+        // A lookup input is 0 on every row where its selector is off, and the
+        // table side is 0 on those rows too, so 0 is always in the table and the
+        // gated-off rows cost nothing. Node IDs are SHIFT_ID-shifted, so a real
+        // packed key is at least PACK_SHIFT + 1 and the containment is over the
+        // real keys only.
+        let q_pw_in_12 = meta.complex_selector();
+        let q_pw_in_3 = meta.complex_selector();
+
+        // pi_K(Bag1^c) subset of pi_K(Bag2^c)
+        meta.lookup_any("pw: bag1^c key in bag2^c", |m| {
+            let lhs = m.query_selector(q_pw_in_12) * m.query_advice(pk12, Rotation::cur());
+            let rhs = m.query_selector(q_pw_in_3) * m.query_advice(pk3, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
+
+        // pi_K(Bag2^c) subset of pi_K(Bag1^c)
+        meta.lookup_any("pw: bag2^c key in bag1^c", |m| {
+            let lhs = m.query_selector(q_pw_in_3) * m.query_advice(pk3, Rotation::cur());
+            let rhs = m.query_selector(q_pw_in_12) * m.query_advice(pk12, Rotation::cur());
+            vec![(lhs, rhs)]
+        });
+
         // Bag1 lookups:
+        //
+        // Every table side below is multiplied by the view's own `q_tbl`, which
+        // is enabled on exactly the rows [0, n_base) the view's permutation,
+        // sort and idx recurrences cover. An ungated table side would make the
+        // sentinel row and every unconstrained row above it a live table entry,
+        // i.e. free advice a bag row could join against. A lookup input is 0 on
+        // every row where its own selector is off, and a table row with `q_tbl`
+        // off contributes 0 on every column, so the all-zero tuple stays in the
+        // table and the gated-off input rows still cost nothing.
+        //
         // r1 via InByDst: key=B, idx=i_r1 -> val=A, eid=r1_eid
         meta.lookup_any("bag1 r1 from in_by_dst", |m| {
             let q = m.query_selector(q_t12_lookup);
+            let t = m.query_selector(in_by_dst.q_tbl);
             vec![
                 (
                     q.clone() * m.query_advice(t12_b, Rotation::cur()),
-                    m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
+                    t.clone() * m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
                 ),
                 (
                     q.clone() * m.query_advice(t12_i_r1, Rotation::cur()),
-                    m.query_advice(in_by_dst.idx, Rotation::cur()),
+                    t.clone() * m.query_advice(in_by_dst.idx, Rotation::cur()),
                 ),
                 (
                     q.clone() * m.query_advice(t12_a, Rotation::cur()),
-                    m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
+                    t.clone() * m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
                 ),
                 (
                     q * m.query_advice(t12_r1_eid, Rotation::cur()),
-                    m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
+                    t * m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
                 ),
             ]
         });
         // r2 via OutBySrc: key=B, idx=j_r2 -> val=C, eid=r2_eid
         meta.lookup_any("bag1 r2 from out_by_src", |m| {
             let q = m.query_selector(q_t12_lookup);
+            let t = m.query_selector(out_by_src.q_tbl);
             vec![
                 (
                     q.clone() * m.query_advice(t12_b, Rotation::cur()),
-                    m.query_advice(out_by_src.sorted_key, Rotation::cur()),
+                    t.clone() * m.query_advice(out_by_src.sorted_key, Rotation::cur()),
                 ),
                 (
                     q.clone() * m.query_advice(t12_j_r2, Rotation::cur()),
-                    m.query_advice(out_by_src.idx, Rotation::cur()),
+                    t.clone() * m.query_advice(out_by_src.idx, Rotation::cur()),
                 ),
                 (
                     q.clone() * m.query_advice(t12_c, Rotation::cur()),
-                    m.query_advice(out_by_src.sorted_val, Rotation::cur()),
+                    t.clone() * m.query_advice(out_by_src.sorted_val, Rotation::cur()),
                 ),
                 (
                     q * m.query_advice(t12_r2_eid, Rotation::cur()),
-                    m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
+                    t * m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
                 ),
             ]
         });
@@ -1305,22 +1605,23 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
         // Bag2 lookup (r3) via OutBySrc: key=C, idx=j_r3 -> val=A, eid=r3_eid
         meta.lookup_any("bag2 r3 from out_by_src", |m| {
             let q = m.query_selector(q_t3_lookup);
+            let t = m.query_selector(out_by_src.q_tbl);
             vec![
                 (
                     q.clone() * m.query_advice(t3_c, Rotation::cur()),
-                    m.query_advice(out_by_src.sorted_key, Rotation::cur()),
+                    t.clone() * m.query_advice(out_by_src.sorted_key, Rotation::cur()),
                 ),
                 (
                     q.clone() * m.query_advice(t3_j_r3, Rotation::cur()),
-                    m.query_advice(out_by_src.idx, Rotation::cur()),
+                    t.clone() * m.query_advice(out_by_src.idx, Rotation::cur()),
                 ),
                 (
                     q.clone() * m.query_advice(t3_a, Rotation::cur()),
-                    m.query_advice(out_by_src.sorted_val, Rotation::cur()),
+                    t.clone() * m.query_advice(out_by_src.sorted_val, Rotation::cur()),
                 ),
                 (
                     q * m.query_advice(t3_r3_eid, Rotation::cur()),
-                    m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
+                    t * m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
                 ),
             ]
         });
@@ -1391,6 +1692,27 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             |m| m.query_advice(t12_c, Rotation::cur()),
         );
 
+        // Bag1 side of the indicator binding: clean implies the row passes the
+        // bag's own predicate, i.e. cln12 == t12_real * [A<B] * [B<C] * c_1.
+        // This is what the filt/pad link gate does in the TPC-H files, where a
+        // row dropped by the predicate pads its indicator with 0.
+        meta.create_gate("bag1 clean indicator", |m| {
+            let q = m.query_selector(q_cln12_bind);
+            let cln = m.query_advice(cln12, Rotation::cur());
+            let real = m.query_advice(t12_real, Rotation::cur());
+            let ab = lt_ab.is_lt(m, None);
+            let bc = lt_bc.is_lt(m, None);
+            let one = Expression::Constant(F::ONE);
+            vec![
+                q.clone() * cln.clone() * (one.clone() - cln.clone()),
+                q.clone() * cln.clone() * (one.clone() - real.clone()),
+                q.clone() * cln.clone() * (one.clone() - ab),
+                q.clone() * cln * (one.clone() - bc),
+                // real == [B != 0], the Bag1 half of the pin described above
+                q * (real - (one - iz_t12_pad.expr())),
+            ]
+        });
+
         // contrib = t12_real * msg_val * lt_ab * lt_bc
         let contrib = meta.advice_column();
         meta.enable_equality(contrib);
@@ -1441,6 +1763,57 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             ]
         });
 
+        // ---------------- Cardinality Preservation Check (condition (4)) ----------------
+        // One fixed column serves every Lt chip of the check, so the whole check
+        // costs a single u8 range table and a single 256-row load region.
+        let cp_u8 = meta.fixed_column();
+
+        // Child side, over the Bag2 rows. Bag2 is a leaf of the cluster tree, so
+        // its two multiplicity columns are columns the circuit already has: the
+        // separator key and the input-channel multiplicity are agg_msg.in_key and
+        // agg_msg.in_val, both pinned to the Bag2 attributes by the gate "msg
+        // input from bag2 edges", and the clean channel is the bound indicator.
+        let cp_agg_msg = configure_cp_agg::<F, NUM_BYTES>(
+            meta,
+            cp_u8,
+            agg_msg.in_key, // t3_real ? pack2(A,C) : PAD
+            agg_msg.in_val, // t3_real
+            cln3,
+            PAD_U64,
+        );
+
+        // Parent side, on the rows of Bag1, keyed by the same packed separator
+        // the message lookup probes with. The membership + gap witness of
+        // MapLookupChip stays where it is; this is its second, two-channel copy,
+        // which is what carries the clean sum up to the root.
+        let cp_join_msg = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, msg_lookup.key);
+        wire_cp_edge(meta, &cp_join_msg, &cp_agg_msg, msg_lookup.key);
+
+        // Root multiplicities and the single equality that compares the two join
+        // cardinalities. mu_all is degree 5, the same as the existing contrib
+        // gate, so the circuit's degree does not rise; mu_cln is degree 3
+        // because the bound indicator already carries the predicate factors.
+        let cp_root = configure_cp_root::<F>(meta);
+        let q_cp_mu = meta.selector();
+        {
+            let s_all = cp_join_msg.s_all;
+            let s_cln = cp_join_msg.s_cln;
+            let mu_all = cp_root.mu_all;
+            let mu_cln = cp_root.mu_cln;
+            meta.create_gate("cp: root multiplicities over bag1", move |m| {
+                let q = m.query_selector(q_cp_mu);
+                let real = m.query_advice(t12_real, Rotation::cur());
+                let ab = lt_ab.is_lt(m, None);
+                let bc = lt_bc.is_lt(m, None);
+                let all = m.query_advice(mu_all, Rotation::cur())
+                    - real * ab * bc * m.query_advice(s_all, Rotation::cur());
+                let cln = m.query_advice(mu_cln, Rotation::cur())
+                    - m.query_advice(cln12, Rotation::cur())
+                        * m.query_advice(s_cln, Rotation::cur());
+                vec![q.clone() * all, q * cln]
+            });
+        }
+
         TrianglePathCloserConfig {
             instance,
             in_by_dst,
@@ -1474,6 +1847,28 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             q_sum,
             out,
             q_out,
+            cln12,
+            cln3,
+            q_cln12_bind,
+            q_cln3_bind,
+            iz_t12_pad,
+            iz_t3_pad,
+            part12,
+            part3,
+            perm_bag1,
+            perm_bag2,
+            q_cln_flag,
+            q_res_flag,
+            pk12,
+            pk3,
+            q_pk12,
+            q_pk3,
+            q_pw_in_12,
+            q_pw_in_3,
+            cp_agg_msg,
+            cp_join_msg,
+            cp_root,
+            q_cp_mu,
         }
     }
 
@@ -1495,6 +1890,10 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
         LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_high.clone()).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone()).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone()).load(layouter)?;
+
+        // Every Lt chip of the Cardinality Preservation Check shares one u8
+        // fixed column, so a single load covers the whole check.
+        LtChip::<F, NUM_BYTES>::construct(cfg.cp_agg_msg.lt_key_cur_next).load(layouter)?;
 
         let in_view_chip = IndexedViewChip::<F>::construct(cfg.in_by_dst.clone());
         let out_view_chip = IndexedViewChip::<F>::construct(cfg.out_by_src.clone());
@@ -1521,16 +1920,138 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 out_view_chip.assign(&mut region, n_base, out_rows)?;
 
                 // -------------------
-                // Assign Bag2 + build agg inputs
+                // Row counts of the two bags. The partition witness below is
+                // computed before either bag is assigned, so both counts and
+                // both padding schemes are settled here, unchanged.
                 // -------------------
                 let real3 = t3.len();
                 let n3 = std::cmp::max(real3 + bag2_pad_extra, 1);
+                let real12 = t12.len();
+                let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
 
+                // ---------------- clean / residual partition of the two bags ----------------
+                // The honest clean part of a relation is its fully reduced
+                // instance: the tuples that extend to a full join result. A Bag1
+                // wedge contributes only when it is real and A<B<C, and a Bag1
+                // wedge and a Bag2 closing edge extend each other exactly when
+                // they agree on the packed separator key, so the reduction of
+                // this two-node cluster tree is the intersection of the two key
+                // sets.
+                //
+                // On a two-node tree that single simultaneous pass is already a
+                // fixed point of semijoin reduction, which is what condition (3)
+                // needs: both clean key sets come out as keys12 /\ keys3. On a
+                // deeper tree it would not be, and the reduction would have to
+                // be iterated.
+                let pred12: Vec<bool> = (0..n12)
+                    .map(|i| i < real12 && t12[i].0 < t12[i].1 && t12[i].1 < t12[i].2)
+                    .collect();
+                let key12: Vec<u64> = (0..n12)
+                    .map(|i| {
+                        if i < real12 {
+                            pack2(t12[i].0, t12[i].2)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+
+                let keys3: HashSet<u64> = t3.iter().map(|&(c, a, _, _)| pack2(a, c)).collect();
+                let keys12: HashSet<u64> =
+                    (0..n12).filter(|&i| pred12[i]).map(|i| key12[i]).collect();
+
+                let mut cln3: Vec<u64> = (0..n3)
+                    .map(|i| (i < real3 && keys12.contains(&pack2(t3[i].1, t3[i].0))) as u64)
+                    .collect();
+                let mut cln12: Vec<u64> = (0..n12)
+                    .map(|i| (pred12[i] && keys3.contains(&key12[i])) as u64)
+                    .collect();
+
+                // test hook only: hide one joinable Bag2 tuple in the residual
+                // side and re-reduce both bags around it, so Conservation still
+                // holds and the clean sides stay pairwise consistent
+                let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+                let mark_all = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+                if tamper {
+                    if let Some(hidden) = (0..n3).find(|&i| cln3[i] == 1) {
+                        cln3[hidden] = 0;
+                        // iterate the reduction until nothing moves, so the two
+                        // clean key sets are still equal and condition (3) has
+                        // nothing to say about this witness
+                        loop {
+                            let mut moved = false;
+                            let live3: HashSet<u64> = (0..n3)
+                                .filter(|&i| cln3[i] == 1)
+                                .map(|i| pack2(t3[i].1, t3[i].0))
+                                .collect();
+                            for i in 0..n12 {
+                                if cln12[i] == 1 && !live3.contains(&key12[i]) {
+                                    cln12[i] = 0;
+                                    moved = true;
+                                }
+                            }
+                            let live12: HashSet<u64> = (0..n12)
+                                .filter(|&i| cln12[i] == 1)
+                                .map(|i| key12[i])
+                                .collect();
+                            for i in 0..n3 {
+                                if cln3[i] == 1 && !live12.contains(&pack2(t3[i].1, t3[i].0)) {
+                                    cln3[i] = 0;
+                                    moved = true;
+                                }
+                            }
+                            if !moved {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // test hook only: skip the reduction and declare every real tuple
+                // clean. The indicator still has to satisfy its binding gate, so
+                // a Bag1 wedge its own predicate drops stays out; everything the
+                // predicate keeps goes to the clean side and the residual side
+                // holds nothing else. Conservation still holds and both channels
+                // of condition (4) then carry the same multiplicity on every row,
+                // so only Pairwise Consistency can reject this.
+                if mark_all {
+                    for i in 0..n3 {
+                        cln3[i] = (i < real3) as u64;
+                    }
+                    for i in 0..n12 {
+                        cln12[i] = pred12[i] as u64;
+                    }
+                }
+
+                // -------------------
+                // Assign Bag2 + build agg inputs
+                // -------------------
                 let mut agg_in: Vec<(u64, u64)> = vec![(PAD_U64, 0); n3];
+
+                // witnesses of the two `real == [attr != 0]` pins
+                let iz_t3_pad_chip = IsZeroChip::construct(cfg.iz_t3_pad.clone());
+                let iz_t12_pad_chip = IsZeroChip::construct(cfg.iz_t12_pad.clone());
 
                 for i in 0..n3 {
                     cfg.q_t3_lookup.enable(&mut region, i)?;
                     cfg.q_t3_msg_in.enable(&mut region, i)?;
+
+                    // clean indicator and the input side of Bag2's Conservation
+                    // Check, both over the same rows as the bag itself
+                    cfg.q_cln3_bind.enable(&mut region, i)?;
+                    cfg.perm_bag2.q_perm1.enable(&mut region, i)?;
+                    cfg.perm_bag2.q_perm2.enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "cln3",
+                        cfg.cln3,
+                        i,
+                        || Value::known(F::from(cln3[i])),
+                    )?;
+                    iz_t3_pad_chip.assign(
+                        &mut region,
+                        i,
+                        Value::known(F::from(if i < real3 { t3[i].0 } else { 0 })),
+                    )?;
 
                     if i < real3 {
                         let (c, a, j_r3, r3_eid) = t3[i];
@@ -1600,9 +2121,6 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 // -------------------
                 // Assign Bag1 + message lookup + ordering + sum
                 // -------------------
-                let real12 = t12.len();
-                let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
-
                 // Debug print, silenced: `assign` runs during keygen as well as
                 // proving, so this fired several times per measured row.
                 // println!("The length of n12 is: {}", t12.len());
@@ -1622,6 +2140,19 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     cfg.msg_lookup.q_complex.enable(&mut region, i)?;
                     cfg.q_order.enable(&mut region, i)?;
                     cfg.q_contrib.enable(&mut region, i)?;
+
+                    // clean indicator, the input side of Bag1's Conservation
+                    // Check and the two root multiplicities of condition (4)
+                    cfg.q_cln12_bind.enable(&mut region, i)?;
+                    cfg.perm_bag1.q_perm1.enable(&mut region, i)?;
+                    cfg.perm_bag1.q_perm2.enable(&mut region, i)?;
+                    cfg.q_cp_mu.enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "cln12",
+                        cfg.cln12,
+                        i,
+                        || Value::known(F::from(cln12[i])),
+                    )?;
 
                     let (a, b, c, i_r1, j_r2, r1_eid, r2_eid, real) = if i < real12 {
                         let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
@@ -1663,6 +2194,7 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                         i,
                         || Value::known(F::from(real)),
                     )?;
+                    iz_t12_pad_chip.assign(&mut region, i, Value::known(F::from(b)))?;
 
                     // LT witnesses (constraints disabled when real=0)
                     lt_ab_chip.assign(
@@ -1764,6 +2296,11 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                         running = contrib_u64;
                     } else {
                         cfg.q_sum.enable(&mut region, i)?;
+                        // Completeness only, not soundness: the "sum" gate is
+                        // over F, so a prefix sum that overflows u64 here would
+                        // simply fail to synthesize rather than be accepted. It
+                        // takes more than 2^64 triangles to reach, so no honest
+                        // witness can hit it.
                         running = running.wrapping_add(contrib_u64);
                     }
                     region.assign_advice(
@@ -1772,6 +2309,166 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                         i,
                         || Value::known(F::from(running)),
                     )?;
+                }
+
+                // ---- Conservation Check: the partition side of both bags ----
+                // [clean rows | residual rows | pad rows]. The pad rows are the
+                // all-zero tuple the bags already pad with, and SHIFT_ID keeps 0
+                // out of the real tuples, so the two multisets agree exactly.
+                let mut part12_rows: Vec<[u64; 8]> = Vec::with_capacity(n12);
+                for i in 0..real12 {
+                    if cln12[i] == 1 {
+                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
+                        part12_rows.push([a, b, c, i_r1, j_r2, r1_eid, r2_eid, 1]);
+                    }
+                }
+                let n_cln12 = part12_rows.len();
+                for i in 0..real12 {
+                    if cln12[i] == 0 {
+                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
+                        part12_rows.push([a, b, c, i_r1, j_r2, r1_eid, r2_eid, 0]);
+                    }
+                }
+                let n_res12 = part12_rows.len() - n_cln12;
+                while part12_rows.len() < n12 {
+                    part12_rows.push([0u64; 8]);
+                }
+
+                let mut part3_rows: Vec<[u64; 5]> = Vec::with_capacity(n3);
+                for i in 0..real3 {
+                    if cln3[i] == 1 {
+                        let (c, a, j_r3, r3_eid) = t3[i];
+                        part3_rows.push([c, a, j_r3, r3_eid, 1]);
+                    }
+                }
+                let n_cln3 = part3_rows.len();
+                for i in 0..real3 {
+                    if cln3[i] == 0 {
+                        let (c, a, j_r3, r3_eid) = t3[i];
+                        part3_rows.push([c, a, j_r3, r3_eid, 0]);
+                    }
+                }
+                let n_res3 = part3_rows.len() - n_cln3;
+                while part3_rows.len() < n3 {
+                    part3_rows.push([0u64; 5]);
+                }
+
+                for i in 0..n12 {
+                    for j in 0..8 {
+                        region.assign_advice(
+                            || "part12",
+                            cfg.part12[j],
+                            i,
+                            || Value::known(F::from(part12_rows[i][j])),
+                        )?;
+                    }
+                }
+                for i in 0..n3 {
+                    for j in 0..5 {
+                        region.assign_advice(
+                            || "part3",
+                            cfg.part3[j],
+                            i,
+                            || Value::known(F::from(part3_rows[i][j])),
+                        )?;
+                    }
+                }
+
+                // KNOWN LIMITATION, not a per-proof soundness hole. The four
+                // block extents below are witness-derived and appear in the
+                // circuit only as selector enable ranges, i.e. as fixed columns
+                // materialized at keygen. Under the standard soundness game the
+                // vk is fixed, so a prover cannot move or shrink them; what they
+                // do cost is (i) a trusted-keygen dependency, since a vk
+                // generated from tampered data certifies nothing, and (ii)
+                // obliviousness, since n_cln12 and n_cln3 are exactly |Bag1^c|
+                // and |Bag2^c| and so leak the clean/residual ratio the paper
+                // claims never to reveal. Both need the extents to become
+                // public inputs or padded to a data-independent bound, which is
+                // an instance-vector change outside this file.
+                for i in 0..n_cln12 {
+                    cfg.q_cln_flag[0].enable(&mut region, i)?;
+                }
+                for i in n_cln12..(n_cln12 + n_res12) {
+                    cfg.q_res_flag[0].enable(&mut region, i)?;
+                }
+                for i in 0..n_cln3 {
+                    cfg.q_cln_flag[1].enable(&mut region, i)?;
+                }
+                for i in n_cln3..(n_cln3 + n_res3) {
+                    cfg.q_res_flag[1].enable(&mut region, i)?;
+                }
+
+                // ===================== PAIRWISE CONSISTENCY =====================
+                // condition (3): pi_K(Bag1^c) == pi_K(Bag2^c) on the packed (A,C)
+                // separator, as two mutual Membership Checks over the clean block
+                // of the two partition groups.
+                //
+                // The packed key of a group is derived from that group's own A
+                // and C columns by the gates "pw: bag1/bag2 partition packed
+                // key", enabled on every row of the group, so it is pinned on the
+                // clean rows and defined everywhere else.
+                for i in 0..n12 {
+                    cfg.q_pk12.enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "pk12",
+                        cfg.pk12,
+                        i,
+                        || Value::known(F::from(pack2(part12_rows[i][0], part12_rows[i][2]))),
+                    )?;
+                }
+                for i in 0..n3 {
+                    cfg.q_pk3.enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "pk3",
+                        cfg.pk3,
+                        i,
+                        || Value::known(F::from(pack2(part3_rows[i][1], part3_rows[i][0]))),
+                    )?;
+                }
+
+                // Rows [0, n_cln) of each group are exactly pi_K(R^c), because
+                // the flag gate pins flag == 1 there and the group's tuple
+                // columns are tied to the bag by its Conservation Check. One
+                // selector per group serves as the input selector of its own
+                // direction and as the table selector of the other, so the two
+                // containments run directly between the two clean key columns.
+                for i in 0..n_cln12 {
+                    cfg.q_pw_in_12.enable(&mut region, i)?;
+                }
+                for i in 0..n_cln3 {
+                    cfg.q_pw_in_3.enable(&mut region, i)?;
+                }
+
+                // ===================== CARDINALITY PRESERVATION CHECK =====================
+                // condition (4) of the One-Pass OBJ: the two multiplicity
+                // channels are propagated over the cluster tree and their root
+                // sums compared.
+                //
+                // Bag2 is a leaf, so a Bag2 row's input-channel multiplicity is
+                // its real bit and its clean-channel multiplicity is the bound
+                // indicator. Both columns are already assigned above, and the
+                // key column is the same agg_msg.in_key the message table sorts.
+                let cp_rows: Vec<[u64; 3]> = (0..n3)
+                    .map(|i| [agg_in[i].0, agg_in[i].1, cln3[i]])
+                    .collect();
+                let cp_stage = build_cp_stage(&cp_rows, PAD_U64);
+                assign_cp_agg(&mut region, &cfg.cp_agg_msg, &cp_rows, &cp_stage)?;
+
+                // parent side, on the rows of Bag1
+                let fetched =
+                    assign_cp_join(&mut region, &cfg.cp_join_msg, &key12, &cp_stage, PAD_U64)?;
+
+                // root multiplicities and the equality between the two sums
+                let cp_mu: Vec<(u64, u64)> = (0..n12)
+                    .map(|i| ((pred12[i] as u64) * fetched[i].0, cln12[i] * fetched[i].1))
+                    .collect();
+                let (cp_all, cp_cln) = assign_cp_root(&mut region, &cfg.cp_root, &cp_mu)?;
+                if !tamper && !mark_all {
+                    debug_assert_eq!(
+                        cp_all, cp_cln,
+                        "cardinality preservation: |R^c join| != |R join|"
+                    );
                 }
 
                 let out_row = n12 - 1;
@@ -1843,7 +2540,8 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::dev::{MockProver, VerifyFailure};
+    use std::sync::atomic::Ordering;
 
     use halo2_proofs::{
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit},
@@ -1979,6 +2677,7 @@ mod tests {
     // }
 
     #[test]
+    #[ignore = "inherited heavy end-to-end proof; the fast check is test_cardinality_preservation"]
     fn test() {
         let dataset = std::env::var("VPJOIN_DATASET").unwrap_or_else(|_| "lastfm".into());
         let privacy = match std::env::var("VPJOIN_PRIVACY")
@@ -2021,8 +2720,14 @@ mod tests {
         let public_input = vec![Fp::from(cnt)];
         let k = crate::bench_queries::degree_for("gq3", &dataset, privacy);
 
-        // let test = true;
-        let test = false;
+        // With VPJOIN_MOCK=1 this checks every gate, lookup and shuffle at full
+        // scale under MockProver, which does no cryptography at all, instead of
+        // generating a real proof. That is the cheap way to confirm the circuit
+        // still fits its degree on the whole dataset. Unset, it measures a real
+        // keygen / prove / verify, which is the number the paper reports.
+        let test = std::env::var("VPJOIN_MOCK")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
         if test {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
@@ -2031,5 +2736,146 @@ mod tests {
             let proof_path = &crate::paths::proof_file("last_proof_q3_dp");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
+    }
+
+    /// Cost probe. The soundness patches of this file are all degree-1 or
+    /// degree-2 gates and one table selector, so none of them may raise
+    /// `cs.degree()`: a rise would double every FFT of the proof.
+    #[test]
+    fn test_max_gate_degree() {
+        use halo2_proofs::plonk::ConstraintSystem;
+
+        let mut cs = ConstraintSystem::<Fp>::default();
+        let _ = <MyCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
+        println!(
+            "advice={} fixed={} sel={} deg={} gates={} polys={} lookups={} shuffles={}",
+            cs.num_advice_columns(),
+            cs.num_fixed_columns(),
+            cs.num_selectors(),
+            cs.degree(),
+            cs.gates().len(),
+            cs.gates()
+                .iter()
+                .map(|g| g.polynomials().len())
+                .sum::<usize>(),
+            cs.lookups().len(),
+            cs.shuffles().len(),
+        );
+        assert!(
+            cs.degree() <= 7,
+            "the maximum gate degree rose to {}, so a soundness patch is costing \
+             more than it should",
+            cs.degree()
+        );
+    }
+
+    /// Fast correctness check of the Cardinality Preservation Check: a truncated
+    /// slice of a real graph under MockProver, which verifies every gate,
+    /// shuffle and lookup of the circuit without paying for a real proof.
+    ///
+    /// The slice is taken from `wiki`, the one shipped dataset that is a
+    /// directed graph: `lastfm` and `facebook` store every edge in one
+    /// direction only, so they contain no closing edge C->A at all and the whole
+    /// clean instance would be empty, which would make both directions of this
+    /// test vacuous.
+    #[test]
+    fn test_cardinality_preservation() {
+        const N_EDGES: usize = 3000;
+        let k = 14;
+
+        let mut edges = crate::bench_queries::load_graph("wiki");
+        assert!(
+            edges.len() >= N_EDGES,
+            "graph dataset not found or too small: {} edges",
+            edges.len()
+        );
+        edges.truncate(N_EDGES);
+
+        let cnt = expected_cnt(&edges);
+        assert!(
+            cnt > 0,
+            "the slice has no triangle, so the clean instance is empty and the test is vacuous"
+        );
+
+        // Non-vacuity of the third direction below: the slice must contain a
+        // dangling tuple, i.e. the two unreduced key sets on the separator must
+        // differ, otherwise the all-clean partition really is pairwise
+        // consistent and condition (3) would be right to accept it.
+        let derived = gq3_derive(&edges);
+        let keys3: HashSet<u64> = derived.t3.iter().map(|&(c, a, _, _)| pack2(a, c)).collect();
+        let keys12: HashSet<u64> = derived
+            .t12
+            .iter()
+            .filter(|&&(a, b, c, _, _, _, _)| a < b && b < c)
+            .map(|&(a, _, c, _, _, _, _)| pack2(a, c))
+            .collect();
+        let dangling12 = keys12.difference(&keys3).count();
+        let dangling3 = keys3.difference(&keys12).count();
+        println!(
+            "[gq3 pw] separator keys: bag1={} bag2={} bag1-only={} bag2-only={}",
+            keys12.len(),
+            keys3.len(),
+            dangling12,
+            dangling3
+        );
+        assert!(
+            dangling12 + dangling3 > 0,
+            "the slice has no dangling tuple, so the all-clean partition is pairwise \
+             consistent and the third direction would pass vacuously"
+        );
+
+        // a few oblivious pad rows on both bags, so the padding path of the new
+        // columns is exercised too
+        let circuit = MyCircuit::<Fp> {
+            edges,
+            bag1_pad_extra: 5,
+            bag2_pad_extra: 3,
+            _marker: PhantomData,
+        };
+        let public_input = vec![Fp::from(cnt)];
+
+        let prover = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
+        prover.assert_satisfied();
+
+        // Negative direction: the same witness with one joinable Bag2 tuple
+        // hidden in the residual side and both bags re-reduced around it, so
+        // Conservation still holds and the two clean sides still agree on the
+        // separator key. Only condition (4) can see this, so the circuit must
+        // now reject.
+        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
+        let verdict = tampered.verify();
+        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
+        assert!(
+            failures
+                .iter()
+                .any(|f| format!("{:?}", f).contains("cardinality preservation")),
+            "the circuit rejected, but not through the Cardinality Preservation Check: {:?}",
+            failures
+        );
+
+        // Third direction: the escape condition (3) closes. With every real tuple
+        // declared clean the partition still conserves both bags, and both
+        // channels of the Cardinality Preservation Check then compute the same
+        // number on every Bag1 row, so sum_cln == sum_all holds for free. Nothing
+        // but Pairwise Consistency notices that the clean side is not the reduced
+        // instance, so the circuit must reject through a "pw: " lookup.
+        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        let all_clean = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+        let verdict = all_clean.verify();
+        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("the all-clean partition was accepted");
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
+            )),
+            "the circuit rejected the all-clean partition, but not through a Pairwise \
+             Consistency lookup: {:?}",
+            failures
+        );
     }
 }
