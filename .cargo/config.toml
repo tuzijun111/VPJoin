@@ -4,3 +4,9 @@
 # Additional cost of the data commitment + the in-circuit witness-equality
 # check, with the check inlined into the query circuit (Appendix A).
 commit-diff = "run --release --bin commit_diff --"
+
+# The main proving-time harness. Release is not optional here: the debug profile
+# builds halo2 itself at opt-level 0 and proves several times slower, so a debug
+# number is not comparable with a release one. The `profile` column of the CSV
+# records which was used.
+vpjoin = "run --release --bin vpjoin_bench --"

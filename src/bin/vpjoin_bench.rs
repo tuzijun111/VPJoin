@@ -3,7 +3,7 @@
 //! Runs the 5 TPC-H queries and the 4 graph queries on each of the 3 SNAP
 //! datasets (17 rows), in one of two modes, and writes one CSV.
 //!
-//!   baseline -- the pure query circuit, i.e. exactly what
+//!   simplification -- the pure query circuit, i.e. exactly what
 //!               `cargo test ... sql::qN_obj::tests::test_1` proves.
 //!   full     -- the same circuits plus the complete commitment layer:
 //!               a published per-column Pedersen commitment to the dataset,
@@ -11,7 +11,7 @@
 //!               the committed data, and the column openings.
 //!   commit   -- ONLY the commitment layer, in the corresponding query
 //!               circuit's own domain (same k). The query proof is not re-run,
-//!               so these numbers add to the matching `baseline` row. Much
+//!               so these numbers add to the matching `simplification` row. Much
 //!               cheaper than `full`, which re-proves the query.
 //!
 //! The difference between the two CSVs is the cost of making the proof bind to
@@ -22,8 +22,8 @@
 //! time is spent on a `k` that is then discarded.
 //!
 //! Usage:
-//!   cargo run --release --bin vpjoin_bench -- <baseline|full|commit> [query ...]
-//!   cargo run --release --bin vpjoin_bench -- <baseline|full|commit> [out.csv] [query ...]
+//!   cargo vpjoin <simplification|full|commit> [query ...]
+//!   cargo vpjoin <simplification|full|commit> [out.csv] [query ...]
 //!
 //!   Every result is printed to stdout, and the run ends with an aligned
 //!   summary table of all completed rows, so the terminal output alone is a
@@ -86,7 +86,7 @@ fn load_completed(path: &str) -> HashMap<String, String> {
 
 fn usage() -> String {
     format!(
-        "usage: vpjoin_bench <baseline|full|commit> [out.csv] [query ...]\n  \
+        "usage: vpjoin_bench <simplification|full|commit> [out.csv] [query ...]\n  \
          queries: {}\n  \
          results are always printed to stdout; an argument ending in .csv also\n  \
          writes them to that file (and enables VPJOIN_RESUME=1).",
@@ -116,7 +116,7 @@ fn print_summary(jobs: &[(String, String)], results: &HashMap<String, String>, m
     const TAIL: &[&str] = &["wall_s", "config", "status"];
 
     let mut wanted: Vec<&str> = HEAD.to_vec();
-    if mode != Mode::Baseline {
+    if mode != Mode::Simplification {
         wanted.extend_from_slice(COMMIT);
     }
     wanted.extend_from_slice(TAIL);
@@ -183,11 +183,16 @@ fn main() {
     }
 
     let mode = match args[0].as_str() {
-        "baseline" => Mode::Baseline,
+        // `baseline` is kept as a silent alias so the commands in older notes,
+        // scripts and result filenames keep working.
+        "simplification" | "baseline" => Mode::Simplification,
         "full" => Mode::Full,
         "commit" => Mode::Commit,
         other => {
-            eprintln!("unknown mode `{}` (expected `baseline`, `full` or `commit`)", other);
+                eprintln!(
+                "unknown mode `{}` (expected `simplification`, `full` or `commit`)",
+                other
+            );
             std::process::exit(2);
         }
     };

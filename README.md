@@ -124,7 +124,7 @@ cargo build --release
 and with the database-commitment layer:
 
 ```bash
-cargo run --bin vpjoin_bench -- baseline
+cargo vpjoin simplification
 ```
 
 **2. Additional in-circuit cost of binding a proof to a committed database.** Each row is
@@ -157,30 +157,30 @@ only `lineitem` and holds the dimension tables at the base size, so the pair iso
 the dimension tables cost:
 
 ```bash
-cargo build --bin vpjoin_bench
+cargo build --release --bin vpjoin_bench
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/all_scaled/60K/data       VPJOIN_LABEL=all-60K       VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/all_scaled/60K/data       VPJOIN_LABEL=all-60K       VPJOIN_PRIVACY=rjs ./target/release/vpjoin_bench simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/all_scaled/120K/data      VPJOIN_LABEL=all-120K      VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/all_scaled/120K/data      VPJOIN_LABEL=all-120K      VPJOIN_PRIVACY=rjs ./target/release/vpjoin_bench simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/all_scaled/240K/data      VPJOIN_LABEL=all-240K      VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/all_scaled/240K/data      VPJOIN_LABEL=all-240K      VPJOIN_PRIVACY=rjs ./target/release/vpjoin_bench simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/60K/data  VPJOIN_LABEL=lineitem-60K  VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/60K/data  VPJOIN_LABEL=lineitem-60K  VPJOIN_PRIVACY=rjs ./target/release/vpjoin_bench simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-120K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-120K VPJOIN_PRIVACY=rjs ./target/release/vpjoin_bench simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/release/vpjoin_bench simplification q3 q5 q8 q9 q18
 ```
 
