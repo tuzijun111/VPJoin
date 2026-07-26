@@ -145,11 +145,6 @@ comma-separated list, so a single invocation sweeps the whole privacy budget cur
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
 
-A released capacity that needs more lanes than the circuit can host is reported as `SKIPPED`
-with the reason and the sweep continues. The released capacities depend on `VPJOIN_DP_SEED`,
-the query and the dataset only, so a row of a sweep is identical to the same row run alone.
-`VPJOIN_PLAN_ONLY=1` prints the geometry and exits before any keygen.
-
 
 **4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
 `all_scaled` grows every table by the same 2x and 4x factors, while `lineitem_scaled` grows
