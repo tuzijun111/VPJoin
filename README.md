@@ -120,18 +120,14 @@ cargo build --release
 ## Running the Benchmarks
 
 
-**1-2. VPJoin proving time**, 5 TPC-H queries plus 4 graph queries on 3 datasets, without
+**1. VPJoin proving time**, 5 TPC-H queries plus 4 graph queries on 3 datasets, without
 and with the database-commitment layer:
 
 ```bash
 cargo run --bin vpjoin_bench -- baseline
 ```
 
-```bash
-cargo run --bin vpjoin_bench -- full
-```
-
-**3-4. Additional in-circuit cost of binding a proof to a committed database.** Each row is
+**2. Additional in-circuit cost of binding a proof to a committed database.** Each row is
 proved twice at the same degree and the reported cost is the median paired difference:
 
 ```bash
@@ -142,7 +138,7 @@ cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
 VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
-**5. DP-guided padding** for the three cyclic queries. `VPJOIN_EPS` takes one budget or a
+**3. DP-guided padding** for the three cyclic queries. `VPJOIN_EPS` takes one budget or a
 comma-separated list, so a single invocation sweeps the whole privacy budget curve:
 
 ```bash
@@ -154,15 +150,8 @@ with the reason and the sweep continues. The released capacities depend on `VPJO
 the query and the dataset only, so a row of a sweep is identical to the same row run alone.
 `VPJOIN_PLAN_ONLY=1` prints the geometry and exits before any keygen.
 
-**6. PoneglyphDB-style graph baselines.** Runs the binary-join-chain baseline at true
-intermediate sizes (the measured anchor) and reports its proving time; the worst-case
-extrapolation is derived from it:
 
-```bash
-PONE_K0=17 cargo run --bin pone_graph_bench
-```
-
-**7. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
+**4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
 `all_scaled` grows every table by the same 2x and 4x factors, while `lineitem_scaled` grows
 only `lineitem` and holds the dimension tables at the base size, so the pair isolates what
 the dimension tables cost:
@@ -195,49 +184,3 @@ VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-
 VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs ./target/debug/vpjoin_bench baseline q3 q5 q8 q9 q18
 ```
 
-**8. The key-edge specialization.** Every query circuit in `sql/` and `graph_sql/` certifies the
-One-Pass OBJ: (7) Conservation, (9) Pairwise Consistency and (10) Cardinality Preservation, the
-last by the two-channel multiplicity count of `circuits/card_preserve.rs`. The five TPC-H queries
-additionally ship as `*_obj_key.rs`, which specializes (10) on *key edges*: an edge whose child
-holds at most one tuple per join key, where every multiplicity is a bit, so the per-key aggregation
-collapses and, when every edge of the tree is such an edge, the clean channel disappears entirely.
-The precondition is certified rather than assumed, by constraining the child's key column to be
-strictly increasing, and absence certification is kept, so a parent whose key occurs in no child
-tuple still exhibits its gap witness.
-
-`VPJOIN_OBJ=key` selects that variant and the reported `config` column gains a `+cpk` suffix.
-GQ1, GQ2 and GQ4 have no key edge, so they always run the general circuit:
-
-```bash
-VPJOIN_OBJ=key cargo run --bin vpjoin_bench -- baseline
-```
-
-Each circuit carries a fast correctness test that checks it under `MockProver` on a truncated
-slice, then re-runs it twice with a tampered witness: once with a joinable tuple hidden in the
-residual side and the neighbours re-reduced around it, so only condition (10) can catch it, and
-once with no reduction at all, so only condition (9) can:
-
-```bash
-RUST_MIN_STACK=33554432 cargo test --lib test_cardinality_preservation
-```
-
-`VPJOIN_MOCK=1` runs a circuit's heavy test under `MockProver` at full dataset scale instead of
-generating a real proof, which checks every gate, lookup and shuffle in seconds:
-
-```bash
-RUST_MIN_STACK=33554432 VPJOIN_MOCK=1 cargo test --release --lib sql::q3_obj::tests::test_1 -- --exact --ignored
-```
-
-What the two realizations cost in the arithmetization, per query and independently of the data:
-
-```bash
-cargo run --release --bin obj_gate_cost
-```
-
-Those deltas are not all the same quantity, and the tool says so at the end of its output. Q3
-and Q5 already carried a clean/residual partition and a residual-side condition (4), so their
-delta is close to the swap described above. The other seven never partitioned at all: their
-`*_obj.rs` verifies the join with one-directional lookups from a root relation, so their delta
-pays for the whole gate that was missing, conditions (1), (3) and (4) together. GQ1 is the row
-that isolates the incremental cost of the clean channel, because that circuit already ran the
-single-channel propagation over the inputs.
