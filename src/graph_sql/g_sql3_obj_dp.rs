@@ -1,118 +1,3 @@
-//! GQ3 (triangle) under the One-Pass OBJ, with the DP release hosted in lanes.
-//!
-//! This is the multi-lane DP-padding variant of `g_sql3_obj.rs`: same query,
-//! same Path+Closer decomposition, same host-side derivation, same released
-//! capacity and padding scheme, but the padded Bag1 pipeline is spread over up
-//! to [`MAX_LANES`] structural replicas of the Bag1 column group so a release
-//! larger than the domain still fits at the pinned degree.
-//!
-//! It now carries the same One-Pass OBJ conditions its single-group sibling
-//! does, over a prover-supplied partition of each bag into a clean part `R^c`
-//! and a residual part `R^r`:
-//!
-//!   (7)  `R_i == R_i^c U R_i^r`                    Conservation
-//!   (9)  `pi_K(Bag1^c) == pi_K(Bag2^c)`            Pairwise Consistency
-//!   (10) `|R^c join| == |R join|`                  Cardinality Preservation
-//!
-//! Condition (8), Non-Membership, is deliberately not enforced, exactly as in
-//! the sibling.
-//!
-//! # How each condition holds over the UNION of the lanes
-//!
-//! A condition that is checked per lane in a way that lets a prover move a
-//! violation into another lane is not checked at all, so each of the three is
-//! spelled out here.
-//!
-//! * (7) is per lane and that is *stronger* than the union statement, not
-//!   weaker. Lane `l` owns the padded Bag1 rows
-//!   `[l*lane_rows, l*lane_rows + lane_live_rows(l))` and its own 8-column
-//!   partition group, and one shuffle per lane forces lane `l`'s multiset of
-//!   `(attributes, clean indicator)` to equal its own group's
-//!   `[clean | residual | pad]` multiset. The lane row blocks are disjoint and
-//!   TILE the assigned pipeline exactly -- every lane but the last is a full
-//!   `lane_rows` and the last stops at the layout capacity, which is the
-//!   released capacity or the full lane span depending on
-//!   [`MyCircuit::released_capacity`] -- so summing the `c`
-//!   lane statements gives `Bag1 == Bag1^c U Bag1^r`. Nothing can be moved
-//!   between lanes, because a lane's shuffle only ever sees its own columns.
-//!   Bag2 is not laned (its height is |E| + pads, public in every regime), so
-//!   its Conservation Check is the sibling's, verbatim.
-//!
-//! * (9) has one direction per orientation, and only one of them is a union
-//!   statement over the lanes.
-//!   - `pi_K(Bag1^c) subset pi_K(Bag2^c)` is `c` lookups, one per lane, all
-//!     into the SAME table (the clean key column of the Bag2 rows). A union of
-//!     inputs is contained in a table iff every input is, so per-lane here IS
-//!     the union statement.
-//!   - `pi_K(Bag2^c) subset pi_K(Bag1^c)` is the dangerous direction: the
-//!     table is the union of `c` per-lane clean key columns and a lookup cannot
-//!     express "in lane 1 OR in lane 2". Doing it per lane would demand that
-//!     EVERY lane contain EVERY clean Bag2 key, which no honest witness
-//!     satisfies. It is realized instead by a prover-supplied host bit per
-//!     (lane, Bag2 row): one gate forces the host bits of a CLEAN Bag2 row to
-//!     sum to exactly 1 over the lanes, and lane `l`'s lookup checks the rows
-//!     it hosts against its own clean key column. So the prover has to name a
-//!     lane for every clean Bag2 tuple and that lane then has to really contain
-//!     the key, which is exactly membership in the union. A prover that cannot
-//!     name one fails the coverage gate.
-//!
-//! * (10) is accumulated ACROSS the lanes and compared exactly once. Bag2 is
-//!   the only child of the cluster tree and it is a leaf, so its child stage is
-//!   the sibling's `configure_cp_agg` over the (unlaned) Bag2 rows, keyed by the
-//!   packed separator, carrying both channels. Two things then make the root
-//!   side cheap and lane-safe:
-//!     - the input channel needs no second traversal at all. On this tree
-//!       `sigma_all(key)` is the number of real Bag2 edges with that key, which
-//!       is exactly the `msg_val` the answer is already read off, so
-//!       `mu_all = t12_real * [A<B] * [B<C] * msg_val` IS the existing `contrib`
-//!       column and the input-side root sum IS `tot_run`, the cross-lane total
-//!       the COUNT(*) is taken from.
-//!     - the clean channel is one column `mu_cln` per lane row, pinned by a
-//!       single lookup `(cln12 * key, mu_cln)` into the child table's
-//!       `(key, sum_cln)` pair. With `cln12 = 0` the key factor is 0 and the
-//!       only table row with key 0 is the pinned dummy `(0, 0, 0)`, so the
-//!       lookup alone forces `mu_cln = cln12 * sigma_cln(key)` with no slack in
-//!       either direction and no separate gap witness.
-//!   Each lane prefix-sums `mu_cln` locally, the `c` lane totals are copied into
-//!   the cross-lane totals stage and accumulated there, and ONE gate at the last
-//!   totals row compares the two grand totals. There is no per-lane equality, so
-//!   a hidden tuple's contribution cannot be parked in a lane that balances on
-//!   its own.
-//!
-//! Everything else, including the message table, the ordering checks, the
-//! COUNT(*) prefix sum and the whole lane geometry, is unchanged.
-//!
-//! # What the verifying key discloses
-//!
-//! Selectors are fixed columns, so every row range a lane is gated on is
-//! committed at keygen and is visible to the verifier. The field that decides
-//! those ranges is [`MyCircuit::released_capacity`], and it is a STRUCTURAL
-//! input the caller supplies. It is never reconstructed from the witness: a
-//! capacity computed as `t12.len() + bag1_pad_extra` would put the true bag
-//! size in the verifying key wherever the pad is a public constant.
-//!
-//!   * `Some(cap)`: the last lane stops at `cap`, so the vk pins `cap` (and
-//!     with it the lane count). SOUND ONLY WHERE `cap` IS A GENUINE RELEASE,
-//!     i.e. a number the verifier is told anyway. Under `Privacy::Dp` it is
-//!     the DP release, whose whole point is to be published; under
-//!     `Privacy::Rjs` it is the true bag size, which that regime reveals by
-//!     definition.
-//!   * `None`: every lane is filled to `lane_rows` and the vk pins only the
-//!     lane count `c = ceil(cap / lane_rows)`. This is what `Privacy::Legacy`
-//!     must use: its pad is a public CONSTANT, so `cap = true_size + constant`
-//!     and a `cap` in the vk would pin the true bag size, which is the one
-//!     statistic the padding exists to hide.
-//!
-//! `None` is the default, so a caller that says nothing gets the layout this
-//! file had before the short last lane existed. The policy that maps a privacy
-//! regime onto the two lives in [`crate::dp_lane::vk_released_capacity`].
-//!
-//! What the vk discloses about the UNLANED stages is unchanged and is not a
-//! function of this field: the two indexed views, the Bag2 pipeline and the
-//! message table size their row ranges from |E| and from the number of
-//! distinct separator keys, both public in every regime, which is exactly why
-//! Bag2 is not laned in the first place.
-
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 
@@ -134,20 +19,6 @@ use super::g_sql3_obj::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 
-/// Rows the u8 range-table `load` regions may claim ahead of the witness
-/// region. Six distinct u8 columns are loaded: the four shared ones (the sort
-/// chip of each indexed view, and AggSumByKey's two sort chips), the single
-/// column every lane's four Lt chips share, and the one column every Lt chip of
-/// the Cardinality Preservation child stage shares. Each `load` writes 256 fixed
-/// rows.
-///
-/// The reserve stays at five columns' worth on purpose. It is a conservative
-/// margin, not a count: `SimpleFloorPlanner` starts a region at the first row
-/// free in the columns that region touches, and each `load` touches only its own
-/// fixed column, so all of them begin at row 0 and none of them displaces the
-/// witness region. The constant is also part of the released capacity scheme
-/// (`lane_rows_for` and every lane count derived from it), which must not move
-/// when a soundness condition is added.
 pub const PREAMBLE_ROWS: usize = 5 * 256;
 
 /// Blinding rows halo2 keeps at the bottom of every advice column.
@@ -357,19 +228,6 @@ pub struct LaneConfig<F: Field + Ord> {
     cln_run: Column<Advice>,
 }
 
-/// The row selectors one lane's machinery reads. Bundled because there are
-/// thirteen of them and because there are now TWO sets: a selector is one fixed
-/// column, so it is on or off for every lane at once, and the last lane is
-/// live on fewer rows than the rest.
-///
-/// The `full` set serves lanes `0..c-1`, enabled on all `lane_rows` rows. The
-/// `last` set serves lane `c-1`, enabled on its [`lane_live_rows`] rows only,
-/// and folds the thirteen down to four columns, one per distinct ROW RANGE,
-/// which is all a selector is: `0..live` for every gate, `0..live` for every
-/// lookup and the shuffle (complex, since only a complex selector may be read
-/// by one), `1..live` for the two prefix sums and `0..live-1` for the gate that
-/// reads `Rotation::next()`. The full lanes keep their thirteen so their layout
-/// is unchanged.
 #[derive(Clone, Copy, Debug)]
 struct LaneSelectors {
     q_t12_lookup: Selector,
@@ -466,17 +324,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         Self { cfg }
     }
 
-    /// One multiset equality between two column groups on the same rows, with
-    /// NO `enable_equality` on either group.
-    ///
-    /// `PermAnyChip::configure` builds the same shuffle, but it also enables
-    /// equality on every column it is handed, and halo2 charges the permutation
-    /// argument for every column that has equality enabled whether or not a copy
-    /// constraint ever touches it. A lane's Conservation Check reads 16 per-lane
-    /// columns that no copy constraint reaches, so routing it through
-    /// `PermAnyChip` would grow the permutation argument by 16 columns per lane
-    /// for nothing. Bag2's Conservation Check is not laned and does use
-    /// `PermAnyChip`, exactly as the sibling does.
     fn lane_shuffle(
         meta: &mut ConstraintSystem<F>,
         name: &'static str,
@@ -540,30 +387,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         let t12_r1_eid = meta.advice_column();
         let t12_r2_eid = meta.advice_column();
         let t12_real = meta.advice_column();
-        // NOTE: no `enable_equality` on the lane columns. halo2 charges for
-        // every column in the permutation argument whether or not a copy
-        // constraint ever touches it, so a per-lane column that is only read by
-        // gates and lookups must stay out of it: otherwise the permutation cost
-        // grows with the lane count for nothing. `run_sum` below is the single
-        // lane column that is genuinely copied (into the totals stage).
 
-        // r1 via InByDst: key=B, idx=i_r1 -> val=A, eid=r1_eid.
-        // The input side is per lane, the table side is the shared view: a
-        // lookup argument is a multiset relation over the whole domain, so
-        // adding lane rows against the same table needs no stitching.
-        //
-        // Every table side is multiplied by the view's own `q_tbl`, which the
-        // shared `IndexedViewChip::assign` enables on exactly the rows
-        // [0, n_base) its permutation, sort and idx recurrences cover. Left
-        // ungated (as this file did), the view's one-past-the-end sentinel row
-        // and EVERY row above it -- and in a laned circuit there are `lane_rows`
-        // of them, far more than the view is tall -- are live table entries that
-        // no constraint of the view touches. That is an unlimited supply of
-        // forged view tuples: a prover writes any (key, idx, val, eid) it likes
-        // on a free row and a lane row then "proves" a join it never had. A
-        // lookup input is 0 wherever its own selector is off and a table row with
-        // `q_tbl` off contributes 0 on every column, so the all-zero tuple stays
-        // in the table and the gated-off input rows still cost nothing.
         meta.lookup_any("bag1 r1 from in_by_dst", |m| {
             let q = m.query_selector(q_t12_lookup);
             let t = m.query_selector(in_by_dst.q_tbl);
@@ -737,15 +561,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             ]
         });
 
-        // ---- condition (7), this lane's Conservation Check ----
-        // Lane l's Bag1 rows, carrying the bound indicator, are a permutation of
-        // lane l's own [clean | residual | pad] group. The flag is 1 over the
-        // clean rows and 0 after them, so the multiset equality forces the
-        // indicator on a bag row to mark exactly the tuples that went to R^c.
-        // Per lane is STRONGER than the union statement: the lane row blocks are
-        // disjoint and cover the whole released capacity, so summing the c lane
-        // equalities gives Bag1 == Bag1^c U Bag1^r, and nothing can be shifted
-        // between lanes because a lane's shuffle only sees its own columns.
         let part12: [Column<Advice>; 8] = [(); 8].map(|_| meta.advice_column());
         Self::lane_shuffle(
             meta,
@@ -758,14 +573,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             part12.to_vec(),
         );
 
-        // The partition side's flag is boolean and non-increasing, so the group
-        // really is [R^c block | R^r and pad block] with no free tail. The block
-        // extents are not selector ranges here, which is why nothing about the
-        // clean/residual ratio is baked into the vk of this circuit.
-        // The two live under separate selectors, so they must be separate gates:
-        // a gate is checked for cell assignment wherever ANY of its selectors is
-        // on, and the monotonicity polynomial reads `Rotation::next()`, which does
-        // not exist at the last row of the lane.
         {
             let flag = part12[7];
             meta.create_gate("bag1 partition flag is boolean (lane)", move |m| {
@@ -799,15 +606,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             )]
         });
 
-        // Direction 2, the union direction: pi_K(Bag2^c) subset pi_K(Bag1^c),
-        // whose table is the union of the c per-lane clean key columns. A lookup
-        // cannot say "in lane 1 OR in lane 2", and asking every lane to contain
-        // every clean Bag2 key would reject every honest witness. So the prover
-        // names the hosting lane with `host3`, and the gate "pw: every clean bag2
-        // tuple is hosted by exactly one lane" in `configure` forces those bits
-        // to sum to 1 on each clean Bag2 row. This lookup then checks the rows
-        // this lane claims against this lane's own clean keys. A host bit on a
-        // non-clean Bag2 row is harmless, since `ck3` is already 0 there.
         meta.lookup_any("pw: bag2^c key in bag1^c (lane host)", |m| {
             let gate = m.query_selector(q_t3_tbl) * m.query_advice(host3, Rotation::cur());
             vec![(
@@ -816,17 +614,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             )]
         });
 
-        // ---- condition (10), the clean channel of the Cardinality
-        // Preservation Check ----
-        // `mu_cln` must be `cln12 * sigma_cln(pack2(A,C))`, and this single
-        // lookup is the whole of it. With cln12 = 1 the pair (key, mu_cln) has to
-        // be a row of the child table, whose keys are unique, so mu_cln is that
-        // key's clean sum exactly. With cln12 = 0 the key factor is 0 and the
-        // only table row with key 0 is the dummy (0,0,0) the child stage pins, so
-        // mu_cln is forced to 0. There is no slack in either direction, which is
-        // why no separate gap witness is needed on this channel: the absence
-        // certification the input channel needs lives in the message probe above,
-        // which is the same fetch with the same gap proof.
         meta.lookup_any("cp: clean sigma from the child table (lane)", |m| {
             let q = m.query_selector(q_t12_lookup);
             let t = m.query_selector(cp_agg.q_map_tbl);
@@ -842,10 +629,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             ]
         });
 
-        // lane-local prefix sum of the clean channel, on the same two selectors
-        // as the answer's prefix sum. Its last cell is copied into the cross-lane
-        // totals stage, where the two grand totals meet in ONE equality: a
-        // per-lane equality is exactly the split a prover would exploit.
         let cln_run = meta.advice_column();
         meta.enable_equality(cln_run);
         meta.create_gate("cp: clean sum first row of the lane", |m| {
@@ -983,12 +766,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             aux_t3_pad,
         );
 
-        // `t3_real` is a multiplicity of the input channel, so it must be boolean
-        // AND pinned to the row's own attributes: with t3_real = 1 on a pad row
-        // the gate above publishes in_key = pack2(0,0) = 0, the reserved dummy
-        // key, and with t3_real = 0 on a real row that row's key leaves the
-        // message map and the child table at once. Node ids are SHIFT_ID-shifted,
-        // so `real == [C != 0]` closes both.
         meta.create_gate("bag2 clean indicator", |m| {
             let q = m.query_selector(q_cln3_bind);
             let cln = m.query_advice(cln3, Rotation::cur());
@@ -1088,18 +865,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             q_perm12_out,
         };
 
-        // The last lane MAY stop short of `lane_rows`, so it cannot share the
-        // ones above: a selector is a fixed column and turns its gate on for
-        // every lane at once. Four more columns cover its four distinct row
-        // ranges, whatever c is, and `q_sum0` stays shared because row 0 is live
-        // in every lane. These four are laid out unconditionally, so the
-        // constraint system does not move with `released_capacity`; under
-        // `None` they simply cover all `lane_rows` rows and the layout is the
-        // full one.
-        //
-        // `q_last_complex` is complex because it gates lookups and a shuffle;
-        // `q_last_row` is simple and drives gates only, exactly like the nine
-        // simple selectors it stands in for.
         let q_last_row = meta.selector();
         let q_last_complex = meta.complex_selector();
         let q_last_sum = meta.selector();
@@ -1143,12 +908,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             })
             .collect();
 
-        // condition (9), the union direction: every clean Bag2 tuple names
-        // exactly one hosting lane. Together with each lane's
-        // "pw: bag2^c key in bag1^c (lane host)" lookup this is membership of
-        // pi_K(Bag2^c) in the UNION of the lanes' clean key columns; a prover
-        // that cannot name a lane fails right here. The polynomial grows with the
-        // lane count but its DEGREE does not, since the bits are summed.
         let q_host3 = meta.selector();
         {
             let hosts: Vec<Column<Advice>> = lanes.iter().map(|l| l.host3).collect();
@@ -1219,22 +978,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             ]
         });
 
-        // ---- condition (10): |Bag1^c |X| Bag2^c| == |Bag1 |X| Bag2| ----
-        // THE one equality of the Cardinality Preservation Check, at the last
-        // totals row, over the two GRAND totals.
-        //
-        // `tot_run` is the input-channel root sum: on this cluster tree
-        // sigma_all(key) is the number of real Bag2 edges with that key, which is
-        // exactly the msg_val the answer is read off, so
-        // mu_all = t12_real * [A<B] * [B<C] * msg_val is the `contrib` column and
-        // its cross-lane total is `tot_run`. `tot_cln` is the clean-channel root
-        // sum of the same traversal.
-        //
-        // Both are accumulated ACROSS the lanes before they meet. A per-lane
-        // equality would be strictly weaker and is the escape this layout has to
-        // avoid: a prover would hide a joinable tuple in one lane and re-balance
-        // that lane's two channels against each other, and every lane's own
-        // equality would still hold.
         meta.create_gate("cp: cardinality preservation over all lanes", |m| {
             let q = m.query_selector(q_out);
             vec![
@@ -1281,19 +1024,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         }
     }
 
-    /// Assign one lane's block of the padded Bag1 pipeline.
-    ///
-    /// `base` is the global index of this lane's row 0 and `live_rows` its
-    /// [`lane_live_rows`], so lane l covers the padded rows
-    /// `[l*lane_rows, l*lane_rows + live_rows)`: a full lane_rows except in the
-    /// last lane, which stops at the released capacity. Rows past `t12.len()`
-    /// are DP pad rows and are witnessed with exactly the pad convention
-    /// g_sql3_obj uses: all-zero tuple, key 0, in_set 1, val 0, contrib 0. Map
-    /// row 0 is (0,0) and view row 0 is (0,0,0), so a pad row satisfies every
-    /// lookup.
-    ///
-    /// Returns the lane's last `run_sum` cell (the value the totals stage
-    /// copies) together with that total.
     #[allow(clippy::too_many_arguments)]
     fn assign_lane(
         lane: &LaneConfig<F>,
@@ -1546,12 +1276,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             // lane: a row's clean bit is decided by the global semijoin reduction
             // in `assign`, so slicing the bag into lanes never changes it.
             let clean = if i < real12 { cln12[i] } else { 0 };
-            region.assign_advice(
-                || "cln12",
-                lane.cln12,
-                r,
-                || Value::known(F::from(clean)),
-            )?;
+            region.assign_advice(|| "cln12", lane.cln12, r, || Value::known(F::from(clean)))?;
             region.assign_advice(
                 || "ck12",
                 lane.ck12,
@@ -1612,14 +1337,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         let num_lanes = cfg.lanes.len();
         assert!(lane_rows > 0, "lane_rows must be positive");
 
-        // -------------------
-        // The capacity the LAYOUT is cut to. Structural input, settled here,
-        // before a single row of witness is derived: selectors are fixed
-        // columns, so this number is committed at keygen and lands in the
-        // verifying key. `Some(cap)` is the caller's public release and the
-        // last lane stops at it; `None` fills every lane, which discloses only
-        // the lane count. See the module header for which regime may use which.
-        // -------------------
         let capacity = released_capacity.unwrap_or(num_lanes * lane_rows);
         // The live rows must TILE the lanes exactly. `lane_live_rows` re-checks
         // it for every lane; calling it here first makes a capacity that does
@@ -1628,11 +1345,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         let live_of = |l: usize| lane_live_rows(l, num_lanes, lane_rows, capacity);
         let live_last = live_of(num_lanes - 1);
 
-        // Load all LT tables used. The shared chips keep a u8 column each; all
-        // 4c lane chips share `lane_u8` and every Lt chip of the Cardinality
-        // Preservation child stage shares `cp_u8`, so this is 6 load regions for
-        // any c. Each one touches only its own fixed column, so they all start at
-        // row 0 and none of them displaces the witness region.
         LtChip::<F, NUM_BYTES>::construct(cfg.in_by_dst.lt_key).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.out_by_src.lt_key).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.agg_msg.lt_key).load(layouter)?;
@@ -1694,23 +1406,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     ),
                 }
 
-                // ---------------- clean / residual partition of the two bags ----------------
-                // Identical to the sibling's, and computed over the WHOLE bag: a
-                // tuple's clean bit is a property of the relation, not of the lane
-                // it happens to land in, so the lane split never enters here.
-                //
-                // The honest clean part of a relation is its fully reduced
-                // instance. A Bag1 wedge contributes only when it is real and
-                // A<B<C, and a wedge and a closing edge extend each other exactly
-                // when they agree on the packed separator key, so the reduction of
-                // this two-node cluster tree is the intersection of the two key
-                // sets. On a two-node tree that single simultaneous pass is
-                // already a fixed point of semijoin reduction, which is what
-                // condition (9) needs.
-                //
-                // Only the REAL rows carry a clean bit; every pad row of every
-                // lane has indicator 0, and `assign_lane` reads that off the
-                // length of these vectors.
                 let pred12: Vec<bool> = (0..real12)
                     .map(|i| {
                         derived.t12[i].0 < derived.t12[i].1 && derived.t12[i].1 < derived.t12[i].2
@@ -1720,13 +1415,12 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     .map(|i| pack2(derived.t12[i].0, derived.t12[i].2))
                     .collect();
 
-                let keys3: HashSet<u64> = derived
-                    .t3
-                    .iter()
-                    .map(|&(c, a, _, _)| pack2(a, c))
+                let keys3: HashSet<u64> =
+                    derived.t3.iter().map(|&(c, a, _, _)| pack2(a, c)).collect();
+                let keys12: HashSet<u64> = (0..real12)
+                    .filter(|&i| pred12[i])
+                    .map(|i| key12[i])
                     .collect();
-                let keys12: HashSet<u64> =
-                    (0..real12).filter(|&i| pred12[i]).map(|i| key12[i]).collect();
 
                 let mut cln3: Vec<u64> = (0..real3)
                     .map(|i| keys12.contains(&pack2(derived.t3[i].1, derived.t3[i].0)) as u64)
@@ -1761,8 +1455,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                                 .collect();
                             for i in 0..real3 {
                                 if cln3[i] == 1
-                                    && !live12
-                                        .contains(&pack2(derived.t3[i].1, derived.t3[i].0))
+                                    && !live12.contains(&pack2(derived.t3[i].1, derived.t3[i].0))
                                 {
                                     cln3[i] = 0;
                                     moved = true;
@@ -1775,11 +1468,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     }
                 }
 
-                // Test hook only. Skip the reduction and declare every real tuple
-                // clean; the indicator still has to satisfy its binding gate, so a
-                // Bag1 wedge its own predicate drops stays out. Conservation still
-                // holds and both channels of condition (10) then carry the same
-                // multiplicity on every row, so only condition (9) can reject it.
                 if tamper == Tamper::MarkAllClean {
                     for v in cln3.iter_mut() {
                         *v = 1;
@@ -1789,12 +1477,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     }
                 }
 
-                // ---------------- condition (9), the union direction ----------------
-                // For every clean Bag2 tuple, the lane that hosts a clean Bag1
-                // wedge with the same separator key. One lane per key is enough,
-                // so this is a key -> lane map over the clean Bag1 rows; the
-                // coverage gate rejects a clean Bag2 key that has none, which is
-                // exactly what the all-clean partition produces.
                 let mut host_of_key: HashMap<u64, usize> = HashMap::new();
                 for j in 0..real12 {
                     if cln12[j] == 1 {
@@ -1814,14 +1496,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 };
                 let mut wrong_host_placed = false;
 
-                // -------------------
-                // Bag2 + message aggregation: fixed-height under Privacy::Dp
-                // (GQ3's Bag2 IS the Edge relation, whose size is public), and
-                // small enough to stay a single group under Privacy::Legacy.
-                // It occupies its own columns, so its height is independent of
-                // `lane_rows`; only the domain 2^k bounds it, and the harness
-                // checks that fit alongside the lane geometry.
-                // -------------------
                 let mut agg_in: Vec<(u64, u64)> = vec![(PAD_U64, 0); n3];
                 let iz_t3_pad_chip = IsZeroChip::construct(cfg.iz_t3_pad.clone());
 
@@ -1999,24 +1673,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 let cp_stage = build_cp_stage(&cp_rows, PAD_U64);
                 assign_cp_agg(&mut region, &cfg.cp_agg, &cp_rows, &cp_stage)?;
 
-                // -------------------
-                // Bag1: the pad-driven pipeline, spread over the lanes
-                // -------------------
-                // Two selector sets, one row range each. `full` covers all
-                // `lane_rows` rows and switches ON every lane but the last;
-                // `last` covers the live rows of the last lane, which stop at
-                // the layout capacity: the caller's release under `Some`, the
-                // full lane span under `None`. Both ranges are functions of
-                // that structural number, `c` and `lane_rows`, none of which is
-                // read off the witness, so nothing here can depend on the true
-                // bag size -- and that is still true of the OBJ selectors: none
-                // of their enable ranges is a function of the clean/residual
-                // split, which is why no lane's shape leaks |Bag1^c|.
-                //
-                // Row 0 is live in every lane, so `q_sum0` stays shared and is
-                // enabled once, outside both loops. `live_last` is the one
-                // computed at the top of `assign`, from the structural capacity
-                // alone.
                 cfg.full.q_sum0.enable(&mut region, 0)?;
                 if num_lanes > 1 {
                     for r in 0..lane_rows {
@@ -2038,12 +1694,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                         }
                     }
                 }
-                // The same list against the same names, so the two ranges stay
-                // visibly parallel. Several of these names alias one column in
-                // the `last` set, and enabling a selector twice on a row is
-                // idempotent; `Assignment::enable_selector` is a no-op under the
-                // prover in any case, since selectors are fixed and were
-                // committed at keygen.
+
                 for r in 0..live_last {
                     cfg.last.q_t12_lookup.enable(&mut region, r)?;
                     cfg.last.q_t12_key.enable(&mut region, r)?;
@@ -2087,11 +1738,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     lane_cln_totals.push(cln_total);
                 }
 
-                // -------------------
-                // The only cross-lane wiring: 2c copy constraints plus two
-                // degree-2 accumulators over the c lane totals, one per channel
-                // of the Cardinality Preservation Check.
-                // -------------------
                 let mut acc: u64 = 0;
                 let mut acc_cln: u64 = 0;
                 for l in 0..num_lanes {
@@ -2141,11 +1787,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     )?;
                 }
 
-                // condition (10) over the union of the lanes. `acc` is the
-                // input-channel root sum (which is also the certified COUNT(*))
-                // and `acc_cln` is the clean-channel root sum; the gate
-                // "cp: cardinality preservation over all lanes" compares them at
-                // the last totals row.
                 if tamper == Tamper::None {
                     debug_assert_eq!(
                         acc, acc_cln,
@@ -2185,20 +1826,7 @@ pub struct MyCircuit<F: Field + Ord> {
     pub bag2_pad_extra: usize,
     pub lane_rows: usize,
     pub num_lanes: usize,
-    /// The RELEASED Bag1 capacity, when the caller is supplying a genuine
-    /// public release.
-    ///
-    ///   * `Some(cap)`: the last lane stops at `cap`, so the assigned rows
-    ///     total `cap` rather than `num_lanes * lane_rows`, and `cap` is what
-    ///     the verifying key pins. Only pass it where `cap` is public already:
-    ///     `Privacy::Dp` (the DP release) and `Privacy::Rjs` (the true size,
-    ///     which that regime reveals by definition).
-    ///   * `None`: every lane is filled to `lane_rows`, exactly as before the
-    ///     short last lane existed, and the vk pins only the lane count. This
-    ///     is the behaviour-preserving default and the one `Privacy::Legacy`
-    ///     must use, since its pad is a public constant.
-    ///
-    /// The check that the witness really implies this capacity is in `assign`.
+
     pub released_capacity: Option<usize>,
     pub tamper: Tamper,
     pub _marker: PhantomData<F>,
@@ -2289,13 +1917,6 @@ struct Gq3DpSetup {
     plan: crate::dp_lane::DpLanePlan,
 }
 
-/// Geometry the released Bag1 capacity implies, or an explanation of why this
-/// configuration cannot be built.
-///
-/// `Err` covers every way a row can be rejected BEFORE proving: the lane cap on
-/// the laned bag, and the structural fit of the tallest column group at the
-/// pinned degree. Both are properties of the request, so a sweep reports them
-/// and continues.
 fn try_dp_lane_setup(
     dataset: &str,
     privacy: crate::bench_queries::Privacy,
@@ -2338,17 +1959,7 @@ fn try_dp_lane_setup(
         true_size: vec![stats.bag1_size as usize],
         pads: vec![bag1_pad_extra, bag2_pad_extra],
     };
-    // POLICY, applied here and nowhere else in this file: whether the circuit
-    // may stop its last lane at the released capacity, which is the same thing
-    // as whether it may pin that capacity in the verifying key.
-    //   * Privacy::Dp  -> Some(n12). The release is public, so the vk discloses
-    //                     nothing the harness did not already print.
-    //   * Privacy::Rjs -> Some(n12), which equals the true bag size. That
-    //                     regime reveals the join size by definition.
-    //   * Privacy::Legacy -> None. Its pad is a public CONSTANT, so a capacity
-    //                     in the vk would pin the true bag size; fall back to
-    //                     the full-lane layout, which discloses only the lane
-    //                     count.
+
     let released_capacity = crate::dp_lane::vk_released_capacity(privacy, n12);
 
     Ok(Gq3DpSetup {
@@ -2398,11 +2009,7 @@ pub fn run_dp_lanes(
     proof_path: Option<&str>,
 ) -> crate::dp_lane::DpLaneRun {
     use halo2_proofs::poly::{
-        ipa::{
-            commitment::IPACommitmentScheme,
-            multiopen::ProverIPA,
-            strategy::SingleStrategy,
-        },
+        ipa::{commitment::IPACommitmentScheme, multiopen::ProverIPA, strategy::SingleStrategy},
         VerificationStrategy,
     };
     use halo2_proofs::transcript::{
@@ -2526,15 +2133,6 @@ mod tests {
             .collect()
     }
 
-    /// 6 wedges survive the A<B pre-filter, so 5 pad rows give a released
-    /// capacity of 11, which at 4 rows per lane really spans 3 lanes and leaves
-    /// the LAST lane 3 rows tall instead of 4.
-    ///
-    /// That short last lane is why every negative direction below is also a test
-    /// of the shortened boundary: a lane that stopped being fully constrained
-    /// past its capacity would still satisfy `mock_three_lanes`, and only these
-    /// would notice. `Tamper::PadRow` in particular breaks the last row of the
-    /// released capacity, which is the last LIVE row of that short lane.
     fn three_lane_circuit(tamper: Tamper) -> (MyCircuit<Fp>, usize) {
         let edges = synthetic_edges();
         let lane_rows = 4;
@@ -2559,12 +2157,6 @@ mod tests {
     /// pre-filter. Every geometry below is stated as `6 + pad`.
     const SYNTH_BAG1_ROWS: usize = 6;
 
-    /// The released capacity a pad implies here, handed to the circuit as a
-    /// GENUINE release. This is the `Privacy::Dp` / `Privacy::Rjs` arm: the
-    /// number is public, so the last lane may stop at it and the vk may pin it.
-    /// The `None` arm (`Privacy::Legacy`) is exercised by
-    /// `mock_some_and_none_at_the_same_geometry` and
-    /// `full_lanes_keep_the_capacity_out_of_the_key`.
     fn released(bag1_pad_extra: usize) -> Option<usize> {
         Some(SYNTH_BAG1_ROWS + bag1_pad_extra)
     }
@@ -2592,10 +2184,6 @@ mod tests {
         assert_eq!(lanes_for_capacity(2_725_688, 22), 1);
     }
 
-    /// The live rows of the c lanes must TILE the released capacity: every lane
-    /// but the last full, the last stopping exactly at the capacity, and the sum
-    /// equal to it. Anything else either drops a released row or leaves lane
-    /// quantization behind.
     #[test]
     fn live_rows_tile_the_capacity() {
         for lane_rows in [1usize, 2, 3, 4, 7, 260_800] {
@@ -2632,12 +2220,6 @@ mod tests {
         }
     }
 
-    /// `keygen_vk` at the degree the mock tests use, as its PINNED
-    /// representation. `PinnedVerificationKey` carries the domain, the whole
-    /// constraint system, the permutation and every fixed commitment, i.e.
-    /// everything the verifier holds, and its `Debug` string is exactly what
-    /// halo2 hashes into the key's `transcript_repr`. Comparing those strings
-    /// is comparing the keys; this fork exposes no cheaper equality.
     fn pinned_vk(circuit: &MyCircuit<Fp>) -> String {
         use halo2_proofs::poly::commitment::ParamsProver;
         use halo2_proofs::poly::ipa::commitment::ParamsIPA;
@@ -2648,31 +2230,6 @@ mod tests {
         format!("{:?}", vk.pinned())
     }
 
-    /// DEFECT 2. halo2's structural guarantee is that a verifying key cannot
-    /// depend on witness data, and `without_witnesses()` is where a circuit
-    /// states it: keygen has to go through on a circuit carrying no bag at all.
-    /// A capacity reconstructed from the witness collapsed to `max(0 + 0, 1)`
-    /// there, which no lane count but 1 tiles, so this panicked at every c > 1.
-    ///
-    /// The second half is the property worth protecting: with the capacity kept
-    /// as a structural field, the witness-free key is a function of
-    /// `(lane_rows, num_lanes, released_capacity)` and of nothing else, so two
-    /// completely different graphs give the SAME key.
-    ///
-    /// WHAT THIS CANNOT ASSERT, AND WHY. The witness-free key is NOT equal to
-    /// the key of the witness-bearing circuit, and that gap is not the
-    /// capacity's doing: it is exactly as wide with `released_capacity = None`,
-    /// where the field plays no part in any row range at all. It comes from the
-    /// UNLANED stages, which size their rows from |E| and from the number of
-    /// distinct separator keys (the two indexed views, the Bag2 pipeline, the
-    /// message table), plus halo2's selector compression, which folds selectors
-    /// into fixed columns using the enable pattern it observes: an empty edge
-    /// list changes `num_fixed_columns` and the compressed gate expressions.
-    /// Both quantities are public in every regime, which is why Bag2 is not
-    /// laned in the first place. `run_dp_lanes` accordingly keygens on the
-    /// witness-bearing circuit, as it always has. What the released capacity
-    /// itself contributes to the key is isolated in
-    /// `full_lanes_keep_the_capacity_out_of_the_key`.
     #[test]
     fn without_witnesses_keygens_at_every_lane_count() {
         let other_edges: Vec<Edge> = [(0, 5), (5, 9), (9, 0), (2, 7), (7, 2), (1, 9)]
@@ -2718,14 +2275,7 @@ mod tests {
             set_config_lanes(c);
             let vk_other_empty =
                 pinned_vk(&<MyCircuit<Fp> as Circuit<Fp>>::without_witnesses(&other));
-            // HONEST ABOUT WHAT THIS PROVES. `without_witnesses` discards the
-            // edges by construction, so this equality cannot fail and is not
-            // evidence that the key is witness-independent. It is a guard on
-            // `without_witnesses` ITSELF: if a later edit made it carry any
-            // part of the witness through, the two keys would diverge here.
-            // The property that the capacity stays out of the key is tested by
-            // `full_lanes_keep_the_capacity_out_of_the_key`, which varies a
-            // real witness quantity at a fixed lane count.
+
             assert_eq!(
                 vk_empty, vk_other_empty,
                 "lane_rows={lane_rows} c={c}: without_witnesses carried witness data through"
@@ -2748,11 +2298,6 @@ mod tests {
             assert_eq!(empty_full.bag1_pad_extra, 0);
             let vk_empty_full = pinned_vk(&empty_full);
 
-            // The gap documented above, pinned so the diagnosis is checkable
-            // rather than asserted in prose: it is there under `Some` and under
-            // `None` alike, so nothing about it is the capacity's. If a later
-            // change ever makes the unlaned stages structural too, both of
-            // these become equalities and this is the test to strengthen.
             set_config_lanes(c);
             assert_ne!(pinned_vk(&circuit), vk_empty);
             set_config_lanes(c);
@@ -2760,13 +2305,6 @@ mod tests {
         }
     }
 
-    /// DEFECT 1. Under `Privacy::Legacy` the pad is a public CONSTANT, so a
-    /// capacity in the verifying key would pin `true_size = capacity - pad`.
-    /// That regime therefore passes `None`, and this is what `None` buys: two
-    /// pads that land on the same lane count give BYTE-IDENTICAL keys, so the
-    /// key cannot be inverted for the bag size. With `Some` the two keys
-    /// differ, which is the point of a genuine release: the capacity is public
-    /// and the last lane may stop at it.
     #[test]
     fn full_lanes_keep_the_capacity_out_of_the_key() {
         let lane_rows = 4;
@@ -3001,7 +2539,10 @@ mod tests {
         // run_sum and cln_run, the two channel totals copied out of a lane; every
         // other per-lane column is read by gates and lookups only and stays out
         // of the permutation argument
-        assert_eq!(step[5], 2, "a lane must add exactly two permutation columns");
+        assert_eq!(
+            step[5], 2,
+            "a lane must add exactly two permutation columns"
+        );
 
         for w in shapes.windows(2) {
             for i in 0..7 {
@@ -3016,21 +2557,16 @@ mod tests {
         }
     }
 
-    /// The COUNT(*) must be invariant to the lane geometry, and the block-wise
-    /// split must place every real Bag1 row in exactly one lane at the right
-    /// offset. The geometries below cover: real rows spilling into the LAST
-    /// lane (no rounding-up pad at all), one row per lane, an odd rounding-up
-    /// tail, and the degenerate single-lane case.
     #[test]
     fn mock_lane_geometries() {
         // (lane_rows, bag1_pad_extra, expected lanes)
         let cases: [(usize, usize, usize); 7] = [
-            (2, 0, 3), // 6 real rows, no pad: lane 2 is entirely real and full
-            (1, 0, 6), // one row per lane, q_sum never fires
-            (4, 5, 3), // 11 released rows over 3 lanes of 4: last lane 3 tall
-            (3, 1, 3), // 7 released rows over 3 lanes of 3: last lane 1 tall
-            (5, 0, 2), // real rows straddle the lane-0/lane-1 boundary
-            (4, 7, 4), // 13 released over 4 lanes of 4: last lane is ONE pad row
+            (2, 0, 3),  // 6 real rows, no pad: lane 2 is entirely real and full
+            (1, 0, 6),  // one row per lane, q_sum never fires
+            (4, 5, 3),  // 11 released rows over 3 lanes of 4: last lane 3 tall
+            (3, 1, 3),  // 7 released rows over 3 lanes of 3: last lane 1 tall
+            (5, 0, 2),  // real rows straddle the lane-0/lane-1 boundary
+            (4, 7, 4),  // 13 released over 4 lanes of 4: last lane is ONE pad row
             (16, 5, 1), // one lane, live on 11 of its 16 rows
         ];
         for (lane_rows, bag1_pad_extra, want_c) in cases {
@@ -3074,11 +2610,6 @@ mod tests {
         }
     }
 
-    /// Cost probe. Every One-Pass OBJ constraint in this file is a degree-1 to
-    /// degree-3 gate, a shuffle, or a lookup whose input and table degrees sum to
-    /// at most 5, so none of them may raise `cs.degree()` above the 7 the
-    /// pre-existing "msg member" lookup already costs: a rise would double every
-    /// FFT of the proof, on every lane.
     #[test]
     fn test_max_gate_degree() {
         use halo2_proofs::plonk::ConstraintSystem;
@@ -3119,11 +2650,7 @@ mod tests {
     /// can match. Used to keep the cross-lane OBJ test below non-vacuous.
     fn clean_lane_spread(lane_rows: usize) -> (HashSet<usize>, usize) {
         let derived = gq3_derive(&synthetic_edges());
-        let keys3: HashSet<u64> = derived
-            .t3
-            .iter()
-            .map(|&(c, a, _, _)| pack2(a, c))
-            .collect();
+        let keys3: HashSet<u64> = derived.t3.iter().map(|&(c, a, _, _)| pack2(a, c)).collect();
         let keys12: HashSet<u64> = derived
             .t12
             .iter()
@@ -3140,35 +2667,8 @@ mod tests {
         (lanes, keys3.difference(&keys12).count())
     }
 
-    /// THE cross-lane One-Pass OBJ test.
-    ///
-    /// Conditions (7), (9) and (10) all have to hold over the UNION of the lanes,
-    /// so the geometries below are chosen to put the clean Bag1 rows in more than
-    /// one lane: a single-lane run cannot tell a union statement from a per-lane
-    /// one. Both negative directions are checked, and each of them is the one the
-    /// other cannot see:
-    ///
-    ///  * one joinable Bag2 tuple hidden in the residual side, with both bags
-    ///    re-reduced around it. Conservation still holds, the two clean sides
-    ///    still agree on the separator key, and the published COUNT(*) is still
-    ///    the honest one. Only condition (10) sees it, and only because its two
-    ///    root sums are accumulated ACROSS the lanes before they are compared: a
-    ///    per-lane equality would let the prover park the missing contribution in
-    ///    a lane that still balances.
-    ///  * every real tuple declared clean. Conservation holds and both channels of
-    ///    condition (10) then carry the same multiplicity on every row, so its
-    ///    equality holds for free. Only condition (9) sees it, through the
-    ///    direction whose table is the union of the lanes' clean key columns.
     #[test]
     fn mock_obj_conditions_across_lanes() {
-        // (lane_rows, bag1_pad_extra, expected lanes). Both geometries are narrow
-        // enough that the 3 clean wedges of `synthetic_edges` CANNOT all fall into
-        // one lane whatever order the host-side derivation emits them in: 3 clean
-        // rows out of 6 real ones cannot fit in a single lane of 2 rows. A wider
-        // lane would sometimes hold all of them and the test would silently stop
-        // testing the cross-lane claim. The first case also has no padding at all
-        // and one row per lane, so some lanes hold a clean row and others hold
-        // none.
         let cases: [(usize, usize, usize); 2] = [(1, 0, 6), (2, 5, 6)];
         for (lane_rows, bag1_pad_extra, want_c) in cases {
             let c = lanes_for(6 + bag1_pad_extra, lane_rows);
@@ -3207,8 +2707,8 @@ mod tests {
             prover.assert_satisfied();
 
             // condition (10), over the union of the lanes
-            let hidden = MockProver::run(11, &build(Tamper::HideCleanTuple), public.clone())
-                .unwrap();
+            let hidden =
+                MockProver::run(11, &build(Tamper::HideCleanTuple), public.clone()).unwrap();
             let failures = hidden
                 .verify()
                 .expect_err("condition (10) accepted a hidden joinable tuple");
@@ -3228,9 +2728,7 @@ mod tests {
                 .verify()
                 .expect_err("the all-clean partition was accepted");
             assert!(
-                failures
-                    .iter()
-                    .any(|f| format!("{:?}", f).contains("pw:")),
+                failures.iter().any(|f| format!("{:?}", f).contains("pw:")),
                 "the circuit rejected the all-clean partition, but not through a \
                  Pairwise Consistency check: {:?}",
                 failures
@@ -3238,10 +2736,6 @@ mod tests {
         }
     }
 
-    /// Condition (7) must bite inside EVERY lane. Demoting the last clean row of
-    /// each lane's partition group leaves the flag boolean and non-increasing and
-    /// leaves the bag's own indicator honest, so the lane's Conservation shuffle
-    /// is the only thing that can notice.
     #[test]
     fn mock_reject_tampered_partition_flag() {
         let lane_rows = 2;
@@ -3274,9 +2768,6 @@ mod tests {
         );
     }
 
-    /// Condition (9)'s union direction must reject a host bit that points at the
-    /// WRONG lane, not just a missing one: that is the difference between "some
-    /// lane holds this key" and "the prover may name any lane it likes".
     #[test]
     fn mock_reject_wrong_host_lane() {
         let lane_rows = 2;
@@ -3301,9 +2792,7 @@ mod tests {
             .verify()
             .expect_err("a clean Bag2 tuple hosted by the wrong lane was accepted");
         assert!(
-            failures
-                .iter()
-                .any(|f| format!("{:?}", f).contains("pw:")),
+            failures.iter().any(|f| format!("{:?}", f).contains("pw:")),
             "rejected, but not through a Pairwise Consistency check: {:?}",
             failures
         );

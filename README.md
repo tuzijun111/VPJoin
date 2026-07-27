@@ -65,17 +65,16 @@ src/
   circuits/       # Reusable circuit gadgets (inclusion checks, permutations, Merkle trees)
   sql/            # TPC-H query circuits (Q3, Q5, Q8, Q9, Q18)
   graph_sql/      # Graph pattern query circuits (GQ1--GQ4)
-  circuits/card_preserve.rs  # Cardinality Preservation Check: the two-channel
-                             # multiplicity propagation behind OBJ condition (4)
+  circuits/card_preserve.rs  # Cardinality Preservation Check
   data/           # TPC-H dataset files and parsing utilities
   graph_data/     # Network dataset files and parsing
   proof/          # Persisted public parameters (param15..param19) and some proof artifacts
   bench_queries.rs  # Shared query/dataset/privacy plumbing for every harness
-  dp_noise.rs       # DP capacity release (one-sided noise mechanism)
+  dp_noise.rs       # DP capacity release 
   dp_lane.rs        # Plan/run records shared by the DP lane circuits
   commitment.rs     # Database-commitment layer: canonical layout, Commit(D), per-proof binding
   input_binding.rs  # In-circuit binding of query inputs to the published commitments
-  bin/              # Benchmark harnesses (see Running the Benchmarks)
+  bin/              # Benchmark harnesses 
 ```
 
 
@@ -132,8 +131,47 @@ Cyclic queries by revealing the true join results size.
 VPJOIN_PRIVACY=rjs cargo vpjoin simplification q5 gq3 gq4
 ```
 
-**2. Additional in-circuit cost of binding a proof to a committed database.** Each row is
-proved twice at the same degree and the reported cost is the median paired difference:
+The same harness proves the **full** system, query circuit plus the complete
+database-commitment layer, when the mode is `full` instead of `simplification`:
+
+```bash
+cargo vpjoin full
+```
+
+Every row then publishes one hiding Pedersen commitment per input column, proves in
+circuit that the witness columns equal the committed data at a Fiat-Shamir point bound to
+both the commitments and the query proof, and opens the columns. The CSV and the summary
+table gain `bind_prove_s`, `open_prove_s` and `total_prove_s` next to the query's own
+`prove_s`, so a `full` row and the matching `simplification` row are directly comparable.
+Both modes are release builds: `cargo vpjoin` expands to `run --release --bin
+vpjoin_bench --`, and the harness prints `profile=release` and records it in the CSV's
+`profile` column.
+
+Two things are worth knowing before launching a `full` sweep.
+
+*It re-proves every query.* A bare `cargo vpjoin full` runs all 17 query circuits again,
+so it costs a complete `simplification` sweep on top of the commitment work, and the
+expensive rows are GQ3 and GQ4 on Facebook and Wikipedia Vote at k=22. To price the
+commitment layer on its own, use the third mode:
+
+```bash
+cargo vpjoin commit
+```
+
+`commit` does not re-prove the query. It binds its Fiat-Shamir challenge to the proof an
+earlier `simplification` run left in `src/proof/bench/<query>_<dataset>.proof`, so its
+numbers add to the matching `simplification` row and each one takes seconds rather than
+the query's minutes to hours.
+
+*The commitment layer is sized by the data it commits, not by the query circuit.* GQ3 and
+GQ4 need k=22 only because of their materialized intermediate bags, while the Edge
+relation they actually commit is 27K to 104K rows, which is k=15 to 17. Charging the
+binding layer for a 2^22 domain would measure the intermediate blow-up rather than the
+cost of binding the input, so the layer uses the smaller degree. This still reuses the
+query's parameters and stays sound: the IPA generators are derived by position, so the
+smaller SRS is exactly a prefix of the larger one.
+
+**2. Additional in-circuit cost of binding a proof to a committed database.** The reported cost is the median paired difference:
 
 ```bash
 cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2

@@ -24,20 +24,8 @@ const PAD_DATE: u64 = MAX_SENTINEL; // pad orderdate (max -> last when ASC)
 const PAD_SHIP: u64 = MAX_SENTINEL; // pad shippriority (max)
 const PAD_REV: u64 = 0; // pad revenue (min -> last when DESC)
 
-/// Test hook, off in every benchmark path: when set, the prover moves one
-/// joinable tuple to the residual side and re-reduces the neighbours around
-/// it, so the partition still passes Conservation, Non-Membership and Pairwise
-/// Consistency and only condition (4) can catch it. This is exactly the cheat
-/// a residual-side-only argument misses, so the negative test in this module
-/// is what shows the Cardinality Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 
-/// Test hook, off in every benchmark path: when set, the prover skips the
-/// semijoin reduction entirely and declares every tuple that passes its
-/// predicate clean. Conservation still holds and both channels of condition (4)
-/// then agree row by row, so this is the escape that only Pairwise Consistency
-/// can close, and the negative direction for it in this module is what shows
-/// condition (3) is doing work.
 pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
