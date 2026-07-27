@@ -2,144 +2,189 @@
 //!
 //! WHY THIS FILE EXISTS
 //! --------------------
-//! GQ4 materializes BOTH of its bags at capacities that, under differential
-//! privacy, are NOISY RELEASES rather than the true bag sizes. The released
-//! capacities are public, but they are not powers of two, and a single column
-//! group must be padded up to the next power of two. On lastfm the true bags
-//! hold 232,943 rows each and Revealing-Join-Size proves at k = 18; the DP
-//! release at (eps,delta) = (0.1,1e-5) is 788,220 rows for Bag1 and 621,070
-//! for Bag2, which alone would push the circuit to k = 20. At eps = 0.01 the
-//! releases are ~50x larger and the degree would reach k = 26. Every step
-//! doubles the prover's work even though the capacity grew by far less.
+//! GQ4 materializes its bag at a capacity that, under differential privacy, is a
+//! NOISY RELEASE rather than the true bag size. The released capacity is public,
+//! but it is not a power of two, and a single column group must be padded up to
+//! the next power of two. On lastfm the true bag holds 232,943 rows and
+//! Revealing-Join-Size proves at k = 18; the DP release at
+//! (eps,delta) = (0.1,1e-5) is 512,521 rows, which alone would push the circuit
+//! to k = 19. At eps = 0.01 the release is ~32x larger and the degree would
+//! reach k = 24. Every step doubles the prover's work even though the capacity
+//! grew by far less.
+//!
+//! (Those are the releases the default `VPJOIN_DP_SEED` produces now that
+//! `bench_queries::graph_pads` spends ONE capacity release on GQ4 instead of
+//! two: the two bags are one relation, hence one private cardinality, so the
+//! budget splits 2 ways rather than 3 and the noise shrinks. The two-bag
+//! version of this file quoted 788,220 and 621,070 from the 3-way split.)
 //!
 //! This circuit keeps the degree PINNED at the Revealing-Join-Size value and
-//! hosts each released capacity in
+//! hosts the released capacity in
 //!
 //!     c = ceil(capacity / lane_rows)
 //!
-//! parallel column-group LANES, so the per-bag cost grows with the released
-//! capacity instead of doubling at each power of two. Same trick, same
-//! conventions, as `sql::q5_obj_dp` does for TPC-H Q5 and `g_sql3_obj_dp` does
-//! for the GQ3 triangle.
+//! parallel column-group LANES, so the cost grows with the released capacity
+//! instead of doubling at each power of two. Same trick, same conventions, as
+//! `sql::q5_obj_dp` does for TPC-H Q5 and `g_sql3_obj_dp` does for the GQ3
+//! triangle.
 //!
 //! WHAT A LANE IS
 //! --------------
-//! GQ4 has TWO pad-driven pipelines, so it has two kinds of lane, and both are
-//! FULL structural replicas:
+//! GQ4's separator (A,C) splits the 4-cycle into the path A->B->C and the path
+//! C->D->A, and those are THE SAME RELATION read with different column roles:
+//! with `W = {(x,y,z) : x->y and y->z are edges, x<y}`, Bag 1 is W as (A,B,C)
+//! and Bag 2 is W as (C,D,A). The role-1 reading adds [y<z] on top of W's own
+//! x<y and the role-2 reading adds nothing, which together is exactly
+//! A<B<C<D. So there is ONE pad-driven pipeline and ONE kind of lane, and
+//! `g_sql4_obj` materializes W once for the same reason.
 //!
-//!   * A Bag2 lane replicates the T34 column group (the eight t34 columns and
-//!     the C<D comparator), the prover's clean/residual partition of that
-//!     block, the occurrence id, and a complete per-key CHILD STAGE of the
-//!     Cardinality Preservation Check, which turns the lane's block of Bag2
-//!     rows into a lane-local key-indexed table of TWO per-key sums.
-//!   * A Bag1 lane replicates the T12 column group (the eight t12 columns, the
-//!     A<B and B<C comparators), its own clean/residual partition, its
-//!     occurrence id, one complete PARENT PROBE per Bag2 lane, and a lane-local
-//!     prefix sum of each of the two channels.
+//! A lane is a full structural replica of everything that pipeline needs:
 //!
-//! Lanes of a kind are identical by construction and all of them are assigned
-//! to the full `lane_rows` rows, so the assigned structure is a function of the
-//! PUBLIC released capacities only. It never depends on the true bag sizes. A
-//! cheaper "overflow lane" that only carries padding would leak exactly the
-//! quantity DP is paying to hide, so there is no such thing here.
+//!   * the eight W columns and the two comparators [x<y] and [y<z];
+//!   * the ROLE-2 group (keep bit, separator key `pack2(z,x)`, the prover's
+//!     clean indicator and the folded `ceff2`), and a complete per-key CHILD
+//!     STAGE of the Cardinality Preservation Check, which turns the lane's block
+//!     of W rows into a lane-local key-indexed table of TWO per-key sums;
+//!   * the ROLE-1 group (predicate bit, separator key `pack2(x,z)`, its own
+//!     clean indicator, the folded `ceff1` and `ck1 = ceff1 * key1`, the table
+//!     side of the mirror half of (9)), one complete PARENT PROBE per lane, c
+//!     boolean `host` bits naming the lane that holds this row's clean role-2
+//!     key, and a lane-local prefix sum of each of the two channels;
+//!   * the occurrence id of the row.
+//!
+//! The aggregate key is `pack2(z,x)`, REVERSED against the role-1 probe key
+//! `pack2(x,z)`: the same two cells of the same row packed in opposite orders.
+//! That reversal is the whole mechanism, so the two keys are two columns and
+//! cannot merge.
+//!
+//! Lanes are identical by construction and all of them are assigned to the full
+//! `lane_rows` rows, so the assigned structure is a function of the PUBLIC
+//! released capacity only. It never depends on the true bag size. A cheaper
+//! "overflow lane" that only carries padding would leak exactly the quantity DP
+//! is paying to hide, so there is no such thing here.
 //!
 //! WHY LANE-LOCAL AGGREGATION IS SOUND
 //! -----------------------------------
-//! The message a Bag2 row sends is `sigma(pack2(A,C)) = COUNT(paths C->D->A
-//! with C<D)`, a pure COUNT. Counts ADD across a partition, so splitting Bag2
-//! block-wise over c2 lanes and grouping each block independently is exactly
+//! The message a role-2 row sends is `sigma(pack2(A,C)) = COUNT(paths C->D->A
+//! with C<D)`, a pure COUNT. Counts ADD across a partition, so splitting W
+//! block-wise over c lanes and grouping each block independently is exactly
 //! correct: lane l's table holds `count_l(key)`, and
 //!
 //!     sum_l count_l(key) = count(key).
 //!
-//! A Bag1 row therefore probes all c2 tables and sums the c2 retrieved values.
+//! A role-1 row therefore probes all c tables and sums the c retrieved values.
 //! Keys missing from a given lane's table are proven missing by that lane's gap
 //! bracket and contribute 0, exactly as in the single-group circuit. No
-//! ordering, no sentinel and no carry crosses a Bag2 lane boundary: the Bag2
-//! side needs ZERO stitching for the aggregation itself.
+//! ordering, no sentinel and no carry crosses a lane boundary on the child side:
+//! the aggregation itself needs ZERO stitching.
 //!
 //! ONE-PASS OBJ ACROSS LANES
 //! -------------------------
 //! `g_sql4_obj` enforces three conditions of the One-Pass OBJ over a
-//! prover-supplied partition of each bag into a clean part and a residual part.
+//! prover-supplied partition of each ROLE into a clean part and a residual part.
+//! The two partitions stay separate even though there is one tuple group: a row
+//! can be role-2 clean and role-1 dangling, so the two clean SETS differ, and
+//! merging them would make (9) compare a set with itself and collapse the two
+//! channels of (10) into one.
+//!
 //! A condition enforced PER LANE in a way that lets a prover split a violation
 //! across two lanes is not enforced at all, so each one is realized here over
 //! the UNION of the lanes:
 //!
 //!   (7) Conservation, `R == R^c U R^r`.
-//!       The partition is carried as a boolean indicator column on the bag rows
-//!       themselves (`t12_cflag` / `t34_cflag`), and the bit both channels of
-//!       (10) actually read is the folded `ceff = predicate * cflag`. With the
+//!       Each partition is carried as a boolean indicator column on the W rows
+//!       themselves (`cflag1` / `cflag2`), and the bit both channels of (10)
+//!       actually read is the folded `ceff = predicate * cflag`. With the
 //!       partition represented as an indicator ON `R`, `R^c = {r : ceff(r)=1}`
 //!       and `R^r = {r : predicate(r)=1, ceff(r)=0}` are a partition of the
 //!       predicate-passing rows BY CONSTRUCTION, per row and therefore over the
 //!       union of the lanes: there is no second column group that could
 //!       disagree with the bag, and no cross-lane split is expressible.
-//!       `g_sql4_obj` instead lays the partition out as a separate
+//!       `g_sql4_obj` instead lays each partition out as a separate
 //!       [clean | residual | pad] column group and shuffles it against the bag.
 //!       That form is equivalent, but it needs one selector per SECTION, whose
 //!       enabled rows are the true clean and residual counts, i.e. it bakes the
 //!       sensitive quantity this file exists to hide into the verifying key.
-//!       See the note on that at `q_t12_row`.
-//!   (9) Pairwise Consistency, `pi_K(R_i^c) == pi_K(R_j^c)` on the one bag tree
-//!       edge, `K = pack2(A,C)`.
-//!       A lookup's TABLE is a single set of column expressions, so it cannot be
-//!       the union of c2 lane columns: membership in a laned relation has to be
-//!       resolved arithmetically, by combining one per-lane answer per lane.
-//!       That is what the clean channel already does. Every Bag1 row fetches
-//!       `s_cln` from EVERY Bag2 lane, each fetch certified by that lane's
-//!       membership lookup or by its gap bracket, so `sum_l s_cln_l(key)` is the
-//!       number of clean Bag2 tuples with that key over ALL of Bag2. The gate
-//!       `cp: root multiplicities and clean-key consistency` then requires a
-//!       clean Bag1 row to have a nonzero total, which is exactly
-//!       `pi_K(t12^c) subset of pi_K(t34^c)` over the union.
-//!       The MIRROR inclusion is NOT enforced; see "WHAT IS NOT ENFORCED".
+//!       See the note on that at the selector block of `configure`.
+//!   (9) Pairwise Consistency, `pi_K(R_1^c) == pi_K(R_2^c)` on the one bag tree
+//!       edge, `K = pack2(A,C)`. BOTH directions are enforced, by two different
+//!       mechanisms, because both sides are laned and a lookup's TABLE is a
+//!       single set of column expressions, so it cannot be the union of c lane
+//!       columns.
+//!         * `pi_K(R_1^c) subset of pi_K(R_2^c)` rides on the clean channel.
+//!           Every role-1 row fetches `s_cln` from EVERY lane, each fetch
+//!           certified by that lane's membership lookup or by its gap bracket,
+//!           so `sum_l s_cln_l(key)` is the number of clean role-2 tuples with
+//!           that key over ALL of W. The gate `cp: root multiplicities and
+//!           clean-key consistency` then requires a clean role-1 row to have a
+//!           nonzero total, which is the containment over the union.
+//!         * the MIRROR, `pi_K(R_2^c) subset of pi_K(R_1^c)`, is resolved by
+//!           NAMING the hosting lane, the trick `g_sql3_obj_dp` uses for its own
+//!           union direction. Each lane carries c boolean `host` bits per row,
+//!           gated to sum to `ceff2`, so a clean role-2 row names exactly one
+//!           lane and a non-clean row names none; one width-1 lookup per
+//!           (row lane, named lane) pair then checks the named claim against
+//!           that lane's clean role-1 keys. Cost `2c + c^2` advice and `c^2`
+//!           lookups, i.e. P += 2c + 4c^2, against a second per-lane child stage
+//!           plus a second c^2 probe grid, which is the only other way to
+//!           resolve it and would cost roughly two thirds of the whole circuit
+//!           again.
 //!  (10) Cardinality Preservation, `|R^c join| == |R join|`.
-//!       This is the one that must not be per lane. Each Bag1 lane accumulates
-//!       its own `sum_all` and `sum_cln` over its own rows, both from
-//!       multiplicities that already sum over all c2 Bag2 lanes; the c1 pairs of
+//!       This is the one that must not be per lane. Each lane accumulates its
+//!       own `sum_all` and `sum_cln` over its own rows, both from
+//!       multiplicities that already sum over all c child stages; the c pairs of
 //!       lane totals are then copied into the totals stage, added with two
-//!       degree-2 accumulators, and compared by a SINGLE equality at row c1-1.
+//!       degree-2 accumulators, and compared by a SINGLE equality at row c-1.
 //!       A prover moving a hidden tuple's contribution into another lane changes
 //!       one global total and nothing rebalances it.
 //!
 //! `sum_all` is also the ANSWER. `g_sql4_obj` propagates the per-key COUNT twice
 //! (once through an `AggSumByKey` for the aggregate and once through the check's
 //! own child table) and needs a gate to equate them; here the aggregate IS the
-//! input channel of the check, `mu_all = pred * sum_l s_all_l`, so the certified
-//! cardinality is the exposed COUNT by construction and there is nothing to
-//! equate. That also makes this circuit CHEAPER than a laned `AggSumByKey` plus
-//! a laned check would be.
+//! input channel of the check, `mu_all = pred1 * sum_l s_all_l`, so the
+//! certified cardinality is the exposed COUNT by construction and there is
+//! nothing to equate. That also makes this circuit CHEAPER than a laned
+//! `AggSumByKey` plus a laned check would be.
 //!
 //! OCCURRENCE DISTINCTNESS ACROSS LANES
 //! ------------------------------------
-//! The four r1/r2/r3/r4 membership lookups say only that a bag row is SOME
-//! valid wedge occurrence. Every argument downstream is blind to a DUPLICATE:
+//! The two r_in/r_out membership lookups say only that a W row is SOME valid
+//! wedge occurrence. Every argument downstream is blind to a DUPLICATE:
 //! conservation is per row, (9) compares key sets, and (10) is a difference of
-//! two channels, so copying a clean Bag2 tuple into a pad slot inflates
+//! two channels, so copying a clean role-2 tuple into a pad slot inflates
 //! `s_all` and `s_cln` equally and inflates the COUNT with nothing rejecting.
 //! In a laned layout the copy does not even have to stay in the same lane, so a
 //! per-lane distinctness argument would miss it.
 //!
-//! Each bag row therefore carries `oid = pack2(the two source edge ids)` when
-//! its predicate holds and PAD when it does not, and the bag rows are required
-//! to be laid out in GLOBAL oid order: strictly increasing while below PAD, then
+//! Each W row therefore carries `oid = pack2(the two source edge ids)` when its
+//! ROLE-2 keep bit holds and PAD when it does not, and the rows are required to
+//! be laid out in GLOBAL oid order: strictly increasing while below PAD, then
 //! PAD for ever. Two uniform gates per lane say that over adjacent rows inside a
 //! lane, and a `c-1` row boundary stage says it over each lane seam, with the
 //! seam cells brought in by copy constraints (the only cells besides the two
 //! lane sums that ever leave a lane). Concatenating the lanes in lane order, the
 //! whole sequence is strictly increasing until PAD, so all non-PAD oids are
 //! pairwise distinct ACROSS lanes, and the honest edge ids fit 32-bit lanes so
-//! a passing row's oid is always below PAD.
+//! a kept row's oid is always below PAD.
+//!
+//! ONE argument does both roles, over the ROLE-2 keep bit, which is W's own x<y
+//! filter. Role 1's rows are exactly the role-2 rows on which a genuine Lt
+//! certifies [y<z], decided per row by the `role 1 pred = keep * [y<z]` gate, so
+//! distinctness of the role-2 occurrences already gives it for the role-1
+//! subset. Do not weaken that gate without restoring a second ordering.
 //!
 //! Note what this does and does not give. It rules out DUPLICATION, hence any
 //! over-count. It cannot rule out OMISSION: `g_sql4_obj` pins the number of
 //! predicate-passing rows through its partition sections, which is sound there
 //! only because the Revealing-Join-Size regime publishes the true bag size. Here
 //! the true bag size is precisely what the DP release hides, so no in-circuit
-//! row count may depend on it, and bag completeness rests on the DP padding
-//! scheme, which is a prover-side step this circuit deliberately does not
-//! verify.
+//! row count may depend on it. Bag completeness therefore rests on NOTHING, in
+//! or out of circuit: the release publishes an upper-bound capacity and
+//! certifies nothing about the prover filling it. What this circuit proves is
+//! COUNT = |join(S)| for a prover-chosen S contained in W, i.e. COUNT is at most
+//! the true count, where `g_sql4_obj` proves equality because its partition
+//! sections put the kept-row count in the vk. Any claim that the padding scheme
+//! closes this is wrong.
 //!
 //! WHAT IS NOT ENFORCED
 //! --------------------
@@ -147,79 +192,94 @@
 //! enforced, as in `g_sql4_obj`; with the partition carried as an indicator it
 //! is vacuous anyway.
 //!
-//! The mirror half of (9), `pi_K(t34^c) subset of pi_K(t12^c)`, is not
-//! enforced. Resolving it would need the whole message machinery mirrored: a
-//! per-Bag1-lane clean-key child stage plus one probe per (Bag2 lane, Bag1 lane)
-//! pair, i.e. a SECOND `c1 * c2` term, which roughly doubles the circuit that
-//! the header cost note is already apologetic about. The exact residual freedom
-//! it leaves the prover is: a KEPT Bag2 tuple whose separator key carries no
-//! predicate-passing Bag1 tuple may be marked clean. Such a tuple's key is
-//! multiplied by no Bag1 row, so it enters neither channel of (10) and no other
-//! constrained quantity; it cannot move the COUNT, it only means `R^c` is not
-//! fully reduced on the Bag2 end.
-//!
 //! COST NOTE (read before scaling this up)
 //! ---------------------------------------
-//! Probing c2 lane-local tables costs c1 * c2 probe replicas, so the Bag1 side
-//! grows QUADRATICALLY in the lane counts, not linearly. That is inherent to
-//! resolving a PRIVATE key against a table of private size: with c2 separate
-//! tables a lookup argument can only address one of them at a time. It is fine
-//! when one side collapses to a single lane (facebook and wiki at eps = 0.1
-//! give c1 = c2 = 1) and it is roughly break-even against the k+2 jump at
-//! lastfm eps = 0.1 (c1 = 4, c2 = 3). Getting a genuinely linear GQ4 needs a
-//! different join strategy, namely replacing the message table by an in-circuit
-//! sort-merge of the two bags, which is a different circuit rather than a
-//! laned version of this one.
+//! Probing c lane-local tables from c lanes costs c * c probe replicas, so the
+//! circuit is QUADRATIC in the single lane count, not linear. That is inherent
+//! to resolving a PRIVATE key against a table of private size: with c separate
+//! tables a lookup argument can only address one of them at a time. Fitted to
+//! the measured table below,
+//!
+//!   advice   = 56 + 90c + 24c^2
+//!   lookups  = 24 + 42c + 19c^2
+//!   shuffles = 4 + 2c
+//!
+//! so with `P = advice + 3*lookups + shuffles` as a rough proxy for the
+//! prover's column work, P = 431 at c = 1 and 892 at c = 2. The `c^2` terms are
+//! 24 advice and 19 lookups per (row lane, named lane) pair: 23 advice and 18
+//! lookups for the probe replica, 1 advice for the `host` bit and 1 lookup for
+//! the mirror direction of (9).
+//!
+//! The quadratic term CANNOT be removed by sharing. A `cp_agg` stage owns ONE
+//! input column pair, bounded by the 2^k rows of the domain, while W spans
+//! c * lane_rows rows, so each lane must keep its own partial table and every
+//! row needs all c partials. Reducing the c partials to one global table first
+//! would break even only at c = 2 and would release a NEW private statistic, the
+//! number of distinct separator keys, which is exactly what a lane layout exists
+//! to avoid. Getting a genuinely linear GQ4 needs a different join strategy,
+//! namely replacing the message table by an in-circuit sort-merge of the two
+//! readings, which is a different circuit rather than a laned version of this
+//! one.
+//!
+//! At the production cells this is comfortable: eps = 0.1 gives c = 2 on lastfm
+//! (P 892 against the 543 an unlaned k+1 would pay, for half the domain) and
+//! c = 1 on facebook and wiki. At eps = 0.01 lastfm needs c = 63, i.e. 3,969
+//! probe replicas and about 101,000 advice columns, which is not a circuit
+//! anyone should build: that cell wants the sort-merge, not lanes.
 //!
 //! WHAT STAYS SINGLE COPY
 //! ----------------------
 //! Everything whose height is fixed by the PUBLIC edge count: the base Edge
 //! relation (`e_src`, `e_dst`, `e_eid`) and the two indexed views of it
-//! (`in_by_dst`, `out_by_src`), which are the table side of every r1/r2/r3/r4
+//! (`in_by_dst`, `out_by_src`), which are the table side of every r_in/r_out
 //! membership lookup. Their height tracks |E|, which is public in every privacy
-//! regime. Two shuffles tie both views to the base relation, so the four bag
+//! regime. Two shuffles tie both views to the base relation, so the lane
 //! lookups read ONE edge relation instead of two independently invented ones,
-//! and `q_view_tbl` keeps each view's sentinel row out of all four tables.
+//! and `q_view_tbl` keeps each view's sentinel row out of both tables.
 //!
 //! WHERE THE STITCHES ARE
 //! ----------------------
 //! Three, all of them small and all of them cross-lane BY DESIGN:
-//!   * the two channels of (10): c1 pairs of copy constraints into the totals
-//!     stage, two degree-2 accumulators over c1 rows, one equality at row c1-1,
-//!     and `out` at row c1-1 into the instance;
-//!   * the global occurrence ordering: 2*(c1-1) and 2*(c2-1) copy constraints
-//!     into the two boundary stages;
-//!   * nothing else. A Bag2 lane still exports nothing by copy: its two per-key
-//!     sums reach Bag1 through lookups.
+//!   * the two channels of (10): c pairs of copy constraints into the totals
+//!     stage, two degree-2 accumulators over c rows, one equality at row c-1,
+//!     and `out` at row c-1 into the instance;
+//!   * the global occurrence ordering: 2*(c-1) copy constraints into the ONE
+//!     boundary stage;
+//!   * nothing else. A lane's child stage still exports nothing by copy: its two
+//!     per-key sums reach the other lanes through lookups, and the mirror of (9)
+//!     travels through a lookup as well.
 //!
 //! MEASURED STRUCTURE (see `tests::test_max_gate_degree`)
 //! -----------------------------------------------------
-//!   c1=1 c2=1 : advice 207  fixed 3  sel 51  lookups 110  shuf  6  perm 50
-//!   c1=2 c2=1 : advice 276  fixed 3  sel 51  lookups 154  shuf  6  perm 53
-//!   c1=1 c2=2 : advice 300  fixed 3  sel 68  lookups 162  shuf  8  perm 70
-//!   c1=4 c2=3 : advice 738  fixed 3  sel 85  lookups 454  shuf 10  perm 99
-//! so one more Bag1 lane costs 69 advice / 3 permutation columns / 44 lookup
-//! arguments and nothing else, one more Bag2 lane costs 93 advice / 20
-//! permutation columns / 17 selectors / 2 shuffles / 52 lookups, and each probe
-//! pair costs 23 advice and 18 lookups and nothing else.
+//!   c=1 : advice 170  fixed 3  sel 44  lookups  85  shuf  6  perm  47  P  431
+//!   c=2 : advice 332  fixed 3  sel 61  lookups 184  shuf  8  perm  69  P  892
+//!   c=3 : advice 542  fixed 3  sel 78  lookups 321  shuf 10  perm  91  P 1515
+//!   c=4 : advice 800  fixed 3  sel 95  lookups 496  shuf 12  perm 113  P 2300
+//! so one more lane costs 90 advice / 17 selectors / 2 shuffles / 22 permutation
+//! columns / 42 lookup arguments plus its share of the quadratic term, and one
+//! more probe pair costs 24 advice and 19 lookups and NOTHING else: no fixed
+//! column, no selector, no shuffle and no permutation column. Of a lane's 22
+//! permutation columns only three carry a cell out of the lane (`oid`,
+//! `sum_all`, `sum_cln`); the rest are internal to its child stage. The
+//! selectors that do grow are the child stage's own, which `assign_cp_agg`
+//! enables itself.
 //!
-//! Before the OBJ conditions were added this file measured 141 / 580 advice and
-//! 31 / 58 permutation columns at (1,1) / (4,3), so the whole gate -- the two
-//! partitions, the clean channel, condition (9), the global occurrence
-//! ordering, the base Edge relation and its two shuffles -- costs about 27% more
-//! advice at the production cell. Replacing the old `AggSumByKey` + `MapLookup`
-//! pair by the check's own child stage and parent probe is what keeps it that
-//! cheap: the second channel rides along on machinery the aggregate needed
-//! anyway.
+//! Collapsing the two laned bags into this one saved 12 advice / 8 lookups of
+//! shared preamble (the second seam stage) and, per lane, 28 advice / 18 lookups
+//! (the tuple columns, the [x<y] comparator, the occurrence id and its
+//! comparator, and the two membership lookups). The newly enforced mirror half
+//! of (9) then spends 1 advice per lane (`ck1`) and 1 advice + 1 lookup per
+//! pair (the host bit and its lookup), i.e. P += c + 4c^2. Net: P went
+//! 543 -> 431 at c = 1, 1072 -> 892 at c = 2, 1755 -> 1515 at c = 3 and
+//! 2592 -> 2300 at c = 4.
 //!
 //! cs.degree() is 7 for every configuration, the same bound `g_sql4_obj` pays
-//! for its own membership lookup (2 + 3 + 2). `lanes_are_structural_replicas`
-//! locks the shape down as EXACTLY BILINEAR in (c1, c2), which is the privacy
-//! property that every lane of a kind costs the same. Per Bag1 lane the circuit
-//! adds no fixed column, no selector and no shuffle, and exactly three
-//! permutation columns (`sum_all`, `sum_cln`, `t12_oid`); per Bag2 lane it adds
-//! no fixed column; per probe pair it adds no fixed column, no selector, no
-//! shuffle and no permutation column.
+//! for its own membership lookup (2 + 3 + 2); the mirror lookup of (9) is
+//! deliberately shaped to sit at that same 2 + 3 + 2.
+//! `lanes_are_structural_replicas` locks the shape down as EXACTLY QUADRATIC in
+//! c, which is the privacy property that every lane costs the same. Per lane the
+//! circuit adds no fixed column; per probe pair it adds no fixed column, no
+//! selector, no shuffle and no permutation column.
 //!
 //! Row budget per lane, at circuit degree k:
 //!   lane_rows = 2^k - PREAMBLE_ROWS - BLINDING_SLACK
@@ -267,11 +327,10 @@ pub const BASE_DEGREE: u32 = 18;
 /// Usable rows per lane at the default base degree.
 pub const LANE_ROWS: usize = (1usize << BASE_DEGREE) - PREAMBLE_ROWS - BLINDING_SLACK;
 
-/// Public structural cap on either lane count. GQ4 releases at eps = 0.01 run
-/// into the dozens of lanes (gq4-lastfm would need about 145 at k = 18), so
-/// this is deliberately far above q5_obj_dp's cap of 16. Note that the Bag1
-/// side pays c1 * c2 probes, so a config near this cap is sizeable even when
-/// each individual count is legal.
+/// Public structural cap on the lane count. GQ4 releases at eps = 0.01 run
+/// into the dozens of lanes (gq4-lastfm needs 63 at k = 18), so this is
+/// deliberately far above q5_obj_dp's cap of 16. Note that the circuit pays
+/// c * c probes, so a config near this cap is enormous: see the COST NOTE.
 pub const MAX_LANES: usize = 64;
 
 /// Usable rows per lane at circuit degree `k`.
@@ -319,26 +378,24 @@ pub fn lanes_for_capacity(capacity: usize, base_degree: u32) -> usize {
 
 // `Circuit::configure` has no access to the circuit instance (the
 // `circuit-params` feature of halo2 is not enabled in this build), so the
-// caller stamps the PUBLIC lane counts here before keygen / MockProver runs;
+// caller stamps the PUBLIC lane count here before keygen / MockProver runs;
 // `synthesize` asserts the resulting config matches the circuit.
 // Thread-local so parallel tests with different lane counts cannot race.
 thread_local! {
-    static CONFIG_LANES: std::cell::Cell<(usize, usize)> =
-        const { std::cell::Cell::new((1, 1)) };
+    static CONFIG_LANES: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
 }
 
-/// Stamp the (Bag1, Bag2) lane counts the NEXT `configure` call on this thread
-/// lays out.
-pub fn set_config_lanes(bag1_lanes: usize, bag2_lanes: usize) {
-    for c in [bag1_lanes, bag2_lanes] {
-        assert!(
-            (1..=MAX_LANES).contains(&c),
-            "lane count {} outside 1..={}",
-            c,
-            MAX_LANES
-        );
-    }
-    CONFIG_LANES.with(|l| l.set((bag1_lanes, bag2_lanes)));
+/// Stamp the lane count the NEXT `configure` call on this thread lays out.
+/// ONE count: both readings of the 4-cycle live on the same lanes, because they
+/// are the same relation.
+pub fn set_config_lanes(lanes: usize) {
+    assert!(
+        (1..=MAX_LANES).contains(&lanes),
+        "lane count {} outside 1..={}",
+        lanes,
+        MAX_LANES
+    );
+    CONFIG_LANES.with(|l| l.set(lanes));
 }
 
 /// MockProver fault injection used by the negative tests in this file.
@@ -348,62 +405,77 @@ pub fn set_config_lanes(bag1_lanes: usize, bag2_lanes: usize) {
 pub enum Tamper {
     #[default]
     None,
-    /// Bump one Bag1 lane row's input-channel multiplicity by 1 (the root
+    /// Bump one lane row's input-channel multiplicity by 1 (the root
     /// multiplicity gate and that lane's own prefix-sum gates must reject).
     LaneMuAll,
-    /// Bump one Bag1 lane total by 1 (the copy constraint into the totals
-    /// stage and the totals accumulator must both reject).
+    /// Bump one lane total by 1 (the copy constraint into the totals stage and
+    /// the totals accumulator must both reject).
     LaneTotal,
-    /// Break the Bag1 pad-row convention on the last rounding-up row (the
-    /// "bag1 real + key" gate and the r1 membership lookup must reject).
+    /// Break the pad-row convention on the last rounding-up row in a way the
+    /// ROLE-1 key gate sees: it sets `x`, which the role-1 key is packed from,
+    /// so the "role 1 real + key" gate and the r_in membership lookup must both
+    /// reject.
     Bag1PadRow,
-    /// Break the Bag2 pad-row convention on the last rounding-up row (the
-    /// r3 membership lookup must reject).
+    /// Break the pad-row convention on the last rounding-up row in a way ONLY
+    /// the shared indexed views see: it sets `y`, the join column, which no
+    /// per-row gate constrains on a pad row (`real = 0` gates both comparators
+    /// and both keys out), so the two membership lookups are the only thing that
+    /// can reject.
     Bag2PadRow,
     /// Zero the retrieved input-channel value of every probe EXCEPT probe 0,
     /// while leaving the root multiplicity at its honest (all-lane) value. This
     /// is the direct negative test for the cross-lane message sum: if the root
-    /// gate ever stopped summing all `c2` probes, or if a probe's membership
+    /// gate ever stopped summing all `c` probes, or if a probe's membership
     /// lookup were dropped, this witness would verify. It must not.
     DropProbeVal,
-    /// Move one joinable Bag1 tuple to the residual side and re-reduce Bag2
+    /// Move one joinable role-1 tuple to the residual side and re-reduce role 2
     /// around it, so conditions (7) and (9) still hold and only the Cardinality
     /// Preservation Check can see the hidden tuple. The check compares GLOBAL
     /// totals, so it sees it in whichever lane the tuple lives.
     HideOneCleanTuple,
     /// Skip the semijoin reduction and declare every predicate-passing tuple of
-    /// both bags clean, leaving the residual side empty. Both channels of (10)
+    /// both roles clean, leaving the residual side empty. Both channels of (10)
     /// then agree on every row, so only Pairwise Consistency can see the
-    /// dangling Bag1 tuples.
+    /// dangling role-1 tuples.
     MarkAllClean,
-    /// Copy the first kept Bag2 occurrence over the FIRST row of the LAST Bag2
-    /// lane. Both copies pass all four membership lookups and both channels of
-    /// (10) move by the same amount, and every lane's own occurrence block stays
-    /// sorted, so the ONLY constraint that can see the duplicate is the lane
-    /// seam of the global ordering. A per-lane ordering would accept it.
+    /// Copy the first kept occurrence over the FIRST row of the LAST lane. Both
+    /// copies pass both membership lookups and both channels of (10) move by the
+    /// same amount, and every lane's own occurrence block stays sorted, so the
+    /// ONLY constraint that can see the duplicate is the lane seam of the global
+    /// ordering. A per-lane ordering would accept it.
     DuplicateOccurrenceAcrossLanes,
+    /// Point one clean role-2 row's host bit at a lane that does NOT hold a
+    /// clean role-1 row with its key. Exactly one bit is still set, so the
+    /// "hosted by exactly one lane" gate still passes and only the mirror
+    /// lookup of condition (9) can see it. Without this the host bits would be
+    /// free advice and the mirror direction would be vacuous.
+    MisnameHostLane,
 }
 
 // ---------------------------------------------------------------------------
-// Bag rows, in the order the global occurrence ordering requires.
+// W rows, in the order the global occurrence ordering requires.
 // ---------------------------------------------------------------------------
 
-/// One bag row as the circuit sees it. Bag1: `(A,B,C,i_r1,j_r2,r1_eid,r2_eid,
-/// real)`. Bag2: `(C,D,A,i_r3,j_r4,r3_eid,r4_eid,real)`.
+/// One row of the shared relation W as the circuit sees it:
+/// `(x,y,z,i,j,e1,e2,real)`. Read as (A,B,C) it is the path A->B->C (role 1),
+/// read as (C,D,A) it is the path C->D->A (role 2).
 pub(crate) type BagRow = [u64; 8];
 
-/// Bag1's per-row predicate bit, `real * [A<B] * [B<C]`.
-pub(crate) fn bag1_pred(r: &BagRow) -> u64 {
+/// The ROLE-1 predicate bit, `real * [x<y] * [y<z]`, i.e. `[A<B] * [B<C]`.
+/// Structurally this is `role2_keep * [y<z]`, which is the form the circuit
+/// gate uses and the form the single occurrence ordering relies on.
+pub(crate) fn role1_pred(r: &BagRow) -> u64 {
     (r[7] == 1 && r[0] < r[1] && r[1] < r[2]) as u64
 }
 
-/// Bag2's per-row predicate bit, `real * [C<D]`.
-pub(crate) fn bag2_keep(r: &BagRow) -> u64 {
+/// The ROLE-2 keep bit, `real * [x<y]`, i.e. `[C<D]`. This is W's own filter,
+/// so it holds on every real row and fails on every pad row.
+pub(crate) fn role2_keep(r: &BagRow) -> u64 {
     (r[7] == 1 && r[0] < r[1]) as u64
 }
 
-/// The occurrence id of a bag row: `pack2` of the two source edge ids when the
-/// row's predicate holds, PAD when it does not.
+/// The occurrence id of a W row: `pack2` of the two source edge ids when the
+/// ROLE-2 keep bit holds, PAD when it does not.
 pub(crate) fn bag_oid(r: &BagRow, keep: u64) -> u64 {
     if keep == 1 {
         pack2(r[5], r[6])
@@ -412,35 +484,26 @@ pub(crate) fn bag_oid(r: &BagRow, keep: u64) -> u64 {
     }
 }
 
-/// Bag1 over the whole released capacity, in the global occurrence-id order the
-/// distinctness argument requires: predicate-passing rows first, ordered by
-/// occurrence id, then the real rows that fail the predicate, then padding.
-pub(crate) fn bag1_rows(
-    t12: &[(u64, u64, u64, u64, u64, u64, u64)],
+/// W over the whole released capacity, in the global occurrence-id order the
+/// distinctness argument requires.
+///
+/// The sort key is the ROLE-2 occurrence id, and the role-2 keep bit is W's own
+/// x<y filter, so EVERY real row carries a real id and the PAD tail is exactly
+/// the pad rows. Role 1 needs no ordering of its own: its rows are the role-2
+/// rows that also satisfy [y<z], a subset determined per row by the
+/// "role 1 pred = keep * [y<z]" gate, so distinctness of the role-2 occurrences
+/// carries over to them.
+pub(crate) fn w_rows(
+    w: &[(u64, u64, u64, u64, u64, u64, u64)],
     capacity: usize,
 ) -> Vec<BagRow> {
-    let mut rows: Vec<BagRow> = t12
+    let mut rows: Vec<BagRow> = w
         .iter()
-        .map(|&(a, b, c, i1, j2, e1, e2)| [a, b, c, i1, j2, e1, e2, 1])
+        .map(|&(x, y, z, i, j, e1, e2)| [x, y, z, i, j, e1, e2, 1])
         .collect();
     rows.truncate(capacity);
     rows.resize(capacity, [0u64; 8]);
-    rows.sort_by_key(|r| bag_oid(r, bag1_pred(r)));
-    rows
-}
-
-/// Bag2 over the whole released capacity, same ordering convention.
-pub(crate) fn bag2_rows(
-    t34: &[(u64, u64, u64, u64, u64, u64, u64)],
-    capacity: usize,
-) -> Vec<BagRow> {
-    let mut rows: Vec<BagRow> = t34
-        .iter()
-        .map(|&(c, d, a, i3, j4, e3, e4)| [c, d, a, i3, j4, e3, e4, 1])
-        .collect();
-    rows.truncate(capacity);
-    rows.resize(capacity, [0u64; 8]);
-    rows.sort_by_key(|r| bag_oid(r, bag2_keep(r)));
+    rows.sort_by_key(|r| bag_oid(r, role2_keep(r)));
     rows
 }
 
@@ -459,74 +522,102 @@ pub struct OidBoundaryConfig<F: Field + Ord> {
     q: Selector,
 }
 
-/// One Bag2 lane: the T34 column group, the prover's partition of this lane's
-/// block, its occurrence id, and the CHILD stage of the single bag tree edge,
-/// which publishes both per-key sums for this block.
+/// The part of a lane that pass 1 of `configure_w_lane` lays out: the tuple
+/// columns, both column ROLES of them, the occurrence id and the child stage.
+/// A lane's probes cannot be built yet, because they must reference EVERY
+/// lane's child stage, so they come in pass 2.
 #[derive(Clone, Debug)]
-pub struct Bag2LaneConfig<F: Field + Ord> {
-    // Bag2 rows: C->D->A, plus the source-edge ids and per-group indices
-    t34_c: Column<Advice>,
-    t34_d: Column<Advice>,
-    t34_a: Column<Advice>,
-    t34_i_r3: Column<Advice>,
-    t34_j_r4: Column<Advice>,
-    t34_r3_eid: Column<Advice>,
-    t34_r4_eid: Column<Advice>,
-    t34_real: Column<Advice>,
+struct WLaneRows<F: Field + Ord> {
+    // W rows: x->y->z with x<y, plus the source-edge ids and per-group indices.
+    // (A,B,C) is the role-1 reading and (C,D,A) the role-2 reading of the SAME
+    // eight columns.
+    w_x: Column<Advice>,
+    w_y: Column<Advice>,
+    w_z: Column<Advice>,
+    w_i: Column<Advice>,
+    w_j: Column<Advice>,
+    w_e1: Column<Advice>,
+    w_e2: Column<Advice>,
+    w_real: Column<Advice>,
 
-    // ordering predicate C<D (a Bag2 row only sends a message when C<D)
-    lt_cd: LtConfig<F, NUM_BYTES>,
+    // [x<y], which is role 1's [A<B] and role 2's [C<D] at once, and [y<z],
+    // which is role 1's [B<C]. One comparator each, not one per role.
+    lt_xy: LtConfig<F, NUM_BYTES>,
+    lt_yz: LtConfig<F, NUM_BYTES>,
 
-    // condition (7): the predicate bit, the separator key, the prover's clean
-    // indicator, and the folded `keep * cflag` both channels read
-    t34_keep: Column<Advice>,
-    t34_key: Column<Advice>,
-    t34_cflag: Column<Advice>,
-    t34_ceff: Column<Advice>,
+    // ROLE 2 and condition (7) on it: the keep bit, the separator key
+    // pack2(z,x) (PAD on a row that is not kept, and a PAD key never reaches
+    // the child table), the prover's clean indicator, the folded `keep * cflag`
+    // both channels read, and `ceff2 * key2` for the mirror half of (9).
+    keep2: Column<Advice>,
+    key2: Column<Advice>,
+    cflag2: Column<Advice>,
+    ceff2: Column<Advice>,
 
-    // occurrence id and its within-lane ordering
-    t34_oid: Column<Advice>,
+    // ROLE 1 and condition (7) on it: the separator key pack2(x,z) REVERSED
+    // against role 2's, the predicate bit `keep2 * [y<z]`, this role's own
+    // clean indicator, the folded `pred * cflag`, and `ceff1 * key1`, which is
+    // the table side of the mirror half of (9).
+    key1: Column<Advice>,
+    pred1: Column<Advice>,
+    cflag1: Column<Advice>,
+    ceff1: Column<Advice>,
+    ck1: Column<Advice>,
+
+    // occurrence id and its within-lane ordering, over the ROLE-2 keep bit
+    oid: Column<Advice>,
     iz_oid_pad: IsZeroConfig<F>,
     lt_oid: LtConfig<F, NUM_BYTES>,
 
-    // child side of the bag tree edge: per key, (sum keep, sum keep*cflag)
+    // child side of the bag tree edge over the ROLE-2 reading: per key,
+    // (sum keep2, sum ceff2)
     cp: CpAggConfig<F, NUM_BYTES>,
 }
 
-/// One Bag1 lane: the T12 column group, its own partition, its occurrence id,
-/// one parent probe per Bag2 lane, and a LANE-LOCAL prefix sum of each channel.
-/// `out` is NOT replicated; it lives once in the cross-lane totals stage.
+/// One lane: everything in [`WLaneRows`], plus one parent probe per lane, the
+/// host bits of the mirror half of (9), and a LANE-LOCAL prefix sum of each
+/// channel. `out` is NOT replicated; it lives once in the cross-lane totals
+/// stage.
 #[derive(Clone, Debug)]
-pub struct Bag1LaneConfig<F: Field + Ord> {
-    // Bag1 rows: A->B->C, plus the source-edge ids and per-group indices
-    t12_a: Column<Advice>,
-    t12_b: Column<Advice>,
-    t12_c: Column<Advice>,
-    t12_i_r1: Column<Advice>,
-    t12_j_r2: Column<Advice>,
-    t12_r1_eid: Column<Advice>,
-    t12_r2_eid: Column<Advice>,
-    t12_real: Column<Advice>,
+pub struct WLaneConfig<F: Field + Ord> {
+    w_x: Column<Advice>,
+    w_y: Column<Advice>,
+    w_z: Column<Advice>,
+    w_i: Column<Advice>,
+    w_j: Column<Advice>,
+    w_e1: Column<Advice>,
+    w_e2: Column<Advice>,
+    w_real: Column<Advice>,
 
-    // ordering predicates A<B and B<C
-    lt_ab: LtConfig<F, NUM_BYTES>,
-    lt_bc: LtConfig<F, NUM_BYTES>,
+    lt_xy: LtConfig<F, NUM_BYTES>,
+    lt_yz: LtConfig<F, NUM_BYTES>,
 
-    // separator key, folded predicate bit, and condition (7)'s two indicators
-    t12_key: Column<Advice>,
-    t12_pred: Column<Advice>,
-    t12_cflag: Column<Advice>,
-    t12_ceff: Column<Advice>,
+    keep2: Column<Advice>,
+    key2: Column<Advice>,
+    cflag2: Column<Advice>,
+    ceff2: Column<Advice>,
 
-    // occurrence id and its within-lane ordering
-    t12_oid: Column<Advice>,
+    key1: Column<Advice>,
+    pred1: Column<Advice>,
+    cflag1: Column<Advice>,
+    ceff1: Column<Advice>,
+    ck1: Column<Advice>,
+
+    oid: Column<Advice>,
     iz_oid_pad: IsZeroConfig<F>,
     lt_oid: LtConfig<F, NUM_BYTES>,
 
-    // membership-or-gap probe of the child table, ONE PER BAG2 LANE. Counts add
-    // across a partition, so the row's two multiplicities are the sums of the
-    // c2 retrieved values.
+    cp: CpAggConfig<F, NUM_BYTES>,
+
+    // membership-or-gap probe of the child table, ONE PER LANE, including this
+    // lane's own. Counts add across a partition, so the row's two
+    // multiplicities are the sums of the c retrieved values.
     probes: Vec<CpJoinConfig<F, NUM_BYTES>>,
+
+    // condition (9), mirror direction: `host[l]` is the prover's claim that
+    // lane l holds a clean role-1 row with this row's role-2 key. Boolean, and
+    // gated to sum to `ceff2`, so a non-clean row names no lane.
+    host: Vec<Column<Advice>>,
 
     // the two root multiplicities and their lane-local prefix sums. `mu_all` is
     // both the answer's per-row contribution and the input channel of (10).
@@ -535,7 +626,7 @@ pub struct Bag1LaneConfig<F: Field + Ord> {
     sum_all: Column<Advice>,
     sum_cln: Column<Advice>,
 
-    // is the clean multiplicity fetched from ALL Bag2 lanes zero? condition (9)
+    // is the clean multiplicity fetched from ALL lanes zero? condition (9)
     iz_cln: IsZeroConfig<F>,
 }
 
@@ -545,7 +636,7 @@ pub struct Gq4DpConfig<F: Field + Ord> {
 
     // ---------------- fixed-height sections (shared, never laned) ----------
     // The base Edge relation, and the two indexed views projected from it. The
-    // views are the table side of every r1/r2/r3/r4 membership lookup; their
+    // views are the table side of every r_in/r_out membership lookup; their
     // height tracks |E|, which is public in every regime.
     e_eid: Column<Advice>,
     e_src: Column<Advice>,
@@ -553,50 +644,46 @@ pub struct Gq4DpConfig<F: Field + Ord> {
     in_by_dst: IndexedViewConfig<F>,  // key=dst, val=src
     out_by_src: IndexedViewConfig<F>, // key=src, val=dst
 
-    /// Table-side gate of the four bag lookups, enabled on exactly the n_base
-    /// real rows of both views. See `configure_bag2_lane` for why.
+    /// Table-side gate of the two lane lookups, enabled on exactly the n_base
+    /// real rows of both views. See `configure_w_lane_rows` for why.
     q_view_tbl: Selector,
 
     /// Both views are the base relation's (src, dst, eid) multiset.
     perm_edge_out: PermAnyConfig,
     perm_edge_in: PermAnyConfig,
 
-    /// One u8 range table for EVERY lane Lt chip, of either kind. `load` costs
-    /// one 256-row region per distinct u8 column, and that must not grow with
-    /// the lane counts.
+    /// One u8 range table for EVERY lane Lt chip. `load` costs one 256-row
+    /// region per distinct u8 column, and that must not grow with the lane
+    /// count.
     lane_u8: Column<Fixed>,
 
-    // ---------------- Bag2 lanes ------------------------------------------
-    // All Bag2 lanes are active on the SAME rows 0..lane_rows, so one selector
-    // of each kind serves every lane; only the columns replicate. (The
-    // per-lane child stages keep their own selectors, since `assign_cp_agg`
-    // enables them itself.)
-    bag2_lanes: Vec<Bag2LaneConfig<F>>,
-    q_t34_lookup: Selector, // r3/r4 membership lookups (complex)
-    q_t34_flag: Selector,
-    q_cd: Selector,
-    q_t34_row: Selector,
-
-    // ---------------- Bag1 lanes ------------------------------------------
-    bag1_lanes: Vec<Bag1LaneConfig<F>>,
-    q_t12_lookup: Selector, // r1/r2 membership lookups (complex)
-    q_t12_key: Selector,
-    q_t12_row: Selector,
-    q_order12: Selector,
+    // ---------------- the lanes -------------------------------------------
+    // All lanes are active on the SAME rows 0..lane_rows, so one selector of
+    // each kind serves every lane and every probe; only the columns replicate.
+    // (The per-lane child stages keep their own selectors, since
+    // `assign_cp_agg` enables them itself.)
+    lanes: Vec<WLaneConfig<F>>,
+    /// Complex, enabled on exactly a lane's rows. It gates the INPUT side of the
+    /// two membership lookups and BOTH sides of the mirror half of (9): the
+    /// mirror's table side must be gated by a complex selector covering exactly
+    /// the owning lane's rows, or the rows past the lane would be free advice
+    /// minting table entries.
+    q_w_lookup: Selector,
+    /// Every per-row gate of both roles, and the two comparators.
+    q_w_row: Selector,
     // The two probe selectors are not repeated here: every probe carries them,
     // and `assign_probe` enables them through the probe it is assigning.
-    q_mu: Selector,   // the two root multiplicities, and condition (9)
-    q_sum0: Selector, // lane-local prefix sums, row 0 of every Bag1 lane
+    q_mu: Selector,   // root multiplicities, condition (9), the host bits
+    q_sum0: Selector, // lane-local prefix sums, row 0 of every lane
     q_sum: Selector,  // lane-local prefix sums, rows 1..lane_rows
 
     // ---------------- global occurrence ordering ---------------------------
-    // Shared by both kinds of lane: they are live on the same rows.
     q_oid_step: Selector,
-    /// `[Bag1, Bag2]`: the lane-seam link of each bag's ordering.
-    oid_bnd: Vec<OidBoundaryConfig<F>>,
+    /// The lane-seam link of the ONE ordering. Both roles ride on it.
+    oid_bnd: OidBoundaryConfig<F>,
 
     // ---------------- cross-lane totals ------------------------------------
-    // Row l holds Bag1 lane l's two channel totals, by copy constraint. This is
+    // Row l holds lane l's two channel totals, by copy constraint. This is
     // where condition (10) is compared and where the answer comes from.
     lane_tot: Column<Advice>,
     cln_tot: Column<Advice>,
@@ -707,12 +794,12 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         }
     }
 
-    /// The parent side of one (Bag1 lane, Bag2 lane) probe.
+    /// The parent side of one (row lane, child lane) probe.
     ///
     /// This is `card_preserve::configure_cp_join` with two changes a replicated
     /// caller needs. The two selectors are supplied rather than allocated, since
-    /// all c1*c2 probes are live on the same rows and a selector per probe would
-    /// make the selector count carry a c1*c2 term. And the five columns are kept
+    /// all c*c probes are live on the same rows and a selector per probe would
+    /// make the selector count carry a c^2 term. And the five columns are kept
     /// OUT of the permutation argument: halo2 charges for every column in it
     /// whether or not a copy constraint touches it, and nothing copies a probe
     /// cell.
@@ -781,38 +868,48 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         }
     }
 
-    /// One full structural replica of the Bag2 column group, its partition and
-    /// its child stage. Every Bag2 lane gets the same gates and the same
-    /// lookups; only the columns differ.
-    #[allow(clippy::too_many_arguments)]
-    fn configure_bag2_lane(
+    /// PASS 1 of one lane: the tuple columns, the two membership lookups, the
+    /// two comparators, both column ROLES with their partitions, the occurrence
+    /// id and the child stage of the bag tree edge.
+    ///
+    /// It stops there because a lane's probes must reference EVERY lane's child
+    /// stage, including the ones not built yet, so the probes and everything
+    /// that reads them are pass 2 (`configure_w_lane_probes`).
+    ///
+    /// Every lane gets the same gates and the same lookups; only the columns
+    /// differ.
+    fn configure_w_lane_rows(
         meta: &mut ConstraintSystem<F>,
         in_by_dst: &IndexedViewConfig<F>,
         out_by_src: &IndexedViewConfig<F>,
         lane_u8: Column<Fixed>,
-        q_view_tbl: Selector,
-        q_t34_lookup: Selector,
-        q_t34_flag: Selector,
-        q_cd: Selector,
-        q_t34_row: Selector,
-        q_oid_step: Selector,
-    ) -> Bag2LaneConfig<F> {
-        let t34_c = meta.advice_column();
-        let t34_d = meta.advice_column();
-        let t34_a = meta.advice_column();
-        let t34_i_r3 = meta.advice_column();
-        let t34_j_r4 = meta.advice_column();
-        let t34_r3_eid = meta.advice_column();
-        let t34_r4_eid = meta.advice_column();
-        let t34_real = meta.advice_column();
+        sel: &WSelectors,
+    ) -> WLaneRows<F> {
+        let WSelectors {
+            q_view_tbl,
+            q_w_lookup,
+            q_w_row,
+            q_oid_step,
+            ..
+        } = *sel;
+
+        let w_x = meta.advice_column();
+        let w_y = meta.advice_column();
+        let w_z = meta.advice_column();
+        let w_i = meta.advice_column();
+        let w_j = meta.advice_column();
+        let w_e1 = meta.advice_column();
+        let w_e2 = meta.advice_column();
+        let w_real = meta.advice_column();
         // NOTE: no `enable_equality` on the tuple columns. halo2 charges for
         // every column in the permutation argument whether or not a copy
         // constraint ever touches it, so a per-lane column that is only read by
-        // gates and lookups must stay out of it. The only Bag2 lane cells that
-        // are ever copied are the two ends of `t34_oid`, for the lane seam.
+        // gates and lookups must stay out of it. The only lane cells that are
+        // ever copied are the two ends of `oid`, for the lane seam, and the last
+        // cell of each of the two channel prefix sums, for the totals stage.
 
-        // The table side of the four bag lookups is gated by `q_view_tbl`, over
-        // exactly the n_base real rows of both views.
+        // The table side of the two membership lookups is gated by
+        // `q_view_tbl`, over exactly the n_base real rows of both views.
         //
         // Each `IndexedView` carries a sentinel row at `n_base` for the
         // Rotation::next() of its own sortedness gate. That row is outside the
@@ -822,347 +919,371 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         // table side that sentinel is a LIVE table row, so a prover can mint an
         // edge the relation does not contain: set out_by_src's sentinel to
         // (key = D, idx = 0, val = A0, eid = anything) with D above every real
-        // src, and a Bag2 row (C0, D, A0) then passes "bag2 r4 from out_by_src"
-        // for an r4 = D->A0 edge that exists nowhere.
+        // src, and a W row (x = C0, y = D, z = A0) then passes
+        // "W r_out from out_by_src" for an r_out = D->A0 edge that exists
+        // nowhere.
         //
         // On the ungated rows every table expression reads 0, so the tuple
-        // (0,0,0,0) is in the table, which is what the padded bag rows look up
+        // (0,0,0,0) is in the table, which is what the padded W rows look up
         // anyway, and it is a real row of both views regardless: base row 0 is
         // the (0,0,0) dummy edge with idx 0. The table side goes from degree 1
         // to degree 2, so these lookups go from 2+2+1 = 5 to 2+2+2 = 6, still
         // under the 2+3+2 = 7 the check's own membership lookup costs, and
         // cs.degree() does not move.
-        meta.lookup_any("bag2 r3 from in_by_dst", |m| {
-            let q = m.query_selector(q_t34_lookup);
+        //
+        // TWO lookups, not four. In W coordinates the role-2 pair is literally
+        // the role-1 pair: role 2's incoming edge is (y, i) -> (x, e1) against
+        // in_by_dst and its outgoing edge is (y, j) -> (z, e2) against
+        // out_by_src, the same cells of the same row against the same two
+        // views. Reading the row as (C,D,A) instead of (A,B,C) renames the
+        // columns and changes nothing a lookup can see. The `r_out` lookup is
+        // also the closing-edge check of the cycle: `val` is `w_z`, so the edge
+        // that closes the 4-cycle in the role-2 reading is proven to exist by
+        // the same lookup that produces its endpoint.
+        //
+        // r_in via InByDst: key=y, idx=i -> val=x, eid=e1
+        meta.lookup_any("W r_in from in_by_dst", |m| {
+            let q = m.query_selector(q_w_lookup);
             let t = m.query_selector(q_view_tbl);
             vec![
                 (
-                    q.clone() * m.query_advice(t34_d, Rotation::cur()),
+                    q.clone() * m.query_advice(w_y, Rotation::cur()),
                     t.clone() * m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t34_i_r3, Rotation::cur()),
+                    q.clone() * m.query_advice(w_i, Rotation::cur()),
                     t.clone() * m.query_advice(in_by_dst.idx, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t34_c, Rotation::cur()),
+                    q.clone() * m.query_advice(w_x, Rotation::cur()),
                     t.clone() * m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
                 ),
                 (
-                    q * m.query_advice(t34_r3_eid, Rotation::cur()),
+                    q * m.query_advice(w_e1, Rotation::cur()),
                     t * m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
                 ),
             ]
         });
-        // r4 via OutBySrc: key=D, idx=j_r4 -> val=A, eid=r4_eid  (r4 is D->A).
-        // This is also the closing-edge check: `val` is t34_a, so the edge
-        // D->A that closes the cycle is proven to exist by the same lookup
-        // that produces A.
-        meta.lookup_any("bag2 r4 from out_by_src", |m| {
-            let q = m.query_selector(q_t34_lookup);
+        // r_out via OutBySrc: key=y, idx=j -> val=z, eid=e2
+        meta.lookup_any("W r_out from out_by_src", |m| {
+            let q = m.query_selector(q_w_lookup);
             let t = m.query_selector(q_view_tbl);
             vec![
                 (
-                    q.clone() * m.query_advice(t34_d, Rotation::cur()),
+                    q.clone() * m.query_advice(w_y, Rotation::cur()),
                     t.clone() * m.query_advice(out_by_src.sorted_key, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t34_j_r4, Rotation::cur()),
+                    q.clone() * m.query_advice(w_j, Rotation::cur()),
                     t.clone() * m.query_advice(out_by_src.idx, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t34_a, Rotation::cur()),
+                    q.clone() * m.query_advice(w_z, Rotation::cur()),
                     t.clone() * m.query_advice(out_by_src.sorted_val, Rotation::cur()),
                 ),
                 (
-                    q * m.query_advice(t34_r4_eid, Rotation::cur()),
+                    q * m.query_advice(w_e2, Rotation::cur()),
                     t * m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
                 ),
             ]
         });
 
-        meta.create_gate("bag2 real boolean", |m| {
-            let q = m.query_selector(q_t34_flag);
-            let real = m.query_advice(t34_real, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            vec![q * real.clone() * (one - real)]
-        });
-
-        // ordering in Bag2: C < D, enabled only if real=1
-        let lt_cd = LtChip::<F, NUM_BYTES>::configure_with_u8(
+        // The two order checks of the row, enabled only if real=1. `lt_xy`
+        // compares (x,y), which is role 1's [A<B] and role 2's [C<D] at once,
+        // and `lt_yz` compares (y,z), which is role 1's [B<C]. Two chips, not
+        // three: the separate role-2 comparator had operands (t34_c, t34_d) =
+        // (x, y) and so was the same predicate on the same cells as `lt_xy`.
+        let lt_xy = LtChip::<F, NUM_BYTES>::configure_with_u8(
             meta,
             lane_u8,
-            |m| m.query_selector(q_cd) * m.query_advice(t34_real, Rotation::cur()),
-            |m| m.query_advice(t34_c, Rotation::cur()),
-            |m| m.query_advice(t34_d, Rotation::cur()),
+            |m| m.query_selector(q_w_row) * m.query_advice(w_real, Rotation::cur()),
+            |m| m.query_advice(w_x, Rotation::cur()),
+            |m| m.query_advice(w_y, Rotation::cur()),
+        );
+        let lt_yz = LtChip::<F, NUM_BYTES>::configure_with_u8(
+            meta,
+            lane_u8,
+            |m| m.query_selector(q_w_row) * m.query_advice(w_real, Rotation::cur()),
+            |m| m.query_advice(w_y, Rotation::cur()),
+            |m| m.query_advice(w_z, Rotation::cur()),
         );
 
-        // ---- condition (7) on this lane's block of Bag2 ----
-        // `keep` is the predicate bit, `key` the separator key on the kept rows
-        // and PAD elsewhere (a PAD key never reaches the child table), `cflag`
-        // the prover's clean indicator and `ceff = keep * cflag` the bit the
+        // ---- ROLE 2 and condition (7) on it ----
+        // `keep2` is the role-2 predicate bit, which is W's own x<y filter;
+        // `key2` the separator key pack2(A,C) = pack2(z,x) on the kept rows and
+        // PAD elsewhere (a PAD key never reaches the child table); `cflag2` the
+        // prover's clean indicator and `ceff2 = keep2 * cflag2` the bit the
         // clean channel reads. `g_sql4_obj` had no booleanity gate on the
         // indicator at all; without it a fractional "indicator" would scale the
-        // clean channel freely. And `ceff` is what forces the indicator to 0
+        // clean channel freely. And `ceff2` is what forces the indicator to 0
         // wherever the predicate fails, so a row that is not in R cannot be in
-        // R^c.
-        let t34_keep = meta.advice_column();
-        let t34_key = meta.advice_column();
-        let t34_cflag = meta.advice_column();
-        let t34_ceff = meta.advice_column();
+        // R^c. `ck1 = ceff1 * key1` is the table side of the mirror half of (9),
+        // folded into a column so that the lookup input stays at degree 3.
+        //
+        // The keep bit is real * [x<y], NOT the role-1 predicate. Aggregating
+        // over the role-1 predicate would make the message count only rows that
+        // also satisfy [y<z], i.e. it would silently require D<A on the C->D->A
+        // path and change the answer.
+        let keep2 = meta.advice_column();
+        let key2 = meta.advice_column();
+        let cflag2 = meta.advice_column();
+        let ceff2 = meta.advice_column();
 
-        meta.create_gate("bag2 keep, separator key and clean partition", |m| {
-            let q = m.query_selector(q_t34_row);
+        meta.create_gate("role 2 keep, separator key and clean partition", |m| {
+            let q = m.query_selector(q_w_row);
             let one = Expression::Constant(F::ONE);
             let pad = Expression::Constant(F::from(PAD_U64));
 
-            let real = m.query_advice(t34_real, Rotation::cur());
-            let cd = lt_cd.is_lt(m, None);
-            let keep = m.query_advice(t34_keep, Rotation::cur());
-            let key = m.query_advice(t34_key, Rotation::cur());
-            let cf = m.query_advice(t34_cflag, Rotation::cur());
-            let ce = m.query_advice(t34_ceff, Rotation::cur());
+            let real = m.query_advice(w_real, Rotation::cur());
+            let xy = lt_xy.is_lt(m, None);
+            let keep = m.query_advice(keep2, Rotation::cur());
+            let key = m.query_advice(key2, Rotation::cur());
+            let cf = m.query_advice(cflag2, Rotation::cur());
+            let ce = m.query_advice(ceff2, Rotation::cur());
 
-            let key_expr = m.query_advice(t34_a, Rotation::cur())
+            // pack2(A,C) = pack2(z,x), REVERSED against role 1's pack2(x,z) on
+            // the SAME two cells of the SAME row. That reversal is the whole
+            // mechanism: M(p,q) = |{w in W : x = p, z = q}| is aggregated on
+            // pack2(z,x) and probed on pack2(x,z).
+            let key_expr = m.query_advice(w_z, Rotation::cur())
                 * Expression::Constant(F::from(PACK_SHIFT))
-                + m.query_advice(t34_c, Rotation::cur());
+                + m.query_advice(w_x, Rotation::cur());
 
             vec![
-                q.clone() * (keep.clone() - real * cd),
+                q.clone() * (keep.clone() - real * xy),
                 q.clone()
-                    * (key - (keep.clone() * key_expr + (one.clone() - keep.clone()) * pad)),
+                    * (key.clone() - (keep.clone() * key_expr + (one.clone() - keep.clone()) * pad)),
                 q.clone() * cf.clone() * (one - cf.clone()),
-                q * (ce - keep * cf),
+                q * (ce.clone() - keep * cf),
             ]
         });
 
-        // ---- occurrence id ----
-        let t34_oid = meta.advice_column();
-        meta.enable_equality(t34_oid);
-        meta.create_gate("occ: bag2 id = pack2(edge ids), PAD when not kept", |m| {
-            let q = m.query_selector(q_t34_row);
+        // ---- ROLE 1 and condition (7) on it ----
+        // `key1` is the probe key pack2(A,C) = pack2(x,z) FORWARD, pinned on
+        // every row (a padding row's tuple is all zero, so its key is 0, which
+        // is the dummy row of every child table and carries both sums 0).
+        // `pred1` folds the three-factor predicate into a column so that every
+        // gate below stays at degree <= 4, and is stated STRUCTURALLY as
+        // `keep2 * [y<z]` on top of the role-2 bit rather than as
+        // real * [x<y] * [y<z]. Beyond dropping a degree, that form is what
+        // licenses the SINGLE occurrence-distinctness argument: role 1's rows
+        // are exactly the role-2 rows that also pass a genuine Lt on (y,z),
+        // decided per row. Do not weaken this gate without restoring a second
+        // ordering.
+        let key1 = meta.advice_column();
+        let pred1 = meta.advice_column();
+        let cflag1 = meta.advice_column();
+        let ceff1 = meta.advice_column();
+        let ck1 = meta.advice_column();
+
+        meta.create_gate("role 1 real + key", |m| {
+            let q = m.query_selector(q_w_row);
+            let one = Expression::Constant(F::ONE);
+            let real = m.query_advice(w_real, Rotation::cur());
+            let key_expr = m.query_advice(w_x, Rotation::cur())
+                * Expression::Constant(F::from(PACK_SHIFT))
+                + m.query_advice(w_z, Rotation::cur());
+            vec![
+                q.clone() * real.clone() * (one - real),
+                q * (m.query_advice(key1, Rotation::cur()) - key_expr),
+            ]
+        });
+
+        meta.create_gate("role 1 pred = keep * [y<z], and clean partition", |m| {
+            let q = m.query_selector(q_w_row);
+            let one = Expression::Constant(F::ONE);
+            let keep = m.query_advice(keep2, Rotation::cur());
+            let yz = lt_yz.is_lt(m, None);
+            let pred = m.query_advice(pred1, Rotation::cur());
+            let cf = m.query_advice(cflag1, Rotation::cur());
+            let ce = m.query_advice(ceff1, Rotation::cur());
+            vec![
+                q.clone() * (pred.clone() - keep * yz),
+                q.clone() * cf.clone() * (one - cf.clone()),
+                q.clone() * (ce.clone() - pred * cf),
+                // the TABLE side of the mirror half of (9): the clean role-1
+                // keys of this lane, 0 on every other row
+                q * (m.query_advice(ck1, Rotation::cur())
+                    - ce * m.query_advice(key1, Rotation::cur())),
+            ]
+        });
+
+        // ---- occurrence id, over the ROLE-2 keep bit ----
+        let oid = meta.advice_column();
+        meta.enable_equality(oid);
+        meta.create_gate("occ: id = pack2(edge ids), PAD when not kept", |m| {
+            let q = m.query_selector(q_w_row);
             let one = Expression::Constant(F::ONE);
             let pad = Expression::Constant(F::from(PAD_U64));
-            let keep = m.query_advice(t34_keep, Rotation::cur());
-            let id = m.query_advice(t34_r3_eid, Rotation::cur())
+            let keep = m.query_advice(keep2, Rotation::cur());
+            let id = m.query_advice(w_e1, Rotation::cur())
                 * Expression::Constant(F::from(PACK_SHIFT))
-                + m.query_advice(t34_r4_eid, Rotation::cur());
+                + m.query_advice(w_e2, Rotation::cur());
             vec![
-                q * (m.query_advice(t34_oid, Rotation::cur())
+                q * (m.query_advice(oid, Rotation::cur())
                     - (keep.clone() * id + (one - keep) * pad)),
             ]
         });
-        let (iz_oid_pad, lt_oid) = Self::configure_oid_order(meta, lane_u8, q_oid_step, t34_oid);
+        let (iz_oid_pad, lt_oid) = Self::configure_oid_order(meta, lane_u8, q_oid_step, oid);
 
         // ---- child side of the bag tree edge, both channels ----
-        // Bag2 is a leaf of the bag tree, so a row's input-channel multiplicity
-        // is its predicate bit and its clean-channel multiplicity is that bit
-        // times the clean indicator. Both already sit in columns this lane
-        // carries, so the second channel costs only the stage's own columns and
-        // the stage groups them by the separator key in one pass.
-        let cp = configure_cp_agg::<F, NUM_BYTES>(
-            meta, lane_u8, t34_key, t34_keep, t34_ceff, PAD_U64,
-        );
+        // The role-2 reading is a leaf of the bag tree, so a row's input-channel
+        // multiplicity is its keep bit and its clean-channel multiplicity is
+        // that bit times the clean indicator. Both already sit in columns this
+        // lane carries, so the second channel costs only the stage's own columns
+        // and the stage groups them by the separator key in one pass.
+        let cp = configure_cp_agg::<F, NUM_BYTES>(meta, lane_u8, key2, keep2, ceff2, PAD_U64);
 
-        Bag2LaneConfig {
-            t34_c,
-            t34_d,
-            t34_a,
-            t34_i_r3,
-            t34_j_r4,
-            t34_r3_eid,
-            t34_r4_eid,
-            t34_real,
-            lt_cd,
-            t34_keep,
-            t34_key,
-            t34_cflag,
-            t34_ceff,
-            t34_oid,
+        WLaneRows {
+            w_x,
+            w_y,
+            w_z,
+            w_i,
+            w_j,
+            w_e1,
+            w_e2,
+            w_real,
+            lt_xy,
+            lt_yz,
+            keep2,
+            key2,
+            cflag2,
+            ceff2,
+            key1,
+            pred1,
+            cflag1,
+            ceff1,
+            ck1,
+            oid,
             iz_oid_pad,
             lt_oid,
             cp,
         }
     }
 
-    /// One full structural replica of the Bag1 column group, carrying one probe
-    /// per Bag2 lane and the two root channels. Every Bag1 lane gets the same
-    /// gates and the same lookups; only the columns differ.
-    #[allow(clippy::too_many_arguments)]
-    fn configure_bag1_lane(
+    /// PASS 2 of one lane: one parent probe per lane, the host bits and lookup
+    /// that close the mirror half of condition (9), the two root multiplicities
+    /// and the lane-local prefix sums.
+    ///
+    /// `lane_cps` and `lane_ck1` are indexed by lane and must cover EVERY lane,
+    /// this one included: a role-1 row's key can live in any lane's child table,
+    /// and a clean role-2 row can be hosted by any lane.
+    fn configure_w_lane_probes(
         meta: &mut ConstraintSystem<F>,
-        in_by_dst: &IndexedViewConfig<F>,
-        out_by_src: &IndexedViewConfig<F>,
-        bag2_lanes: &[Bag2LaneConfig<F>],
+        rows: WLaneRows<F>,
+        lane_cps: &[CpAggConfig<F, NUM_BYTES>],
+        lane_ck1: &[Column<Advice>],
         lane_u8: Column<Fixed>,
-        q_view_tbl: Selector,
-        sel: &Bag1Selectors,
-    ) -> Bag1LaneConfig<F> {
-        let Bag1Selectors {
-            q_t12_lookup,
-            q_t12_key,
-            q_t12_row,
-            q_order12,
+        sel: &WSelectors,
+    ) -> WLaneConfig<F> {
+        let WSelectors {
+            q_w_lookup,
             q_probe,
             q_probe_complex,
             q_mu,
             q_sum0,
             q_sum,
-            q_oid_step,
+            ..
         } = *sel;
+        let WLaneRows {
+            w_x,
+            w_y,
+            w_z,
+            w_i,
+            w_j,
+            w_e1,
+            w_e2,
+            w_real,
+            lt_xy,
+            lt_yz,
+            keep2,
+            key2,
+            cflag2,
+            ceff2,
+            key1,
+            pred1,
+            cflag1,
+            ceff1,
+            ck1,
+            oid,
+            iz_oid_pad,
+            lt_oid,
+            cp,
+        } = rows;
 
-        let t12_a = meta.advice_column();
-        let t12_b = meta.advice_column();
-        let t12_c = meta.advice_column();
-        let t12_i_r1 = meta.advice_column();
-        let t12_j_r2 = meta.advice_column();
-        let t12_r1_eid = meta.advice_column();
-        let t12_r2_eid = meta.advice_column();
-        let t12_real = meta.advice_column();
-        // NOTE: no `enable_equality` here either; see the Bag2 lane. The Bag1
-        // lane cells that are copied are the two ends of `t12_oid` and the last
-        // `sum_all` / `sum_cln`.
-
-        // r1 via InByDst: key=B, idx=i_r1 -> val=A, eid=r1_eid. Table side gated
-        // by `q_view_tbl`, for the reason spelled out in `configure_bag2_lane`.
-        meta.lookup_any("bag1 r1 from in_by_dst", |m| {
-            let q = m.query_selector(q_t12_lookup);
-            let t = m.query_selector(q_view_tbl);
-            vec![
-                (
-                    q.clone() * m.query_advice(t12_b, Rotation::cur()),
-                    t.clone() * m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t12_i_r1, Rotation::cur()),
-                    t.clone() * m.query_advice(in_by_dst.idx, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t12_a, Rotation::cur()),
-                    t.clone() * m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
-                ),
-                (
-                    q * m.query_advice(t12_r1_eid, Rotation::cur()),
-                    t * m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
-                ),
-            ]
-        });
-        // r2 via OutBySrc: key=B, idx=j_r2 -> val=C, eid=r2_eid
-        meta.lookup_any("bag1 r2 from out_by_src", |m| {
-            let q = m.query_selector(q_t12_lookup);
-            let t = m.query_selector(q_view_tbl);
-            vec![
-                (
-                    q.clone() * m.query_advice(t12_b, Rotation::cur()),
-                    t.clone() * m.query_advice(out_by_src.sorted_key, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t12_j_r2, Rotation::cur()),
-                    t.clone() * m.query_advice(out_by_src.idx, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t12_c, Rotation::cur()),
-                    t.clone() * m.query_advice(out_by_src.sorted_val, Rotation::cur()),
-                ),
-                (
-                    q * m.query_advice(t12_r2_eid, Rotation::cur()),
-                    t * m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
-                ),
-            ]
-        });
-
-        // The separator key every probe asks about. On a padding row the tuple
-        // is all zero, so the key is 0, which is the dummy row of every child
-        // table and carries both sums 0.
-        let t12_key = meta.advice_column();
-        meta.create_gate("bag1 real + key", |m| {
-            let q = m.query_selector(q_t12_key);
-            let one = Expression::Constant(F::ONE);
-            let real = m.query_advice(t12_real, Rotation::cur());
-            let key_expr = m.query_advice(t12_a, Rotation::cur())
-                * Expression::Constant(F::from(PACK_SHIFT))
-                + m.query_advice(t12_c, Rotation::cur());
-            vec![
-                q.clone() * real.clone() * (one - real),
-                q * (m.query_advice(t12_key, Rotation::cur()) - key_expr),
-            ]
-        });
-
-        // ordering checks for Bag1: A<B and B<C, enabled only if real=1
-        let lt_ab = LtChip::<F, NUM_BYTES>::configure_with_u8(
-            meta,
-            lane_u8,
-            |m| m.query_selector(q_order12) * m.query_advice(t12_real, Rotation::cur()),
-            |m| m.query_advice(t12_a, Rotation::cur()),
-            |m| m.query_advice(t12_b, Rotation::cur()),
-        );
-        let lt_bc = LtChip::<F, NUM_BYTES>::configure_with_u8(
-            meta,
-            lane_u8,
-            |m| m.query_selector(q_order12) * m.query_advice(t12_real, Rotation::cur()),
-            |m| m.query_advice(t12_b, Rotation::cur()),
-            |m| m.query_advice(t12_c, Rotation::cur()),
-        );
-
-        // ---- condition (7) on this lane's block of Bag1 ----
-        // `pred` folds the three-factor predicate into a column so that every
-        // gate below stays at degree <= 4; `cflag` is the prover's clean
-        // indicator, gated boolean, and `ceff = pred * cflag` is the bit the
-        // clean channel reads, which is 0 wherever the predicate fails.
-        let t12_pred = meta.advice_column();
-        let t12_cflag = meta.advice_column();
-        let t12_ceff = meta.advice_column();
-        meta.create_gate("bag1 pred and clean partition", |m| {
-            let q = m.query_selector(q_t12_row);
-            let one = Expression::Constant(F::ONE);
-            let real = m.query_advice(t12_real, Rotation::cur());
-            let ab = lt_ab.is_lt(m, None);
-            let bc = lt_bc.is_lt(m, None);
-            let pred = m.query_advice(t12_pred, Rotation::cur());
-            let cf = m.query_advice(t12_cflag, Rotation::cur());
-            let ce = m.query_advice(t12_ceff, Rotation::cur());
-            vec![
-                q.clone() * (pred.clone() - real * ab * bc),
-                q.clone() * cf.clone() * (one - cf.clone()),
-                q * (ce - pred * cf),
-            ]
-        });
-
-        // ---- occurrence id ----
-        let t12_oid = meta.advice_column();
-        meta.enable_equality(t12_oid);
-        meta.create_gate(
-            "occ: bag1 id = pack2(edge ids), PAD when the predicate fails",
-            |m| {
-                let q = m.query_selector(q_t12_row);
-                let one = Expression::Constant(F::ONE);
-                let pad = Expression::Constant(F::from(PAD_U64));
-                let pred = m.query_advice(t12_pred, Rotation::cur());
-                let id = m.query_advice(t12_r1_eid, Rotation::cur())
-                    * Expression::Constant(F::from(PACK_SHIFT))
-                    + m.query_advice(t12_r2_eid, Rotation::cur());
-                vec![
-                    q * (m.query_advice(t12_oid, Rotation::cur())
-                        - (pred.clone() * id + (one - pred) * pad)),
-                ]
-            },
-        );
-        let (iz_oid_pad, lt_oid) = Self::configure_oid_order(meta, lane_u8, q_oid_step, t12_oid);
-
-        // ---- one probe per Bag2 lane ----
+        // ---- one probe per lane ----
         // Each probe is a complete replica pointed at that lane's child table;
         // they share the two probe selectors and the u8 column because every
-        // probe is live on every row.
-        let probes: Vec<CpJoinConfig<F, NUM_BYTES>> = bag2_lanes
+        // probe is live on every row. This is the c^2 term, and it cannot be
+        // shared: a `cp_agg` stage owns ONE input column pair bounded by the
+        // rows of the domain, while W spans c * lane_rows rows.
+        let probes: Vec<CpJoinConfig<F, NUM_BYTES>> = lane_cps
             .iter()
-            .map(|b2| {
-                let j = Self::configure_probe(meta, lane_u8, q_probe, q_probe_complex, t12_key);
-                wire_cp_edge(meta, &j, &b2.cp, t12_key);
+            .map(|child| {
+                let j = Self::configure_probe(meta, lane_u8, q_probe, q_probe_complex, key1);
+                wire_cp_edge(meta, &j, child, key1);
                 j
             })
             .collect();
 
-        // ---- the two root multiplicities, and condition (9) ----
+        // ---- condition (9), the MIRROR direction ----
+        // pi_K(R_2^c) subset of pi_K(R_1^c), whose table is the union of the c
+        // per-lane clean role-1 key columns. A lookup cannot say "in lane 1 OR
+        // in lane 2", and asking every lane to contain every clean role-2 key
+        // would reject every honest witness. So the prover NAMES the hosting
+        // lane with a boolean bit per lane, the gate below forces those bits to
+        // sum to `ceff2` (not to 1: a row that is not role-2 clean must name NO
+        // lane, so its input is zeroed), and one width-1 lookup
+        // per named lane checks the claim against that lane's own clean role-1
+        // keys.
+        //
+        // BOTH SIDES ARE GATED, which is the part that has to be right. The
+        // table side is `q_w_lookup * ck1_l`, and `q_w_lookup` is a complex
+        // selector enabled on exactly a lane's rows: without it the rows past
+        // the lane's capacity would sit outside every gate, so `ck1` there would
+        // be free advice and a prover could mint any clean key it liked. On the
+        // gated-off rows both sides read 0, so 0 is in the table and the rows
+        // cost nothing; a real key is pack2 of two shifted node ids, hence at
+        // least PACK_SHIFT + 1, so the containment is over the real clean keys
+        // only. Input degree 3 and table degree 2 put this lookup at the same
+        // 2 + 3 + 2 = 7 the check's own membership lookup already pays.
+        let host: Vec<Column<Advice>> = lane_cps.iter().map(|_| meta.advice_column()).collect();
+        {
+            let hosts = host.clone();
+            meta.create_gate(
+                "pw: every clean role-2 tuple is hosted by exactly one lane",
+                move |m| {
+                    let q = m.query_selector(q_mu);
+                    let one = Expression::Constant(F::ONE);
+                    let mut polys = Vec::with_capacity(hosts.len() + 1);
+                    let mut sum = Expression::Constant(F::ZERO);
+                    for h in hosts.iter() {
+                        let hq = m.query_advice(*h, Rotation::cur());
+                        polys.push(q.clone() * hq.clone() * (one.clone() - hq.clone()));
+                        sum = sum + hq;
+                    }
+                    polys.push(q * (sum - m.query_advice(ceff2, Rotation::cur())));
+                    polys
+                },
+            );
+        }
+        for (h, tbl) in host.iter().zip(lane_ck1.iter()) {
+            let (h, tbl) = (*h, *tbl);
+            meta.lookup_any("pw: role2^c key in role1^c (lane host)", move |m| {
+                let gate = m.query_selector(q_w_lookup) * m.query_advice(h, Rotation::cur());
+                // `key2`, not `ceff2 * key2`: the host gate forces
+                // `sum_l host[l] = ceff2` with every bit boolean, so a SET host
+                // bit already implies `ceff2 = 1`, and a clear one zeroes the
+                // product. Folding `ceff2` in again would cost one advice
+                // column and one degree-3 gate per lane for nothing.
+                vec![(
+                    gate * m.query_advice(key2, Rotation::cur()),
+                    m.query_selector(q_w_lookup) * m.query_advice(tbl, Rotation::cur()),
+                )]
+            });
+        }
+
+        // ---- the two root multiplicities, and condition (9) direction 1 ----
         let mu_all = meta.advice_column();
         let mu_cln = meta.advice_column();
         let sum_all = meta.advice_column();
@@ -1170,9 +1291,9 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         meta.enable_equality(sum_all);
         meta.enable_equality(sum_cln);
 
-        // Is the clean multiplicity of this row's key, summed over ALL Bag2
-        // lanes, zero? A per-lane test would be meaningless: a key legitimately
-        // lives in only some of the lanes.
+        // Is the clean multiplicity of this row's key, summed over ALL lanes,
+        // zero? A per-lane test would be meaningless: a key legitimately lives
+        // in only some of the lanes.
         let aux_cln = meta.advice_column();
         let probes_iz = probes.clone();
         let iz_cln = IsZeroChip::configure(
@@ -1198,17 +1319,17 @@ impl<F: Field + Ord> Gq4DpChip<F> {
                     s_all = s_all + m.query_advice(p.s_all, Rotation::cur());
                     s_cln = s_cln + m.query_advice(p.s_cln, Rotation::cur());
                 }
-                let pred = m.query_advice(t12_pred, Rotation::cur());
-                let ceff = m.query_advice(t12_ceff, Rotation::cur());
+                let pred = m.query_advice(pred1, Rotation::cur());
+                let ceff = m.query_advice(ceff1, Rotation::cur());
                 vec![
                     // the input channel, which is also this row's contribution
                     // to the COUNT
                     q.clone() * (m.query_advice(mu_all, Rotation::cur()) - pred * s_all),
                     // the clean channel
                     q.clone() * (m.query_advice(mu_cln, Rotation::cur()) - ceff.clone() * s_cln),
-                    // condition (9), the direction pi_K(t12^c) subset of
-                    // pi_K(t34^c): a Bag1 tuple left on the clean side must have
-                    // at least one clean Bag2 partner SOMEWHERE in Bag2
+                    // condition (9), the direction pi_K(R_1^c) subset of
+                    // pi_K(R_2^c): a role-1 tuple left on the clean side must
+                    // have at least one clean role-2 partner SOMEWHERE in W
                     q * ceff * izc.expr(),
                 ]
             },
@@ -1241,25 +1362,32 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             ]
         });
 
-        Bag1LaneConfig {
-            t12_a,
-            t12_b,
-            t12_c,
-            t12_i_r1,
-            t12_j_r2,
-            t12_r1_eid,
-            t12_r2_eid,
-            t12_real,
-            lt_ab,
-            lt_bc,
-            t12_key,
-            t12_pred,
-            t12_cflag,
-            t12_ceff,
-            t12_oid,
+        WLaneConfig {
+            w_x,
+            w_y,
+            w_z,
+            w_i,
+            w_j,
+            w_e1,
+            w_e2,
+            w_real,
+            lt_xy,
+            lt_yz,
+            keep2,
+            key2,
+            cflag2,
+            ceff2,
+            key1,
+            pred1,
+            cflag1,
+            ceff1,
+            ck1,
+            oid,
             iz_oid_pad,
             lt_oid,
+            cp,
             probes,
+            host,
             mu_all,
             mu_cln,
             sum_all,
@@ -1267,21 +1395,18 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             iz_cln,
         }
     }
-
     pub fn construct(cfg: Gq4DpConfig<F>) -> Self {
         Self { cfg }
     }
 
     pub fn configure(meta: &mut ConstraintSystem<F>) -> Gq4DpConfig<F> {
-        let (num_bag1_lanes, num_bag2_lanes) = CONFIG_LANES.with(|l| l.get());
-        for c in [num_bag1_lanes, num_bag2_lanes] {
-            assert!(
-                (1..=MAX_LANES).contains(&c),
-                "configured lane count {} outside 1..={} (call set_config_lanes first)",
-                c,
-                MAX_LANES
-            );
-        }
+        let num_lanes = CONFIG_LANES.with(|l| l.get());
+        assert!(
+            (1..=MAX_LANES).contains(&num_lanes),
+            "configured lane count {} outside 1..={} (call set_config_lanes first)",
+            num_lanes,
+            MAX_LANES
+        );
 
         let instance = meta.instance_column();
         meta.enable_equality(instance);
@@ -1300,16 +1425,16 @@ impl<F: Field + Ord> Gq4DpChip<F> {
 
         // -------- Conservation of the edge relation --------
         // The two views were free advice tied only to their own sorted view,
-        // with nothing relating them to each other, so the four bag lookups
-        // proved membership in two INDEPENDENT prover-invented relations: r1/r3
-        // could come from one edge list and r2/r4 from another. Two shuffles
-        // fix that. `in_by_dst` is sorted (dst, src, eid) and `out_by_src` is
+        // with nothing relating them to each other, so the lane lookups proved
+        // membership in two INDEPENDENT prover-invented relations: `r_in` could
+        // come from one edge list and `r_out` from another. Two shuffles fix
+        // that. `in_by_dst` is sorted (dst, src, eid) and `out_by_src` is
         // sorted (src, dst, eid), so both are compared against the base
         // relation's (src, dst, eid) with the key/val columns swapped on the
         // in-side. The comparison is against the SORTED columns, which are the
-        // ones the four bag lookups actually read; each view's own shuffle
-        // already ties those to its input columns, so this is the same statement
-        // and it needs one fewer column group.
+        // ones the lane lookups actually read; each view's own shuffle already
+        // ties those to its input columns, so this is the same statement and it
+        // needs one fewer column group.
         let perm_edge_out = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
@@ -1343,85 +1468,60 @@ impl<F: Field + Ord> Gq4DpChip<F> {
 
         let lane_u8 = meta.fixed_column();
 
-        // The global occurrence ordering is shared machinery: both kinds of lane
-        // are live on rows 0..lane_rows, so one step selector drives all of them.
-        let q_oid_step = meta.selector();
-
-        // ---------------- Bag2 lanes ----------------
-        let q_t34_lookup = meta.complex_selector();
-        let q_t34_flag = meta.selector();
-        let q_cd = meta.selector();
-        let q_t34_row = meta.selector();
-
-        let bag2_lanes: Vec<Bag2LaneConfig<F>> = (0..num_bag2_lanes)
-            .map(|_| {
-                Self::configure_bag2_lane(
-                    meta,
-                    &in_by_dst,
-                    &out_by_src,
-                    lane_u8,
-                    q_view_tbl,
-                    q_t34_lookup,
-                    q_t34_flag,
-                    q_cd,
-                    q_t34_row,
-                    q_oid_step,
-                )
-            })
-            .collect();
-
-        // ---------------- Bag1 lanes ----------------
-        // Shared selectors: every Bag1 lane is active on the same rows, so one
-        // selector of each kind drives all c1 replicas and all c1*c2 probes.
+        // ---------------- the lanes ----------------
+        // Shared selectors: every lane is active on the same rows, so one
+        // selector of each kind drives all c replicas and all c*c probes.
         //
         // A NOTE ON WHY NO SELECTOR ROW MAY DEPEND ON THE WITNESS. Selectors are
         // fixed columns, so where they are enabled is part of the verifying key.
         // `g_sql4_obj` realizes condition (7) as a shuffle against a
         // [clean | residual | pad] column group and needs one selector per
-        // section, i.e. the true clean and residual counts of each bag are in
+        // section, i.e. the true clean and residual counts of each role are in
         // its vk. That is legitimate there, where the Revealing-Join-Size regime
         // publishes the bag size anyway, and it is exactly what this circuit may
         // not do: those counts are what the DP release pays to hide. Every
-        // selector below is enabled on a row range determined by `lane_rows`,
-        // `c1` and `c2`, all of which are public.
-        let sel = Bag1Selectors {
-            q_t12_lookup: meta.complex_selector(),
-            q_t12_key: meta.selector(),
-            q_t12_row: meta.selector(),
-            q_order12: meta.selector(),
+        // selector below is enabled on a row range determined by `lane_rows` and
+        // `c`, both of which are public.
+        let sel = WSelectors {
+            q_view_tbl,
+            q_w_lookup: meta.complex_selector(),
+            q_w_row: meta.selector(),
             q_probe: meta.selector(),
             q_probe_complex: meta.complex_selector(),
             q_mu: meta.selector(),
             q_sum0: meta.selector(),
             q_sum: meta.selector(),
-            q_oid_step,
+            // The global occurrence ordering is shared machinery: every lane is
+            // live on rows 0..lane_rows, so one step selector drives all of them.
+            q_oid_step: meta.selector(),
         };
 
-        let bag1_lanes: Vec<Bag1LaneConfig<F>> = (0..num_bag1_lanes)
-            .map(|_| {
-                Self::configure_bag1_lane(
-                    meta,
-                    &in_by_dst,
-                    &out_by_src,
-                    &bag2_lanes,
-                    lane_u8,
-                    q_view_tbl,
-                    &sel,
-                )
+        // TWO PASSES, because a lane's probes must reference EVERY lane's child
+        // stage: pass 1 lays out the rows of all c lanes and their child stages,
+        // pass 2 adds each lane's c probes, its host bits and its merge path.
+        let stage1: Vec<WLaneRows<F>> = (0..num_lanes)
+            .map(|_| Self::configure_w_lane_rows(meta, &in_by_dst, &out_by_src, lane_u8, &sel))
+            .collect();
+        let lane_cps: Vec<CpAggConfig<F, NUM_BYTES>> =
+            stage1.iter().map(|s| s.cp.clone()).collect();
+        let lane_ck1: Vec<Column<Advice>> = stage1.iter().map(|s| s.ck1).collect();
+        let lanes: Vec<WLaneConfig<F>> = stage1
+            .into_iter()
+            .map(|rows| {
+                Self::configure_w_lane_probes(meta, rows, &lane_cps, &lane_ck1, lane_u8, &sel)
             })
             .collect();
 
         // ---------------- lane seams of the occurrence ordering -------------
-        let oid_bnd = vec![
-            Self::configure_oid_boundary(meta, lane_u8),
-            Self::configure_oid_boundary(meta, lane_u8),
-        ];
+        // ONE stage: there is one occurrence ordering, over the role-2 keep bit,
+        // and role 1's rows are a per-row-determined subset of role 2's.
+        let oid_bnd = Self::configure_oid_boundary(meta, lane_u8);
 
         // ---------------- cross-lane totals ----------------
-        // Row l holds Bag1 lane l's two channel totals, copied in from that
-        // lane's last `sum_all` / `sum_cln`; `tot_run` and `cln_run` add them
-        // with degree-2 accumulators. A flat degree-(1+c1) sum gate would blow
-        // past cs.degree() = 7 for c1 > 6.
+        // Row l holds lane l's two channel totals, copied in from that lane's
+        // last `sum_all` / `sum_cln`; `tot_run` and `cln_run` add them with
+        // degree-2 accumulators. A flat degree-(1+c) sum gate would blow past
+        // cs.degree() = 7 for c > 6.
         let lane_tot = meta.advice_column();
         let cln_tot = meta.advice_column();
         let tot_run = meta.advice_column();
@@ -1466,8 +1566,8 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             ]
         });
 
-        // ---- condition (10), over the UNION of the Bag1 lanes ----
-        // ONE equality, between the two GLOBAL totals at row c1-1. Accumulating
+        // ---- condition (10), over the UNION of the lanes ----
+        // ONE equality, between the two GLOBAL totals at row c-1. Accumulating
         // per lane and comparing per lane would let a prover move a hidden
         // tuple's contribution into a lane whose own equality still balances;
         // there is only one equality here and it sees every lane.
@@ -1490,20 +1590,13 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             perm_edge_out,
             perm_edge_in,
             lane_u8,
-            bag2_lanes,
-            q_t34_lookup,
-            q_t34_flag,
-            q_cd,
-            q_t34_row,
-            bag1_lanes,
-            q_t12_lookup: sel.q_t12_lookup,
-            q_t12_key: sel.q_t12_key,
-            q_t12_row: sel.q_t12_row,
-            q_order12: sel.q_order12,
+            lanes,
+            q_w_lookup: sel.q_w_lookup,
+            q_w_row: sel.q_w_row,
             q_mu: sel.q_mu,
             q_sum0: sel.q_sum0,
             q_sum: sel.q_sum,
-            q_oid_step,
+            q_oid_step: sel.q_oid_step,
             oid_bnd,
             lane_tot,
             cln_tot,
@@ -1517,14 +1610,13 @@ impl<F: Field + Ord> Gq4DpChip<F> {
     }
 }
 
-/// The selectors every Bag1 lane shares. Bundled only to keep
-/// `configure_bag1_lane` under a readable argument count.
+/// The selectors every lane shares. Bundled only to keep the two passes of
+/// `configure_w_lane` under a readable argument count.
 #[derive(Clone, Copy, Debug)]
-struct Bag1Selectors {
-    q_t12_lookup: Selector,
-    q_t12_key: Selector,
-    q_t12_row: Selector,
-    q_order12: Selector,
+struct WSelectors {
+    q_view_tbl: Selector,
+    q_w_lookup: Selector,
+    q_w_row: Selector,
     q_probe: Selector,
     q_probe_complex: Selector,
     q_mu: Selector,
@@ -1533,8 +1625,36 @@ struct Bag1Selectors {
     q_oid_step: Selector,
 }
 
-/// What one Bag1 lane exports to the cross-lane stages.
-struct Bag1LaneOut<F: Field + Ord> {
+/// The per-row witness of the WHOLE released capacity, in the global
+/// occurrence order. Every vector has `c * lane_rows` entries and is indexed by
+/// the GLOBAL row index; lane l reads the block
+/// `[l*lane_rows, (l+1)*lane_rows)`. Bundled so that `assign_w_lane` takes one
+/// argument instead of twelve slices, all of which have to agree on their
+/// indexing.
+struct WWitness {
+    rows: Vec<BagRow>,
+    // role 2, the (C,D,A) reading: keep bit, aggregate key pack2(z,x), clean
+    // indicator, folded keep*cflag, and ceff2*key2
+    keep2: Vec<u64>,
+    key2: Vec<u64>,
+    cflag2: Vec<u64>,
+    ceff2: Vec<u64>,
+    // role 1, the (A,B,C) reading: probe key pack2(x,z), predicate bit, clean
+    // indicator, folded pred*cflag, and ceff1*key1
+    key1: Vec<u64>,
+    pred1: Vec<u64>,
+    cflag1: Vec<u64>,
+    ceff1: Vec<u64>,
+    ck1: Vec<u64>,
+    /// occurrence id, over the role-2 keep bit
+    oid: Vec<u64>,
+    /// the lane the prover names as holding a clean role-1 row with this row's
+    /// role-2 key, meaningful only where `ceff2` is 1
+    host: Vec<usize>,
+}
+
+/// What one lane exports to the cross-lane stages.
+struct WLaneOut<F: Field + Ord> {
     /// first and last cell of the lane's occurrence-id column
     oid_ends: (AssignedCell<F, F>, AssignedCell<F, F>),
     /// last cell of the two channel prefix sums
@@ -1645,132 +1765,27 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         Ok(())
     }
 
-    /// Assign one Bag2 lane's block of the padded Bag2 pipeline, its partition,
-    /// its occurrence id and its child stage.
+    /// Assign one lane's block of the padded W pipeline: the tuple, both column
+    /// roles with their partitions, the occurrence id, the child stage, the c
+    /// probes, the host bits and the two lane-local prefix sums.
     ///
     /// `base` is the global index of this lane's row 0, so lane l covers the
-    /// padded rows `[l*lane_rows, (l+1)*lane_rows)`. Rows past the true bag are
-    /// padding: all-zero tuple, real 0, hence keep 0, key PAD and oid PAD. View
-    /// row 0 is (0,0,0) with idx 0, so a padding row satisfies both membership
-    /// lookups.
-    ///
-    /// Returns the first and last cell of this lane's occurrence-id column, for
-    /// the seam stage.
+    /// padded rows `[l*lane_rows, (l+1)*lane_rows)`. Rows past the released
+    /// capacity's real part are padding: all-zero tuple, real 0, hence keep2 0,
+    /// key2 PAD, pred1 0 and oid PAD. View row 0 is (0,0,0) with idx 0, so a
+    /// padding row satisfies both membership lookups.
     #[allow(clippy::too_many_arguments)]
-    fn assign_bag2_lane(
-        lane: &Bag2LaneConfig<F>,
+    fn assign_w_lane(
+        lane: &WLaneConfig<F>,
         region: &mut Region<'_, F>,
         lane_rows: usize,
         base: usize,
-        rows: &[BagRow],
-        keep: &[u64],
-        key: &[u64],
-        cflag: &[u64],
-        ceff: &[u64],
-        oid: &[u64],
-        stage: &CpStage,
-    ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>), Error> {
-        let lt_cd_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_cd);
-        let lt_oid_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_oid);
-        let iz_oid_chip = IsZeroChip::construct(lane.iz_oid_pad.clone());
-        let pad = F::from(PAD_U64);
-
-        let mut first: Option<AssignedCell<F, F>> = None;
-        let mut last: Option<AssignedCell<F, F>> = None;
-
-        for r in 0..lane_rows {
-            let i = base + r;
-            let row = rows[i];
-
-            for (col, v) in [
-                (lane.t34_c, row[0]),
-                (lane.t34_d, row[1]),
-                (lane.t34_a, row[2]),
-                (lane.t34_i_r3, row[3]),
-                (lane.t34_j_r4, row[4]),
-                (lane.t34_r3_eid, row[5]),
-                (lane.t34_r4_eid, row[6]),
-                (lane.t34_real, row[7]),
-            ] {
-                region.assign_advice(|| "t34", col, r, || Value::known(F::from(v)))?;
-            }
-
-            // LT witness (the constraint is gated by real)
-            lt_cd_chip.assign(
-                region,
-                r,
-                Value::known(F::from(row[0])),
-                Value::known(F::from(row[1])),
-            )?;
-
-            for (col, v) in [
-                (lane.t34_keep, keep[i]),
-                (lane.t34_key, key[i]),
-                (lane.t34_cflag, cflag[i]),
-                (lane.t34_ceff, ceff[i]),
-            ] {
-                region.assign_advice(|| "t34 partition", col, r, || Value::known(F::from(v)))?;
-            }
-
-            let cell = region.assign_advice(
-                || "t34_oid",
-                lane.t34_oid,
-                r,
-                || Value::known(F::from(oid[i])),
-            )?;
-            if r == 0 {
-                first = Some(cell.clone());
-            }
-            last = Some(cell);
-
-            iz_oid_chip.assign(region, r, Value::known(F::from(oid[i]) - pad))?;
-            let nxt = if r + 1 < lane_rows {
-                oid[i + 1]
-            } else {
-                PAD_U64
-            };
-            lt_oid_chip.assign(
-                region,
-                r,
-                Value::known(F::from(oid[i])),
-                Value::known(F::from(nxt)),
-            )?;
-        }
-
-        // Lane-local child stage: the sorted view, the group boundaries, the two
-        // running sums, the emitted per-key rows and the key-indexed table all
-        // live inside this lane's own columns, with the lane's own first/last
-        // guards. Nothing crosses a Bag2 lane boundary here.
-        let cp_rows: Vec<[u64; 3]> = (0..lane_rows)
-            .map(|r| [key[base + r], keep[base + r], ceff[base + r]])
-            .collect();
-        assign_cp_agg(region, &lane.cp, &cp_rows, stage)?;
-
-        Ok((
-            first.expect("lane_rows > 0 guarantees a first row"),
-            last.expect("lane_rows > 0 guarantees a last row"),
-        ))
-    }
-
-    /// Assign one Bag1 lane's block of the padded Bag1 pipeline, its partition,
-    /// its occurrence id, its c2 probes and its two lane-local prefix sums.
-    #[allow(clippy::too_many_arguments)]
-    fn assign_bag1_lane(
-        lane: &Bag1LaneConfig<F>,
-        region: &mut Region<'_, F>,
-        lane_rows: usize,
-        base: usize,
-        rows: &[BagRow],
-        pred: &[u64],
-        key: &[u64],
-        cflag: &[u64],
-        ceff: &[u64],
-        oid: &[u64],
+        w: &WWitness,
         stages: &[CpStage],
         tamper: Tamper,
-    ) -> Result<Bag1LaneOut<F>, Error> {
-        let lt_ab_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_ab);
-        let lt_bc_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_bc);
+    ) -> Result<WLaneOut<F>, Error> {
+        let lt_xy_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_xy);
+        let lt_yz_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_yz);
         let lt_oid_chip = LtChip::<F, NUM_BYTES>::construct(lane.lt_oid);
         let iz_oid_chip = IsZeroChip::construct(lane.iz_oid_pad.clone());
         let iz_cln_chip = IsZeroChip::construct(lane.iz_cln.clone());
@@ -1781,29 +1796,29 @@ impl<F: Field + Ord> Gq4DpChip<F> {
 
         for r in 0..lane_rows {
             let i = base + r;
-            let row = rows[i];
+            let row = w.rows[i];
 
             for (col, v) in [
-                (lane.t12_a, row[0]),
-                (lane.t12_b, row[1]),
-                (lane.t12_c, row[2]),
-                (lane.t12_i_r1, row[3]),
-                (lane.t12_j_r2, row[4]),
-                (lane.t12_r1_eid, row[5]),
-                (lane.t12_r2_eid, row[6]),
-                (lane.t12_real, row[7]),
+                (lane.w_x, row[0]),
+                (lane.w_y, row[1]),
+                (lane.w_z, row[2]),
+                (lane.w_i, row[3]),
+                (lane.w_j, row[4]),
+                (lane.w_e1, row[5]),
+                (lane.w_e2, row[6]),
+                (lane.w_real, row[7]),
             ] {
-                region.assign_advice(|| "t12", col, r, || Value::known(F::from(v)))?;
+                region.assign_advice(|| "w", col, r, || Value::known(F::from(v)))?;
             }
 
-            // order witnesses (the constraints are gated by real)
-            lt_ab_chip.assign(
+            // order witnesses (both constraints are gated by real)
+            lt_xy_chip.assign(
                 region,
                 r,
                 Value::known(F::from(row[0])),
                 Value::known(F::from(row[1])),
             )?;
-            lt_bc_chip.assign(
+            lt_yz_chip.assign(
                 region,
                 r,
                 Value::known(F::from(row[1])),
@@ -1811,47 +1826,75 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             )?;
 
             for (col, v) in [
-                (lane.t12_key, key[i]),
-                (lane.t12_pred, pred[i]),
-                (lane.t12_cflag, cflag[i]),
-                (lane.t12_ceff, ceff[i]),
+                (lane.keep2, w.keep2[i]),
+                (lane.key2, w.key2[i]),
+                (lane.cflag2, w.cflag2[i]),
+                (lane.ceff2, w.ceff2[i]),
+                (lane.key1, w.key1[i]),
+                (lane.pred1, w.pred1[i]),
+                (lane.cflag1, w.cflag1[i]),
+                (lane.ceff1, w.ceff1[i]),
+                (lane.ck1, w.ck1[i]),
             ] {
-                region.assign_advice(|| "t12 partition", col, r, || Value::known(F::from(v)))?;
+                region.assign_advice(|| "w roles", col, r, || Value::known(F::from(v)))?;
+            }
+
+            // The host bits of the mirror half of (9): exactly one is 1 on a
+            // clean role-2 row, and none is on any other row, which is what the
+            // "hosted by exactly one lane" gate reads as `sum = ceff2`.
+            for (l, h) in lane.host.iter().enumerate() {
+                let bit = (w.ceff2[i] == 1 && w.host[i] == l) as u64;
+                region.assign_advice(|| "pw host", *h, r, || Value::known(F::from(bit)))?;
             }
 
             let cell = region.assign_advice(
-                || "t12_oid",
-                lane.t12_oid,
+                || "w_oid",
+                lane.oid,
                 r,
-                || Value::known(F::from(oid[i])),
+                || Value::known(F::from(w.oid[i])),
             )?;
             if r == 0 {
                 first = Some(cell.clone());
             }
             last = Some(cell);
 
-            iz_oid_chip.assign(region, r, Value::known(F::from(oid[i]) - pad))?;
+            iz_oid_chip.assign(region, r, Value::known(F::from(w.oid[i]) - pad))?;
             let nxt = if r + 1 < lane_rows {
-                oid[i + 1]
+                w.oid[i + 1]
             } else {
                 PAD_U64
             };
             lt_oid_chip.assign(
                 region,
                 r,
-                Value::known(F::from(oid[i])),
+                Value::known(F::from(w.oid[i])),
                 Value::known(F::from(nxt)),
             )?;
         }
 
-        // ---- the c2 probes, then the two root multiplicities ----
+        // Lane-local child stage: the sorted view, the group boundaries, the two
+        // running sums, the emitted per-key rows and the key-indexed table all
+        // live inside this lane's own columns, with the lane's own first/last
+        // guards. Nothing crosses a lane boundary here.
+        let cp_rows: Vec<[u64; 3]> = (0..lane_rows)
+            .map(|r| [w.key2[base + r], w.keep2[base + r], w.ceff2[base + r]])
+            .collect();
+        assign_cp_agg(region, &lane.cp, &cp_rows, &stages[base / lane_rows])?;
+
+        // ---- the c probes, then the two root multiplicities ----
         // Counts add across a partition, so this row's two multiplicities are
-        // the sums of the c2 fetched pairs. Every fetch is certified by that
+        // the sums of the c fetched pairs. Every fetch is certified by that
         // lane's membership lookup or by its gap bracket, which is what makes
-        // the sums statements about the WHOLE of Bag2.
-        let keys: Vec<u64> = (0..lane_rows).map(|r| key[base + r]).collect();
+        // the sums statements about the WHOLE of W.
+        let keys: Vec<u64> = (0..lane_rows).map(|r| w.key1[base + r]).collect();
         let mut s_all = vec![0u64; lane_rows];
         let mut s_cln = vec![0u64; lane_rows];
+        assert_eq!(
+            lane.probes.len(),
+            stages.len(),
+            "every lane probes every lane's child table, so the two must have the \
+             same length or a lane's rows would go uncounted"
+        );
         for (p_idx, (probe, stage)) in lane.probes.iter().zip(stages.iter()).enumerate() {
             let drop = tamper == Tamper::DropProbeVal && p_idx > 0;
             let fetched = Self::assign_probe(region, probe, &keys, stage, drop)?;
@@ -1868,8 +1911,8 @@ impl<F: Field + Ord> Gq4DpChip<F> {
 
         for r in 0..lane_rows {
             let i = base + r;
-            let mu_all = pred[i] * s_all[r];
-            let mu_cln = ceff[i] * s_cln[r];
+            let mu_all = w.pred1[i] * s_all[r];
+            let mu_cln = w.ceff1[i] * s_cln[r];
 
             // Tamper::LaneMuAll perturbs the cell only; the prefix sum keeps its
             // honest value, so the root multiplicity gate and the sum gate both
@@ -1917,7 +1960,7 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             )?);
         }
 
-        Ok(Bag1LaneOut {
+        Ok(WLaneOut {
             oid_ends: (
                 first.expect("lane_rows > 0 guarantees a first row"),
                 last.expect("lane_rows > 0 guarantees a last row"),
@@ -1928,33 +1971,30 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             total_cln: acc_cln,
         })
     }
-
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
         edges: &[Edge],
-        bag1_pad_extra: usize,
-        bag2_pad_extra: usize,
+        pad_extra: usize,
         lane_rows: usize,
         tamper: Tamper,
     ) -> Result<AssignedCell<F, F>, Error> {
         let cfg = self.cfg.clone();
-        let c1 = cfg.bag1_lanes.len();
-        let c2 = cfg.bag2_lanes.len();
+        let c = cfg.lanes.len();
         assert!(lane_rows > 0, "lane_rows must be positive");
 
         let in_view_chip = IndexedViewChip::<F>::construct(cfg.in_by_dst.clone());
         let out_view_chip = IndexedViewChip::<F>::construct(cfg.out_by_src.clone());
 
         // Load all LT tables used. The two shared views keep a u8 column each;
-        // every lane chip of either kind, the two child stages' comparators, the
-        // probes and both occurrence orderings share `lane_u8`, so this is 3
-        // load regions for any lane counts.
+        // every lane's two comparators, every child stage's comparators, the
+        // probes and the occurrence ordering share `lane_u8`, so this is 3 load
+        // regions for any lane count.
         in_view_chip.load(layouter)?;
         out_view_chip.load(layouter)?;
-        debug_assert_eq!(cfg.bag2_lanes[0].lt_cd.u8, cfg.lane_u8);
-        debug_assert_eq!(cfg.bag2_lanes[0].cp.lt_key_cur_next.u8, cfg.lane_u8);
-        LtChip::<F, NUM_BYTES>::construct(cfg.bag2_lanes[0].lt_cd).load(layouter)?;
+        debug_assert_eq!(cfg.lanes[0].lt_xy.u8, cfg.lane_u8);
+        debug_assert_eq!(cfg.lanes[0].cp.lt_key_cur_next.u8, cfg.lane_u8);
+        LtChip::<F, NUM_BYTES>::construct(cfg.lanes[0].lt_xy).load(layouter)?;
 
         layouter.assign_region(
             || "cycle4_ordered dp-lanes witness",
@@ -1992,204 +2032,202 @@ impl<F: Field + Ord> Gq4DpChip<F> {
                 out_view_chip.assign(&mut region, n_base, &derived.out_rows)?;
 
                 // -------------------
-                // Capacities. Both pipelines are laned, so both can be the one
-                // that does not fit.
+                // Capacity. ONE released capacity, because the two readings are
+                // one relation and `bench_queries::graph_pads` releases its
+                // cardinality once.
                 // -------------------
-                let real34 = derived.t34.len();
-                let n34 = std::cmp::max(real34 + bag2_pad_extra, 1);
-                let cap2 = c2 * lane_rows;
+                let real = derived.w.len();
+                let n = std::cmp::max(real + pad_extra, 1);
+                let cap = c * lane_rows;
                 assert!(
-                    cap2 >= n34,
-                    "released Bag2 capacity {} exceeds {} lanes of {} rows",
-                    n34,
-                    c2,
-                    lane_rows
-                );
-                let real12 = derived.t12.len();
-                let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
-                let cap1 = c1 * lane_rows;
-                assert!(
-                    cap1 >= n12,
-                    "released Bag1 capacity {} exceeds {} lanes of {} rows",
-                    n12,
-                    c1,
+                    cap >= n,
+                    "released capacity {} exceeds {} lanes of {} rows",
+                    n,
+                    c,
                     lane_rows
                 );
 
                 // -------------------
-                // Both bags, in the GLOBAL occurrence-id order the distinctness
-                // argument requires. Lane l is the block
-                // [l*lane_rows, (l+1)*lane_rows) of these vectors.
+                // W over the whole released capacity, in the GLOBAL
+                // occurrence-id order the distinctness argument requires. Lane l
+                // is the block [l*lane_rows, (l+1)*lane_rows) of every vector
+                // below.
                 // -------------------
-                let mut rows34 = bag2_rows(&derived.t34, cap2);
-                let mut rows12 = bag1_rows(&derived.t12, cap1);
+                let mut rows = w_rows(&derived.w, cap);
 
-                // Test hook: copy the bag's FIRST kept occurrence over the FIRST
-                // row of the LAST Bag2 lane. Both copies pass all four
-                // membership lookups and both channels of (10) move by the same
-                // amount, so the only thing that can see the duplicate is the
-                // occurrence ordering. The copy goes to the first row of a later
-                // lane on purpose: every lane's own block stays sorted, so a
-                // PER-LANE ordering would accept this witness and only the seam
-                // gate rejects it.
+                // Test hook: copy the FIRST kept occurrence over the FIRST row
+                // of the LAST lane. Both copies pass both membership lookups and
+                // both channels of (10) move by the same amount, so the only
+                // thing that can see the duplicate is the occurrence ordering.
+                // The copy goes to the first row of a later lane on purpose:
+                // every lane's own block stays sorted, so a PER-LANE ordering
+                // would accept this witness and only the seam gate rejects it.
                 if tamper == Tamper::DuplicateOccurrenceAcrossLanes {
-                    assert!(
-                        c2 >= 2,
-                        "the cross-lane duplicate needs at least two Bag2 lanes"
-                    );
-                    let src = rows34[0];
-                    assert_eq!(bag2_keep(&src), 1, "the duplicated row must be kept");
-                    rows34[(c2 - 1) * lane_rows] = src;
+                    assert!(c >= 2, "the cross-lane duplicate needs at least two lanes");
+                    let src = rows[0];
+                    assert_eq!(role2_keep(&src), 1, "the duplicated row must be kept");
+                    rows[(c - 1) * lane_rows] = src;
                 }
 
-                let keep34: Vec<u64> = rows34.iter().map(bag2_keep).collect();
-                let key34: Vec<u64> = (0..cap2)
+                // ---- the ROLE-2 reading, (C,D,A) = (x,y,z) ----
+                // The keep bit is W's own x<y filter, the aggregate key is
+                // pack2(A,C) = pack2(z,x), and the occurrence id rides on the
+                // keep bit.
+                let keep2: Vec<u64> = rows.iter().map(role2_keep).collect();
+                let key2: Vec<u64> = (0..cap)
                     .map(|i| {
-                        if keep34[i] == 1 {
-                            pack2(rows34[i][2], rows34[i][0])
+                        if keep2[i] == 1 {
+                            pack2(rows[i][2], rows[i][0])
                         } else {
                             PAD_U64
                         }
                     })
                     .collect();
-                let oid34: Vec<u64> = (0..cap2)
-                    .map(|i| bag_oid(&rows34[i], keep34[i]))
-                    .collect();
+                let oid: Vec<u64> = (0..cap).map(|i| bag_oid(&rows[i], keep2[i])).collect();
 
-                let pred12: Vec<u64> = rows12.iter().map(bag1_pred).collect();
-                // The probe key is pack2(A,C) on every row; a padding row's
-                // tuple is all zero, so its key is 0, the dummy row of every
-                // child table.
-                let key12: Vec<u64> = (0..cap1)
-                    .map(|i| pack2(rows12[i][0], rows12[i][2]))
-                    .collect();
-                let oid12: Vec<u64> = (0..cap1)
-                    .map(|i| bag_oid(&rows12[i], pred12[i]))
-                    .collect();
+                // ---- the ROLE-1 reading, (A,B,C) = (x,y,z) ----
+                // The probe key is pack2(A,C) = pack2(x,z), REVERSED against the
+                // aggregate key, and pinned on every row; a padding row's tuple
+                // is all zero, so its key is 0, the dummy row of every child
+                // table.
+                let pred1: Vec<u64> = rows.iter().map(role1_pred).collect();
+                let key1: Vec<u64> = (0..cap).map(|i| pack2(rows[i][0], rows[i][2])).collect();
 
                 // -------------------
-                // Condition (7): the prover's partition of each bag. The bag
-                // tree has two nodes, so the semijoin reduction is exact: a Bag1
-                // tuple is clean iff its predicate holds and its separator key
-                // carries at least one kept Bag2 tuple, and a Bag2 tuple is
-                // clean iff it is kept and its key is the key of a clean Bag1
-                // tuple. The per-key counts are taken over the WHOLE of Bag2,
-                // i.e. over all lanes, which is what makes the clean side a
-                // property of the union.
+                // Condition (7): the prover's partition of each ROLE. The bag
+                // tree has two nodes, so the semijoin reduction is exact: a
+                // role-1 tuple is clean iff its predicate holds and its
+                // separator key carries at least one kept role-2 tuple, and a
+                // role-2 tuple is clean iff it is kept and its key is the key of
+                // a clean role-1 tuple. The per-key counts are taken over the
+                // WHOLE of W, i.e. over all lanes, which is what makes the clean
+                // side a property of the union.
                 // -------------------
-                let mut global34: BTreeMap<u64, u64> = BTreeMap::new();
-                for i in 0..cap2 {
-                    if keep34[i] == 1 {
-                        *global34.entry(key34[i]).or_default() += 1;
+                let mut global2: BTreeMap<u64, u64> = BTreeMap::new();
+                for i in 0..cap {
+                    if keep2[i] == 1 {
+                        *global2.entry(key2[i]).or_default() += 1;
                     }
                 }
 
-                let mut cln12: Vec<u64> = (0..cap1)
-                    .map(|i| {
-                        (pred12[i] == 1 && *global34.get(&key12[i]).unwrap_or(&0) > 0) as u64
-                    })
+                let mut cln1: Vec<u64> = (0..cap)
+                    .map(|i| (pred1[i] == 1 && *global2.get(&key1[i]).unwrap_or(&0) > 0) as u64)
                     .collect();
                 if tamper == Tamper::HideOneCleanTuple {
-                    let h = (0..cap1)
-                        .find(|&i| cln12[i] == 1)
-                        .expect("the slice has no clean Bag1 tuple to hide");
-                    cln12[h] = 0;
+                    let h = (0..cap)
+                        .find(|&i| cln1[i] == 1)
+                        .expect("the slice has no clean role-1 tuple to hide");
+                    cln1[h] = 0;
                 }
                 if tamper == Tamper::MarkAllClean {
-                    cln12 = pred12.clone();
+                    cln1 = pred1.clone();
                 }
 
-                let clean_keys12: HashSet<u64> = (0..cap1)
-                    .filter(|&i| cln12[i] == 1)
-                    .map(|i| key12[i])
+                let clean_keys1: HashSet<u64> = (0..cap)
+                    .filter(|&i| cln1[i] == 1)
+                    .map(|i| key1[i])
                     .collect();
-                let cln34: Vec<u64> = if tamper == Tamper::MarkAllClean {
-                    keep34.clone()
+                let cln2: Vec<u64> = if tamper == Tamper::MarkAllClean {
+                    keep2.clone()
                 } else {
-                    (0..cap2)
-                        .map(|i| (keep34[i] == 1 && clean_keys12.contains(&key34[i])) as u64)
+                    (0..cap)
+                        .map(|i| (keep2[i] == 1 && clean_keys1.contains(&key2[i])) as u64)
                         .collect()
                 };
 
-                let ceff12: Vec<u64> = (0..cap1).map(|i| pred12[i] * cln12[i]).collect();
-                let ceff34: Vec<u64> = (0..cap2).map(|i| keep34[i] * cln34[i]).collect();
+                let ceff1: Vec<u64> = (0..cap).map(|i| pred1[i] * cln1[i]).collect();
+                let ceff2: Vec<u64> = (0..cap).map(|i| keep2[i] * cln2[i]).collect();
+                let ck1: Vec<u64> = (0..cap).map(|i| ceff1[i] * key1[i]).collect();
+
+                // ---- condition (9), the mirror direction: name the host lane
+                // of every clean role-2 row ----
+                // Lane l hosts the key iff it holds a clean role-1 row with that
+                // key. By construction of `cln2` such a lane exists for every
+                // clean role-2 row, so the honest witness always names one. Under
+                // `MarkAllClean` it may not, and the fallback below names lane 0
+                // so that the LOOKUP is what rejects (rather than the
+                // "hosted by exactly one lane" gate, which would hide which
+                // statement actually failed).
+                let clean1_by_lane: Vec<HashSet<u64>> = (0..c)
+                    .map(|l| {
+                        ((l * lane_rows)..((l + 1) * lane_rows))
+                            .filter(|&i| ceff1[i] == 1)
+                            .map(|i| key1[i])
+                            .collect()
+                    })
+                    .collect();
+                let mut host: Vec<usize> = (0..cap)
+                    .map(|i| {
+                        if ceff2[i] != 1 {
+                            return 0;
+                        }
+                        (0..c)
+                            .find(|&l| clean1_by_lane[l].contains(&key2[i]))
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                // Test hook: name a lane that does not hold the key. Exactly one
+                // bit is still set, so only the mirror lookup can see it.
+                if tamper == Tamper::MisnameHostLane {
+                    // At c == 1 the single lane necessarily holds every clean
+                    // role-1 key, so there is no wrong lane to name. The mirror
+                    // constraint is still live there: `Tamper::MarkAllClean`
+                    // fires it at c == 1. Same precondition as
+                    // `Tamper::DuplicateOccurrenceAcrossLanes`.
+                    assert!(c >= 2, "misnaming a host lane needs at least two lanes");
+                    let (i, wrong) = (0..cap)
+                        .filter(|&i| ceff2[i] == 1)
+                        .find_map(|i| {
+                            (0..c)
+                                .find(|&l| !clean1_by_lane[l].contains(&key2[i]))
+                                .map(|l| (i, l))
+                        })
+                        .expect("every lane holds every clean key: nothing to misname");
+                    host[i] = wrong;
+                }
 
                 // Cell-level test hooks, applied AFTER the per-row values are
                 // derived, so exactly the intended constraint is the one that
-                // breaks.
+                // breaks. Both hit the LAST rounding-up pad row of the released
+                // capacity, which is one row of ONE column group now, so they
+                // differ in WHICH cell they break: `x` is packed into the role-1
+                // key, `y` is only ever read by the two membership lookups.
                 if tamper == Tamper::Bag1PadRow {
-                    rows12[cap1 - 1][0] = 7;
+                    rows[cap - 1][0] = 7;
                 }
                 if tamper == Tamper::Bag2PadRow {
-                    rows34[cap2 - 1][0] = 7;
+                    rows[cap - 1][1] = 7;
                 }
+
+                let w = WWitness {
+                    rows,
+                    keep2,
+                    key2,
+                    cflag2: cln2,
+                    ceff2,
+                    key1,
+                    pred1,
+                    cflag1: cln1,
+                    ceff1,
+                    ck1,
+                    oid,
+                    host,
+                };
 
                 // -------------------
-                // Bag2: shared selectors, then the c2 lanes.
-                // -------------------
-                for r in 0..lane_rows {
-                    cfg.q_t34_lookup.enable(&mut region, r)?;
-                    cfg.q_t34_flag.enable(&mut region, r)?;
-                    cfg.q_cd.enable(&mut region, r)?;
-                    cfg.q_t34_row.enable(&mut region, r)?;
-                }
-                // the within-lane step of both bags' occurrence orderings
-                for r in 0..lane_rows.saturating_sub(1) {
-                    cfg.q_oid_step.enable(&mut region, r)?;
-                }
-
-                let mut stages: Vec<CpStage> = Vec::with_capacity(c2);
-                for l in 0..c2 {
-                    let base = l * lane_rows;
-                    let rows: Vec<[u64; 3]> = (0..lane_rows)
-                        .map(|r| [key34[base + r], keep34[base + r], ceff34[base + r]])
-                        .collect();
-                    stages.push(build_cp_stage(&rows, PAD_U64));
-                }
-                debug_assert_eq!(
-                    stages
-                        .iter()
-                        .map(|s| s.map.values().map(|v| v.0).sum::<u64>())
-                        .sum::<u64>(),
-                    keep34.iter().sum::<u64>(),
-                    "the lane-local child tables must partition the kept Bag2 multiset"
-                );
-
-                let mut oid34_ends: Vec<(AssignedCell<F, F>, AssignedCell<F, F>)> =
-                    Vec::with_capacity(c2);
-                for (l, lane) in cfg.bag2_lanes.iter().enumerate() {
-                    oid34_ends.push(Self::assign_bag2_lane(
-                        lane,
-                        &mut region,
-                        lane_rows,
-                        l * lane_rows,
-                        &rows34,
-                        &keep34,
-                        &key34,
-                        &cln34,
-                        &ceff34,
-                        &oid34,
-                        &stages[l],
-                    )?);
-                }
-                let oid34_vals: Vec<(u64, u64)> = (0..c2)
-                    .map(|l| (oid34[l * lane_rows], oid34[(l + 1) * lane_rows - 1]))
-                    .collect();
-                Self::assign_oid_boundary(
-                    &mut region,
-                    &cfg.oid_bnd[1],
-                    &oid34_ends,
-                    &oid34_vals,
-                )?;
-
-                // -------------------
-                // Bag1: shared selectors, then the c1 lanes.
+                // Shared selectors, then the c lanes. Every lane is live on rows
+                // 0..lane_rows, so each of these fires once for all of them.
+                //
+                // `q_w_lookup` and `q_w_row` MUST cover the same rows. `q_w_row`
+                // is what pins `ck1 = ceff1 * key1`, and `q_w_lookup` is what
+                // gates that column as the table side of the mirror half of (9):
+                // a row inside the lookup's table but outside the pinning gate
+                // would be free advice minting a clean key. They are enabled
+                // together here so the coupling is visible in one place.
                 // -------------------
                 for r in 0..lane_rows {
-                    cfg.q_t12_lookup.enable(&mut region, r)?;
-                    cfg.q_t12_key.enable(&mut region, r)?;
-                    cfg.q_t12_row.enable(&mut region, r)?;
-                    cfg.q_order12.enable(&mut region, r)?;
+                    cfg.q_w_lookup.enable(&mut region, r)?;
+                    cfg.q_w_row.enable(&mut region, r)?;
                     cfg.q_mu.enable(&mut region, r)?;
                     if r == 0 {
                         cfg.q_sum0.enable(&mut region, r)?;
@@ -2197,46 +2235,65 @@ impl<F: Field + Ord> Gq4DpChip<F> {
                         cfg.q_sum.enable(&mut region, r)?;
                     }
                 }
+                // the within-lane step of the occurrence ordering
+                for r in 0..lane_rows.saturating_sub(1) {
+                    cfg.q_oid_step.enable(&mut region, r)?;
+                }
 
-                let mut lanes_out: Vec<Bag1LaneOut<F>> = Vec::with_capacity(c1);
-                for (l, lane) in cfg.bag1_lanes.iter().enumerate() {
-                    lanes_out.push(Self::assign_bag1_lane(
+                // The c child tables, built before any lane is assigned: every
+                // lane's probes read every one of them.
+                let mut stages: Vec<CpStage> = Vec::with_capacity(c);
+                for l in 0..c {
+                    let base = l * lane_rows;
+                    let cp_rows: Vec<[u64; 3]> = (0..lane_rows)
+                        .map(|r| [w.key2[base + r], w.keep2[base + r], w.ceff2[base + r]])
+                        .collect();
+                    stages.push(build_cp_stage(&cp_rows, PAD_U64));
+                }
+                debug_assert_eq!(
+                    stages
+                        .iter()
+                        .map(|s| s.map.values().map(|v| v.0).sum::<u64>())
+                        .sum::<u64>(),
+                    w.keep2.iter().sum::<u64>(),
+                    "the lane-local child tables must partition the kept role-2 multiset"
+                );
+
+                let mut lanes_out: Vec<WLaneOut<F>> = Vec::with_capacity(c);
+                for (l, lane) in cfg.lanes.iter().enumerate() {
+                    lanes_out.push(Self::assign_w_lane(
                         lane,
                         &mut region,
                         lane_rows,
                         l * lane_rows,
-                        &rows12,
-                        &pred12,
-                        &key12,
-                        &cln12,
-                        &ceff12,
-                        &oid12,
+                        &w,
                         &stages,
                         tamper,
                     )?);
                 }
-                let oid12_ends: Vec<(AssignedCell<F, F>, AssignedCell<F, F>)> = lanes_out
+
+                // -------------------
+                // The ONE lane seam of the occurrence ordering. Sorting W by the
+                // role-2 occurrence id put every real row before every pad row,
+                // so this single stage carries the ordering of both readings.
+                // -------------------
+                let oid_ends: Vec<(AssignedCell<F, F>, AssignedCell<F, F>)> = lanes_out
                     .iter()
                     .map(|o| o.oid_ends.clone())
                     .collect();
-                let oid12_vals: Vec<(u64, u64)> = (0..c1)
-                    .map(|l| (oid12[l * lane_rows], oid12[(l + 1) * lane_rows - 1]))
+                let oid_vals: Vec<(u64, u64)> = (0..c)
+                    .map(|l| (w.oid[l * lane_rows], w.oid[(l + 1) * lane_rows - 1]))
                     .collect();
-                Self::assign_oid_boundary(
-                    &mut region,
-                    &cfg.oid_bnd[0],
-                    &oid12_ends,
-                    &oid12_vals,
-                )?;
+                Self::assign_oid_boundary(&mut region, &cfg.oid_bnd, &oid_ends, &oid_vals)?;
 
                 // -------------------
-                // The cross-lane totals stage: c1 pairs of copy constraints, two
+                // The cross-lane totals stage: c pairs of copy constraints, two
                 // degree-2 accumulators, ONE equality between the global totals
                 // (condition (10)) and `out` for the instance.
                 // -------------------
                 let mut acc_all: u64 = 0;
                 let mut acc_cln: u64 = 0;
-                for l in 0..c1 {
+                for l in 0..c {
                     let tot_all = lanes_out[l].total_all;
                     let tot_cln = lanes_out[l].total_cln;
                     let written = if tamper == Tamper::LaneTotal && l == 0 {
@@ -2286,7 +2343,7 @@ impl<F: Field + Ord> Gq4DpChip<F> {
                     "cardinality preservation: |R^c join| != |R join|"
                 );
 
-                let out_row = c1 - 1;
+                let out_row = c - 1;
                 cfg.q_out.enable(&mut region, out_row)?;
                 let out_cell = region.assign_advice(
                     || "out",
@@ -2308,16 +2365,13 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         layouter.constrain_instance(cell.cell(), self.cfg.instance, row)
     }
 }
-/// Wrapper circuit. `lane_rows`, `num_bag1_lanes` and `num_bag2_lanes` are
-/// circuit STRUCTURE derived from the publicly released capacities, not
-/// witness.
+/// Wrapper circuit. `lane_rows` and `num_lanes` are circuit STRUCTURE derived
+/// from the publicly released capacity, not witness.
 pub struct MyCircuit<F: Field + Ord> {
     pub edges: Vec<Edge>,
-    pub bag1_pad_extra: usize,
-    pub bag2_pad_extra: usize,
+    pub pad_extra: usize,
     pub lane_rows: usize,
-    pub num_bag1_lanes: usize,
-    pub num_bag2_lanes: usize,
+    pub num_lanes: usize,
     pub tamper: Tamper,
     pub _marker: PhantomData<F>,
 }
@@ -2326,11 +2380,9 @@ impl<F: Field + Ord> Default for MyCircuit<F> {
     fn default() -> Self {
         Self {
             edges: vec![],
-            bag1_pad_extra: 0,
-            bag2_pad_extra: 0,
+            pad_extra: 0,
             lane_rows: LANE_ROWS,
-            num_bag1_lanes: 1,
-            num_bag2_lanes: 1,
+            num_lanes: 1,
             tamper: Tamper::None,
             _marker: PhantomData,
         }
@@ -2345,8 +2397,7 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
         // keep the lane geometry: it is circuit STRUCTURE, not witness
         Self {
             lane_rows: self.lane_rows,
-            num_bag1_lanes: self.num_bag1_lanes,
-            num_bag2_lanes: self.num_bag2_lanes,
+            num_lanes: self.num_lanes,
             ..Self::default()
         }
     }
@@ -2357,17 +2408,16 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 
     fn synthesize(&self, cfg: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
         assert_eq!(
-            (cfg.bag1_lanes.len(), cfg.bag2_lanes.len()),
-            (self.num_bag1_lanes, self.num_bag2_lanes),
-            "configured lane counts do not match the circuit: call \
-             set_config_lanes(num_bag1_lanes, num_bag2_lanes) before keygen / MockProver"
+            cfg.lanes.len(),
+            self.num_lanes,
+            "configured lane count does not match the circuit: call \
+             set_config_lanes(num_lanes) before keygen / MockProver"
         );
         let chip = Gq4DpChip::<F>::construct(cfg);
         let out = chip.assign(
             &mut layouter,
             &self.edges,
-            self.bag1_pad_extra,
-            self.bag2_pad_extra,
+            self.pad_extra,
             self.lane_rows,
             self.tamper,
         )?;
@@ -2383,42 +2433,39 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 // `src/bin/dp_lane_bench.rs`.
 // ---------------------------------------------------------------------------
 
-/// Geometry the two released capacities imply, plus the edges they were
-/// derived from. No SRS is read and no key is built here.
+/// Geometry the released capacity implies, plus the edges it was derived from.
+/// No SRS is read and no key is built here.
 struct Gq4DpSetup {
     edges: Vec<Edge>,
-    bag1_pad_extra: usize,
-    bag2_pad_extra: usize,
+    pad_extra: usize,
     plan: crate::dp_lane::DpLanePlan,
 }
 
-/// Geometry the two released capacities imply, or an explanation of why this
+/// Geometry the released capacity implies, or an explanation of why this
 /// configuration cannot be built.
 ///
-/// `Err` covers every way a row can be rejected BEFORE proving: the lane cap on
-/// EITHER bag, and the structural fit of the tallest column group at the pinned
-/// degree. All three are properties of the request, so a sweep reports them and
-/// continues.
+/// `Err` covers every way a row can be rejected BEFORE proving: the lane cap,
+/// and the structural fit of the tallest column group at the pinned degree.
+/// Both are properties of the request, so a sweep reports them and continues.
 fn try_dp_lane_setup(
     dataset: &str,
     privacy: crate::bench_queries::Privacy,
 ) -> Result<Gq4DpSetup, String> {
     let edges = crate::bench_queries::load_graph(dataset);
-    let (bag1_pad_extra, bag2_pad_extra) =
-        crate::bench_queries::graph_pads("gq4", dataset, &edges, privacy);
+    // ONE released capacity: the two column roles are one relation, so their
+    // cardinality is one statistic and `graph_pads` returns it twice (the pair
+    // shape is what GQ3 and Q5 need). Reading `.0` is what `bench_queries`
+    // itself does for gq4.
+    let pad_extra = crate::bench_queries::graph_pads("gq4", dataset, &edges, privacy).0;
 
-    // The degree is PINNED at the Revealing-Join-Size value; the DP releases
-    // are absorbed by lanes, not by a bigger domain.
+    // The degree is PINNED at the Revealing-Join-Size value; the DP release is
+    // absorbed by lanes, not by a bigger domain.
     let k = crate::bench_queries::degree_for("gq4", dataset, crate::bench_queries::Privacy::Rjs);
     let lane_rows = lane_rows_for(k);
 
     let stats = crate::bench_queries::bag_stats("gq4", &edges);
-    let n12 = stats.bag1_size as usize + bag1_pad_extra;
-    let n34 = stats.bag2_size as usize + bag2_pad_extra;
-    // BOTH bags are laned, so both can be the one that does not fit; name the
-    // bag in the message so a skipped row says which release was too big.
-    let c1 = try_lanes_for_capacity(n12, k).map_err(|e| format!("bag1: {}", e))?;
-    let c2 = try_lanes_for_capacity(n34, k).map_err(|e| format!("bag2: {}", e))?;
+    let n = stats.bag1_size as usize + pad_extra;
+    let c = try_lanes_for_capacity(n, k)?;
 
     // Every column group must fit under the range-table loads plus slack.
     //
@@ -2431,7 +2478,12 @@ fn try_dp_lane_setup(
     // this check uses `lane_rows`, matching g_sql3_obj_dp. The authoritative
     // fit check against the constraint system halo2 actually builds is
     // `tests::structure_fits_base_degree`.
-    let tallest = (edges.len() + 2).max(lane_rows).max(c1);
+    //
+    // The cross-lane stages are the other two candidates and both are tiny: the
+    // totals stage is c rows and the ONE seam stage is c-1, so `max(lane_rows,
+    // c)` covers them. The second seam term the two-bag version omitted is now
+    // genuinely absent.
+    let tallest = (edges.len() + 2).max(lane_rows).max(c);
     if PREAMBLE_ROWS + tallest + BLINDING_SLACK > 1usize << k {
         return Err(format!(
             "tallest column group ({} rows) does not fit k={} ({} rows, of which {} go to \
@@ -2449,15 +2501,14 @@ fn try_dp_lane_setup(
         dataset: dataset.to_string(),
         k,
         lane_rows,
-        lanes: vec![c1, c2],
-        capacity: vec![n12, n34],
-        true_size: vec![stats.bag1_size as usize, stats.bag2_size as usize],
-        pads: vec![bag1_pad_extra, bag2_pad_extra],
+        lanes: vec![c],
+        capacity: vec![n],
+        true_size: vec![stats.bag1_size as usize],
+        pads: vec![pad_extra],
     };
     Ok(Gq4DpSetup {
         edges,
-        bag1_pad_extra,
-        bag2_pad_extra,
+        pad_extra,
         plan,
     })
 }
@@ -2486,7 +2537,7 @@ pub fn plan_dp_lanes(
     dp_lane_setup(dataset, privacy).plan
 }
 
-/// Real IPA proving at the Revealing-Join-Size degree with both DP releases
+/// Real IPA proving at the Revealing-Join-Size degree with the DP release
 /// hosted in lanes.
 ///
 /// The verifying and proving keys are built ONCE, outside the timed region;
@@ -2516,17 +2567,15 @@ pub fn run_dp_lanes(
     assert!(reps >= 1, "reps must be at least 1");
     let setup = dp_lane_setup(dataset, privacy);
     let k = setup.plan.k;
-    let (c1, c2) = (setup.plan.lanes[0], setup.plan.lanes[1]);
+    let c = setup.plan.lanes[0];
     let cnt = crate::bench_queries::count_gq4(&setup.edges);
 
-    set_config_lanes(c1, c2);
+    set_config_lanes(c);
     let build = || MyCircuit::<Fp> {
         edges: setup.edges.clone(),
-        bag1_pad_extra: setup.bag1_pad_extra,
-        bag2_pad_extra: setup.bag2_pad_extra,
+        pad_extra: setup.pad_extra,
         lane_rows: setup.plan.lane_rows,
-        num_bag1_lanes: c1,
-        num_bag2_lanes: c2,
+        num_lanes: c,
         tamper: Tamper::None,
         _marker: PhantomData,
     };
@@ -2604,8 +2653,8 @@ pub fn run_dp_lanes(
 #[cfg(test)]
 mod tests {
     use super::{
-        bag1_pred, bag2_keep, bag2_rows, lane_rows_for, lanes_for, lanes_for_capacity,
-        set_config_lanes, MyCircuit, Tamper, BASE_DEGREE, LANE_ROWS, MAX_LANES,
+        lane_rows_for, lanes_for, lanes_for_capacity, role1_pred, role2_keep, set_config_lanes,
+        w_rows, MyCircuit, Tamper, BASE_DEGREE, LANE_ROWS, MAX_LANES,
     };
 
     use crate::data::graph_data_processing::Edge;
@@ -2620,18 +2669,20 @@ mod tests {
     /// d in {4,5,6,7,8}, so there are exactly FIVE ordered 4-cycles, all
     /// sharing the separator pair (A,C) = (0,3).
     ///
-    /// The shape is chosen so the message cannot live in one lane. Both bags
-    /// materialize 11 rows, and the single separator key that carries the answer
-    /// has multiplicity 5 in Bag2. With `LANE_ROWS_SMALL` = 4 those five rows
-    /// cannot all land in one Bag2 lane, so `mock_three_lanes` only reaches the
-    /// right answer if the Bag1 probes really do SUM the values retrieved from
-    /// every Bag2 lane's child table. See
-    /// `heavy_key_spans_multiple_bag2_lanes`, which pins that down.
+    /// The shape is chosen so the message cannot live in one lane. W
+    /// materializes 11 rows, and the single separator key that carries the answer
+    /// has multiplicity 5 in the ROLE-2 reading. With `LANE_ROWS_SMALL` = 4 those
+    /// five rows cannot all land in one lane, so `mock_three_lanes` only reaches
+    /// the right answer if the role-1 probes really do SUM the values retrieved
+    /// from every lane's child table. See `heavy_key_spans_multiple_bag2_lanes`,
+    /// which pins that down.
     ///
     /// The shape also has DANGLING tuples on both ends of the bag tree edge --
-    /// 5 predicate-passing Bag1 rows whose key occurs in no Bag2 tuple, and 6
-    /// kept Bag2 rows whose key occurs in no predicate-passing Bag1 row -- which
-    /// is what makes `mock_reject_mark_all_clean` non-vacuous.
+    /// 5 predicate-passing role-1 rows whose key occurs in no kept role-2 tuple,
+    /// and 6 kept role-2 rows whose key occurs in no predicate-passing role-1
+    /// row -- which is what makes `mock_reject_mark_all_clean` non-vacuous and
+    /// what the mirror half of condition (9) has to accept on the honest
+    /// witness.
     fn synthetic_edges() -> Vec<Edge> {
         let mut edges = vec![Edge { src: 0, dst: 1 }, Edge { src: 1, dst: 3 }];
         for d in 4..9u64 {
@@ -2641,42 +2692,38 @@ mod tests {
         edges
     }
 
-    /// True size of either bag on [`synthetic_edges`].
+    /// True size of W on [`synthetic_edges`].
     const SYNTH_BAG_ROWS: usize = 11;
     /// Rows per lane in the small tests.
     const LANE_ROWS_SMALL: usize = 4;
     /// COUNT(*) on [`synthetic_edges`].
     const SYNTH_CNT: u64 = 5;
 
-    /// Both bags hold 11 rows, so 1 pad row gives a released capacity of 12,
-    /// which at 4 rows per lane spans exactly 3 lanes and leaves the last row
-    /// of each pipeline as a rounding-up pad.
-    fn three_lane_circuit(tamper: Tamper) -> (MyCircuit<Fp>, usize, usize) {
+    /// W holds 11 rows, so 1 pad row gives a released capacity of 12, which at 4
+    /// rows per lane spans exactly 3 lanes and leaves the last row of the
+    /// pipeline as a rounding-up pad.
+    fn three_lane_circuit(tamper: Tamper) -> (MyCircuit<Fp>, usize) {
         let edges = synthetic_edges();
         let lane_rows = LANE_ROWS_SMALL;
-        let bag1_pad_extra = 1;
-        let bag2_pad_extra = 1;
-        let c1 = lanes_for(SYNTH_BAG_ROWS + bag1_pad_extra, lane_rows);
-        let c2 = lanes_for(SYNTH_BAG_ROWS + bag2_pad_extra, lane_rows);
-        assert_eq!((c1, c2), (3, 3));
+        let pad_extra = 1;
+        let c = lanes_for(SYNTH_BAG_ROWS + pad_extra, lane_rows);
+        assert_eq!(c, 3);
 
         let circuit = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra,
-            bag2_pad_extra,
+            pad_extra,
             lane_rows,
-            num_bag1_lanes: c1,
-            num_bag2_lanes: c2,
+            num_lanes: c,
             tamper,
             _marker: PhantomData,
         };
-        (circuit, c1, c2)
+        (circuit, c)
     }
 
     /// Runs the three-lane circuit under MockProver and returns the failures.
     fn three_lane_failures(tamper: Tamper) -> Vec<VerifyFailure> {
-        let (circuit, c1, c2) = three_lane_circuit(tamper);
-        set_config_lanes(c1, c2);
+        let (circuit, c) = three_lane_circuit(tamper);
+        set_config_lanes(c);
         let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(SYNTH_CNT)]]).unwrap();
         prover
             .verify()
@@ -2712,24 +2759,26 @@ mod tests {
             .any(|f| format!("{:?}", f).contains(needle))
     }
 
-    /// The separator key that carries the whole answer has multiplicity 5 in
-    /// Bag2 while a lane only holds 4 rows, so its count is necessarily split
-    /// over at least two Bag2 lanes. This is what makes `mock_three_lanes` a
-    /// real test of the cross-lane message sum rather than of a single table.
+    /// The separator key that carries the whole answer has multiplicity 5 in the
+    /// ROLE-2 reading while a lane only holds 4 rows, so its count is
+    /// necessarily split over at least two lanes. This is what makes
+    /// `mock_three_lanes` a real test of the cross-lane message sum rather than
+    /// of a single table.
     ///
-    /// The lane a Bag2 row falls into is decided by the GLOBAL occurrence-id
-    /// order the distinctness argument requires, so this test asks
-    /// `bag2_rows` for the layout instead of assuming the derivation order.
+    /// The lane a row falls into is decided by the GLOBAL occurrence-id order the
+    /// distinctness argument requires, so this test asks `w_rows` for the layout
+    /// instead of assuming the derivation order.
     #[test]
     fn heavy_key_spans_multiple_bag2_lanes() {
         use std::collections::BTreeMap;
 
         let edges = synthetic_edges();
         let derived = crate::graph_sql::g_sql4_obj::gq4_derive(&edges);
-        assert_eq!(derived.t12.len(), SYNTH_BAG_ROWS);
-        assert_eq!(derived.t34.len(), SYNTH_BAG_ROWS);
+        // ONE materialized relation, read in two column roles, so one length
+        // assertion covers both readings.
+        assert_eq!(derived.w.len(), SYNTH_BAG_ROWS);
 
-        // the heaviest message key, and the lanes its Bag2 rows fall into
+        // the heaviest message key, and the lanes its role-2 rows fall into
         let (&heavy, &mult) = derived
             .msg_map
             .iter()
@@ -2738,10 +2787,10 @@ mod tests {
         assert_eq!(mult, 5, "the five 4-cycles all share one separator key");
 
         let capacity = 3 * LANE_ROWS_SMALL;
-        let rows = bag2_rows(&derived.t34, capacity);
+        let rows = w_rows(&derived.w, capacity);
         let mut per_lane: BTreeMap<usize, u64> = BTreeMap::new();
         for (i, r) in rows.iter().enumerate() {
-            if bag2_keep(r) == 1 && crate::graph_sql::g_sql4_obj::pack2(r[2], r[0]) == heavy {
+            if role2_keep(r) == 1 && crate::graph_sql::g_sql4_obj::pack2(r[2], r[0]) == heavy {
                 *per_lane.entry(i / LANE_ROWS_SMALL).or_default() += 1;
             }
         }
@@ -2767,43 +2816,49 @@ mod tests {
         let derived = crate::graph_sql::g_sql4_obj::gq4_derive(&edges);
         let pack2 = crate::graph_sql::g_sql4_obj::pack2;
 
-        let kept34_keys: HashSet<u64> = derived
-            .t34
+        // Both readings are the same `w` rows: role 1 reads them as (A,B,C) and
+        // needs the extra [B<C], role 2 reads them as (C,D,A) and needs nothing
+        // extra since `w` is pre-filtered to x<y.
+        let kept2_keys: HashSet<u64> = derived
+            .w
             .iter()
-            .filter(|&&(c, d, ..)| c < d)
-            .map(|&(c, _d, a, ..)| pack2(a, c))
+            .map(|&(x, _y, z, ..)| pack2(z, x))
             .collect();
-        let pred12_keys: HashSet<u64> = derived
-            .t12
+        let pred1_keys: HashSet<u64> = derived
+            .w
             .iter()
-            .filter(|&&(a, b, c, ..)| a < b && b < c)
-            .map(|&(a, _b, c, ..)| pack2(a, c))
+            .filter(|&&(_x, y, z, ..)| y < z)
+            .map(|&(x, _y, z, ..)| pack2(x, z))
             .collect();
-        let dangling12 = derived
-            .t12
+        let dangling1 = derived
+            .w
             .iter()
-            .filter(|&&(a, b, c, ..)| a < b && b < c && !kept34_keys.contains(&pack2(a, c)))
+            .filter(|&&(x, y, z, ..)| y < z && !kept2_keys.contains(&pack2(x, z)))
             .count();
-        let dangling34 = derived
-            .t34
+        let dangling2 = derived
+            .w
             .iter()
-            .filter(|&&(c, d, a, ..)| c < d && !pred12_keys.contains(&pack2(a, c)))
+            .filter(|&&(x, _y, z, ..)| !pred1_keys.contains(&pack2(z, x)))
             .count();
         println!(
-            "[gq4 dp] dangling: t12={} t34={}",
-            dangling12, dangling34
+            "[gq4 dp] dangling: role1={} role2={}",
+            dangling1, dangling2
         );
         assert!(
-            dangling12 > 0,
-            "no dangling Bag1 tuple: the all-clean direction would be vacuous"
+            dangling1 > 0,
+            "no dangling role-1 tuple: the all-clean direction would be vacuous"
         );
     }
 
-    /// Every predicate-passing bag row must have a DISTINCT occurrence id, or
-    /// the honest witness could not satisfy the global ordering in the first
-    /// place. `pack2(r1_eid, r2_eid)` is a function of the occurrence, so this
-    /// is a property of the derivation, checked here so a failure points at the
-    /// derivation rather than at a gate.
+    /// Every kept row must have a DISTINCT occurrence id, or the honest witness
+    /// could not satisfy the global ordering in the first place.
+    /// `pack2(e1, e2)` is a function of the occurrence, so this is a property of
+    /// the derivation, checked here so a failure points at the derivation rather
+    /// than at a gate.
+    ///
+    /// ONE ordering covers both roles, so this checks the ROLE-2 keep bit, which
+    /// is W's own x<y filter and therefore holds on every real row; the role-1
+    /// ids are a subset of these.
     #[test]
     fn occurrence_ids_are_distinct() {
         use std::collections::HashSet;
@@ -2811,32 +2866,35 @@ mod tests {
         let edges = synthetic_edges();
         let derived = crate::graph_sql::g_sql4_obj::gq4_derive(&edges);
 
-        let ids12: Vec<u64> = derived
-            .t12
+        let ids2: Vec<u64> = derived
+            .w
             .iter()
-            .map(|&(a, b, c, _i, _j, e1, e2)| {
-                let r = [a, b, c, 0, 0, e1, e2, 1];
-                (bag1_pred(&r), crate::graph_sql::g_sql4_obj::pack2(e1, e2))
-            })
-            .filter(|&(p, _)| p == 1)
-            .map(|(_, id)| id)
+            .map(|&(x, y, z, _i, _j, e1, e2)| [x, y, z, 0, 0, e1, e2, 1])
+            .filter(|r| role2_keep(r) == 1)
+            .map(|r| crate::graph_sql::g_sql4_obj::pack2(r[5], r[6]))
             .collect();
+        assert_eq!(ids2.len(), derived.w.len(), "W is pre-filtered to x<y");
         assert_eq!(
-            ids12.len(),
-            ids12.iter().copied().collect::<HashSet<u64>>().len(),
-            "two Bag1 occurrences share an id"
+            ids2.len(),
+            ids2.iter().copied().collect::<HashSet<u64>>().len(),
+            "two role-2 occurrences share an id"
         );
 
-        let ids34: Vec<u64> = derived
-            .t34
+        let ids1: Vec<u64> = derived
+            .w
             .iter()
-            .filter(|&&(c, d, ..)| c < d)
-            .map(|&(_c, _d, _a, _i, _j, e3, e4)| crate::graph_sql::g_sql4_obj::pack2(e3, e4))
+            .map(|&(x, y, z, _i, _j, e1, e2)| [x, y, z, 0, 0, e1, e2, 1])
+            .filter(|r| role1_pred(r) == 1)
+            .map(|r| crate::graph_sql::g_sql4_obj::pack2(r[5], r[6]))
             .collect();
+        assert!(
+            ids1.len() < ids2.len(),
+            "role 1 must be a proper subset here, or the slice is degenerate"
+        );
         assert_eq!(
-            ids34.len(),
-            ids34.iter().copied().collect::<HashSet<u64>>().len(),
-            "two Bag2 occurrences share an id"
+            ids1.len(),
+            ids1.iter().copied().collect::<HashSet<u64>>().len(),
+            "two role-1 occurrences share an id"
         );
     }
 
@@ -2845,18 +2903,22 @@ mod tests {
     /// individual gate saves. The bound is the one `g_sql4_obj` already pays: a
     /// membership lookup with a degree-3 input and a degree-2 table side, i.e.
     /// 2 + 3 + 2 = 7.
+    ///
+    /// `P` is the crude column-work proxy the COST NOTE quotes,
+    /// advice + 3*lookups + shuffles.
     #[test]
     fn test_max_gate_degree() {
         use halo2_proofs::plonk::ConstraintSystem;
 
-        for (c1, c2) in [(1usize, 1usize), (2, 1), (1, 2), (4, 3)] {
-            set_config_lanes(c1, c2);
+        for c in [1usize, 2, 3, 4] {
+            set_config_lanes(c);
             let mut cs = ConstraintSystem::<Fp>::default();
             let _ = <MyCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
-            println!("c1={} c2={} cs.degree() = {}", c1, c2, cs.degree());
+            let p = cs.num_advice_columns() + 3 * cs.lookups().len() + cs.shuffles().len();
+            println!("c={} cs.degree() = {}", c, cs.degree());
             println!(
                 "  advice={} fixed={} instance={} selectors={} gates={} lookups={} \
-                 shuffles={} perm_cols={}",
+                 shuffles={} perm_cols={} P={}",
                 cs.num_advice_columns(),
                 cs.num_fixed_columns(),
                 cs.num_instance_columns(),
@@ -2865,12 +2927,12 @@ mod tests {
                 cs.lookups().len(),
                 cs.shuffles().len(),
                 cs.permutation().get_columns().len(),
+                p,
             );
             assert!(
                 cs.degree() <= 7,
-                "c1={} c2={}: the maximum gate degree rose to {}, which doubles every FFT",
-                c1,
-                c2,
+                "c={}: the maximum gate degree rose to {}, which doubles every FFT",
+                c,
                 cs.degree()
             );
         }
@@ -2890,39 +2952,62 @@ mod tests {
         assert_eq!(lane_rows_for(BASE_DEGREE), LANE_ROWS);
         assert!(lane_rows_for(22) > 15 * LANE_ROWS);
 
-        // measured releases at eps=0.1: lastfm needs 4 Bag1 lanes and 3 Bag2
-        // lanes at k=18 (it would otherwise need k=20)
+        // The releases the default VPJOIN_DP_SEED produces, as `graph_pads`
+        // reports them for ONE capacity release (the two column roles are one
+        // private cardinality). These assertions are arithmetic on the released
+        // numbers, so a seed change moves the inputs, not the property.
+        //
+        // lastfm at eps=0.1 needs 2 lanes at k=18 (it would otherwise need
+        // k=19); the two-bag version quoted 788,220 and 621,070 from a 3-way
+        // budget split and got 4 and 3.
+        assert_eq!(lanes_for_capacity(512_521, 18), 2);
         assert_eq!(lanes_for_capacity(788_220, 18), 4);
-        assert_eq!(lanes_for_capacity(621_070, 18), 3);
-        // facebook and wiki collapse to a single lane of each kind at k=22
-        assert_eq!(lanes_for_capacity(3_703_832, 22), 1);
-        assert_eq!(lanes_for_capacity(3_797_163, 22), 1);
-        assert_eq!(lanes_for_capacity(3_142_942, 22), 1);
-        assert_eq!(lanes_for_capacity(3_017_452, 22), 1);
-        // facebook and wiki at eps=0.01 stay under the structural cap at k=22
-        assert!(lanes_for_capacity(36_036_597, 22) <= MAX_LANES);
-        assert!(lanes_for_capacity(39_114_118, 22) <= MAX_LANES);
+        // facebook and wiki collapse to a single lane at k=22
+        assert_eq!(lanes_for_capacity(3_284_609, 22), 1);
+        assert_eq!(lanes_for_capacity(2_767_286, 22), 1);
+        // at eps=0.01 every dataset stays under the structural cap, lastfm only
+        // just: 63 lanes is 3,969 probe replicas, which the COST NOTE says is
+        // past the point where lanes are the right tool.
+        assert_eq!(lanes_for_capacity(16_336_389, 18), 63);
+        assert!(lanes_for_capacity(16_336_389, 18) <= MAX_LANES);
+        assert_eq!(lanes_for_capacity(18_253_740, 22), 5);
+        assert_eq!(lanes_for_capacity(17_190_338, 22), 5);
     }
 
-    /// PRIVACY AUDIT. Every lane of a kind must be a FULL structural replica:
-    /// no lane may be cheaper than another, or the constraint system would leak
-    /// where the real rows stop, which is exactly what the DP release pays to
-    /// hide. That is equivalent to the circuit shape being EXACTLY BILINEAR in
-    /// (c1, c2) -- constant, plus a fixed cost per Bag1 lane, plus a fixed cost
-    /// per Bag2 lane, plus a fixed cost per (Bag1 lane, Bag2 lane) probe pair.
-    /// Fit that model on the corners and check it on a whole grid.
+    /// PRIVACY AUDIT. Every lane must be a FULL structural replica: no lane may
+    /// be cheaper than another, or the constraint system would leak where the
+    /// real rows stop, which is exactly what the DP release pays to hide. With
+    /// one kind of lane and one probe per (row lane, child lane) pair that is
+    /// equivalent to the circuit shape being EXACTLY QUADRATIC in c -- constant,
+    /// plus a fixed cost per lane, plus a fixed cost per probe pair. Fit that
+    /// model on c = 1, 2, 3 and check it off the fit.
     ///
     /// The same fit also pins down the sharing that keeps the preamble bounded:
-    /// fixed columns, selectors and shuffles must not grow with c1 at all
-    /// (every Bag1 lane is live on the same rows, so they share every selector,
-    /// and they hold no range table and no shuffle of their own).
+    /// fixed columns must not grow with c at all (one shared u8 range table),
+    /// the shuffle count must be exactly 4 + 2c (the four preamble shuffles,
+    /// plus the two a lane's child stage owns), and the quadratic coefficient
+    /// must be zero for everything except advice and lookups, since a probe
+    /// pair adds no fixed column, no selector, no shuffle and no permutation
+    /// column.
+    ///
+    /// Selectors DO carry a linear term: `assign_cp_agg` enables its own
+    /// selectors, so each lane's child stage brings its own. That is uniform
+    /// across lanes, which is what the audit is about.
     #[test]
     fn lanes_are_structural_replicas() {
         use halo2_proofs::plonk::ConstraintSystem;
 
         const N: usize = 7;
-        fn shape(c1: usize, c2: usize) -> [i64; N] {
-            set_config_lanes(c1, c2);
+        const ADVICE: usize = 0;
+        const FIXED: usize = 1;
+        const SEL: usize = 2;
+        const LOOKUPS: usize = 3;
+        const SHUF: usize = 4;
+        const PERM: usize = 5;
+        const DEGREE: usize = 6;
+
+        fn shape(c: usize) -> [i64; N] {
+            set_config_lanes(c);
             let mut cs = ConstraintSystem::<Fp>::default();
             let _ = <MyCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
             [
@@ -2936,131 +3021,124 @@ mod tests {
             ]
         }
 
-        let s11 = shape(1, 1);
-        let s21 = shape(2, 1);
-        let s12 = shape(1, 2);
-        let s22 = shape(2, 2);
+        let s1 = shape(1);
+        let s2 = shape(2);
+        let s3 = shape(3);
 
-        // per-Bag1-lane, per-Bag2-lane and per-probe-pair costs
-        let mut d1 = [0i64; N]; // one more Bag1 lane, at c2 = 1
-        let mut d2 = [0i64; N]; // one more Bag2 lane, at c1 = 1
-        let mut d12 = [0i64; N]; // the extra probe replica the pair costs
+        // shape(c) = a + b*c + q*c^2, from the three cells
+        let mut a = [0i64; N];
+        let mut b = [0i64; N];
+        let mut q = [0i64; N];
         for i in 0..N {
-            d1[i] = s21[i] - s11[i];
-            d2[i] = s12[i] - s11[i];
-            d12[i] = s22[i] - s21[i] - s12[i] + s11[i];
+            // second difference is 2q
+            assert_eq!(
+                (s3[i] - 2 * s2[i] + s1[i]) % 2,
+                0,
+                "component {i} is not quadratic in c"
+            );
+            q[i] = (s3[i] - 2 * s2[i] + s1[i]) / 2;
+            b[i] = s2[i] - s1[i] - 3 * q[i];
+            a[i] = s1[i] - b[i] - q[i];
         }
 
-        for (i, what) in [
-            (1usize, "fixed columns"),
-            (2, "selectors"),
-            (4, "shuffles"),
-            (6, "degree"),
-        ] {
-            assert_eq!(d1[i], 0, "{what} must not grow with the Bag1 lane count");
+        for i in [FIXED, DEGREE] {
+            assert_eq!(b[i], 0, "component {i} must not grow with the lane count");
+            assert_eq!(q[i], 0, "component {i} must not carry a c^2 term");
         }
-        assert_eq!(d12[6], 0, "degree must not grow with the probe count");
-        for (i, what) in [
-            (1usize, "fixed columns"),
-            (2, "selectors"),
-            (4, "shuffles"),
-            (5, "permutation columns"),
-            (6, "degree"),
-        ] {
+        assert_eq!(
+            a[DEGREE] + b[DEGREE] + q[DEGREE],
+            7,
+            "degree must stay at g_sql4_obj's 7"
+        );
+        assert_eq!(a[FIXED], 3, "three fixed columns: two view u8 tables and one shared lane u8");
+        // A probe pair is a pure advice-plus-lookup replica: it shares the two
+        // probe selectors with every other probe, holds no range table of its
+        // own, owns no shuffle, and nothing copies a probe cell.
+        for i in [FIXED, SEL, SHUF, PERM, DEGREE] {
             assert_eq!(
-                d12[i], 0,
-                "{what} must not carry a c1*c2 term (probes share them)"
+                q[i], 0,
+                "component {i} must not carry a c^2 term (probes share them)"
             );
         }
-        assert_eq!(d1[6], 0, "degree must stay 7 as Bag1 lanes are added");
-        assert_eq!(d2[6], 0, "degree must stay 7 as Bag2 lanes are added");
-        assert_eq!(
-            d1[1], 0,
-            "a lane must not claim a range-table column of its own"
+        assert!(
+            q[ADVICE] > 0 && q[LOOKUPS] > 0,
+            "a probe pair must cost advice and lookups"
         );
-        assert_eq!(d2[1], 0, "a Bag2 lane shares the one lane u8 column");
-        assert!(d1[0] > 0 && d2[0] > 0 && d12[0] > 0, "a lane must cost");
-        // Exactly three cells leave a Bag1 lane by copy: the two ends of its
-        // occurrence-id column, for the lane seam of the global ordering, and
-        // the last cell of each of the two channel prefix sums, for the totals
-        // stage where condition (10) is compared. A Bag2 lane exports nothing by
-        // copy except the two ends of ITS occurrence-id column; the rest of the
-        // permutation cost a Bag2 lane pays is internal to its child stage.
+        assert!(b[ADVICE] > 0, "a lane must cost");
+        // Shuffles: the two view sorts and the two edge-conservation shuffles,
+        // plus the two a lane's child stage owns. Nothing else may shuffle, and
+        // in particular no cross-lane column group may appear.
         assert_eq!(
-            d1[5], 3,
-            "a Bag1 lane must add exactly three permutation columns \
-             (t12_oid, sum_all, sum_cln)"
+            (a[SHUF], b[SHUF], q[SHUF]),
+            (4, 2, 0),
+            "the shuffle count must be exactly 4 + 2c"
+        );
+        // Of a lane's permutation columns exactly three carry a cell OUT of the
+        // lane: the occurrence-id column, for the lane seam of the global
+        // ordering, and the two channel prefix sums, for the totals stage where
+        // condition (10) is compared. The rest are internal to its child stage,
+        // which shuffles its own sorted view and emitted table.
+        assert!(
+            b[PERM] >= 3,
+            "a lane must export its oid ends and its two channel totals"
         );
 
-        // Now the audit proper: the model must hold EXACTLY off the corners.
-        // Any lane that were cheaper than its siblings, or any structure keyed
-        // to the true bag size, would break the fit.
-        for c1 in 1..=4usize {
-            for c2 in 1..=4usize {
-                let got = shape(c1, c2);
-                for i in 0..N {
-                    let want = s11[i]
-                        + (c1 as i64 - 1) * d1[i]
-                        + (c2 as i64 - 1) * d2[i]
-                        + (c1 as i64 - 1) * (c2 as i64 - 1) * d12[i];
-                    assert_eq!(
-                        got[i], want,
-                        "c1={c1} c2={c2}: component {i} is {} but a full replica costs {}",
-                        got[i], want
-                    );
-                }
+        // Now the audit proper: the model must hold EXACTLY off the fit. Any
+        // lane that were cheaper than its siblings, or any structure keyed to
+        // the true bag size, would break it.
+        for c in 1..=5usize {
+            let got = shape(c);
+            for i in 0..N {
+                let want = a[i] + b[i] * c as i64 + q[i] * (c * c) as i64;
+                assert_eq!(
+                    got[i], want,
+                    "c={c}: component {i} is {} but a full replica costs {}",
+                    got[i], want
+                );
             }
         }
     }
 
     /// The COUNT(*) must be invariant to the lane geometry, and the block-wise
-    /// split must place every real row of BOTH bags in exactly one lane at the
-    /// right offset. The geometries below cover: no rounding-up pad at all (the
-    /// last lane of each pipeline is entirely real), real rows straddling a
-    /// lane boundary, an odd rounding-up tail, a lane holding a single real
-    /// row, and `lane_rows` = 1, where `q_sum` never fires, every lane's prefix
-    /// sum is just its one row and EVERY step of the occurrence ordering is a
-    /// lane seam.
+    /// split must place every real row in exactly one lane at the right offset.
+    /// The geometries below cover: no rounding-up pad at all (the last lane is
+    /// entirely real), real rows straddling a lane boundary, an odd rounding-up
+    /// tail, a lane holding a single real row, and `lane_rows` = 1, where
+    /// `q_sum` never fires, every lane's prefix sum is just its one row and
+    /// EVERY step of the occurrence ordering is a lane seam.
     #[test]
     fn mock_lane_geometries() {
-        // (lane_rows, bag1_pad_extra, bag2_pad_extra, expected c1, expected c2)
-        let cases: [(usize, usize, usize, usize, usize); 6] = [
-            (11, 0, 0, 1, 1),  // exactly one full lane each, no pad anywhere
-            (6, 0, 0, 2, 2),   // real rows straddle the lane-0/lane-1 boundary
-            (3, 1, 1, 4, 4),   // 12 released rows over 12: one rounding-up pad
-            (5, 3, 0, 3, 3),   // 14 released rows over 15 vs 11 over 15
-            (2, 0, 0, 6, 6),   // the last lane holds a single real row
-            (1, 0, 0, 11, 11), // one row per lane: every step is a seam
+        // (lane_rows, pad_extra, expected c)
+        let cases: [(usize, usize, usize); 6] = [
+            (11, 0, 1), // exactly one full lane, no pad anywhere
+            (6, 0, 2),  // real rows straddle the lane-0/lane-1 boundary
+            (3, 1, 4),  // 12 released rows over 12: one rounding-up pad
+            (5, 3, 3),  // 14 released rows over 15
+            (2, 0, 6),  // the last lane holds a single real row
+            (1, 0, 11), // one row per lane: every step is a seam
         ];
-        for (lane_rows, p1, p2, want_c1, want_c2) in cases {
-            let c1 = lanes_for(SYNTH_BAG_ROWS + p1, lane_rows);
-            let c2 = lanes_for(SYNTH_BAG_ROWS + p2, lane_rows);
-            assert_eq!((c1, c2), (want_c1, want_c2), "lane_rows={lane_rows}");
+        for (lane_rows, pad_extra, want_c) in cases {
+            let c = lanes_for(SYNTH_BAG_ROWS + pad_extra, lane_rows);
+            assert_eq!(c, want_c, "lane_rows={lane_rows}");
 
-            set_config_lanes(c1, c2);
+            set_config_lanes(c);
             let circuit = MyCircuit::<Fp> {
                 edges: synthetic_edges(),
-                bag1_pad_extra: p1,
-                bag2_pad_extra: p2,
+                pad_extra,
                 lane_rows,
-                num_bag1_lanes: c1,
-                num_bag2_lanes: c2,
+                num_lanes: c,
                 tamper: Tamper::None,
                 _marker: PhantomData,
             };
             let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(SYNTH_CNT)]]).unwrap();
-            assert_eq!(
-                prover.verify(),
-                Ok(()),
-                "lane_rows={lane_rows} c1={c1} c2={c2}"
-            );
+            assert_eq!(prover.verify(), Ok(()), "lane_rows={lane_rows} c={c}");
 
             // ... and the same geometry must reject a wrong public count
             let prover =
                 MockProver::run(11, &circuit, vec![vec![Fp::from(SYNTH_CNT + 1)]]).unwrap();
             assert!(
                 prover.verify().is_err(),
-                "lane_rows={lane_rows} c1={c1} c2={c2} accepted a wrong COUNT(*)"
+                "lane_rows={lane_rows} c={c} accepted a wrong COUNT(*)"
             );
         }
     }
@@ -3068,26 +3146,26 @@ mod tests {
     /// `LANE_ROWS` is arithmetic on a CONSERVATIVE guess at the preamble and
     /// the blinding rows. Get it wrong and nothing fails until a multi-hour
     /// real proof aborts, so check it against the constraint system halo2
-    /// actually builds, at the two production cells:
-    ///   * lastfm  k = 18, c1 = 4, c2 = 3 (the cell lanes exist for)
-    ///   * fb/wiki k = 22, c1 = c2 = 1
+    /// actually builds, at the production cells:
+    ///   * lastfm  k = 18, c = 2 (the cell lanes exist for), plus c = 4 as
+    ///     headroom for a noisier release
+    ///   * fb/wiki k = 22, c = 1
     /// A lane occupies `lane_rows + 1` region rows: the child stage writes a
     /// sentinel row at `lane_rows` for its `Rotation::next()` comparisons.
     #[test]
     fn structure_fits_base_degree() {
         use halo2_proofs::plonk::ConstraintSystem;
 
-        for (k, c1, c2) in [(18u32, 4usize, 3usize), (22, 1, 1), (18, 1, 1)] {
-            set_config_lanes(c1, c2);
+        for (k, c) in [(18u32, 2usize), (18, 4), (22, 1), (18, 1)] {
+            set_config_lanes(c);
             let mut cs = ConstraintSystem::<Fp>::default();
             let _ = <MyCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
 
             assert!(
                 cs.degree() <= 7,
-                "k={} c1={} c2={}: degree {} exceeds g_sql4_obj's 7",
+                "k={} c={}: degree {} exceeds g_sql4_obj's 7",
                 k,
-                c1,
-                c2,
+                c,
                 cs.degree()
             );
 
@@ -3095,11 +3173,10 @@ mod tests {
             let needed = lane_rows + 1 + cs.blinding_factors() + 1;
             assert!(
                 needed <= 1usize << k,
-                "k={} c1={} c2={}: a lane needs {} rows (lane_rows {} + sentinel + {} blinding \
+                "k={} c={}: a lane needs {} rows (lane_rows {} + sentinel + {} blinding \
                  + 1) but 2^k = {}",
                 k,
-                c1,
-                c2,
+                c,
                 needed,
                 lane_rows,
                 cs.blinding_factors(),
@@ -3108,21 +3185,22 @@ mod tests {
         }
     }
 
-    /// c1 = c2 = 3 lanes at k = 11: both padded pipelines really span three
-    /// lanes, each Bag2 lane builds its own child table, each Bag1 lane probes
-    /// all three of them, the occurrence ordering runs across all six lane
-    /// seams, and the totals stage adds the three pairs of Bag1 lane totals and
-    /// compares the two global sums once.
+    /// c = 3 lanes at k = 11: the padded pipeline really spans three lanes, each
+    /// lane builds its own child table, each lane probes all three of them, the
+    /// occurrence ordering runs across both lane seams, the mirror half of
+    /// condition (9) has to find a hosting lane for every clean role-2 row, and
+    /// the totals stage adds the three pairs of lane totals and compares the two
+    /// global sums once.
     #[test]
     fn mock_three_lanes() {
-        let (circuit, c1, c2) = three_lane_circuit(Tamper::None);
-        set_config_lanes(c1, c2);
+        let (circuit, c) = three_lane_circuit(Tamper::None);
+        set_config_lanes(c);
         let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(SYNTH_CNT)]]).unwrap();
         prover.assert_satisfied();
     }
 
-    /// Corrupting one Bag1 lane row's input-channel multiplicity must break the
-    /// root multiplicity gate and that lane's prefix sum.
+    /// Corrupting one lane row's input-channel multiplicity must break the root
+    /// multiplicity gate and that lane's prefix sum.
     #[test]
     fn mock_reject_tampered_lane_mu_all() {
         let failures = three_lane_failures(Tamper::LaneMuAll);
@@ -3135,45 +3213,48 @@ mod tests {
         );
     }
 
-    /// Corrupting one Bag1 lane total must break the copy constraint out of the
-    /// lane and the totals accumulator.
+    /// Corrupting one lane total must break the copy constraint out of the lane
+    /// and the totals accumulator.
     #[test]
     fn mock_reject_tampered_lane_total() {
         let failures = three_lane_failures(Tamper::LaneTotal);
         report_failing_constraints("lane total", &failures);
     }
 
-    /// Breaking the Bag1 pad convention on the last rounding-up row must break
-    /// the "bag1 real + key" gate and the r1 membership lookup.
+    /// Breaking the pad convention on the last rounding-up row, on the cell the
+    /// ROLE-1 key is packed from, must break the "role 1 real + key" gate and
+    /// the r_in membership lookup.
     #[test]
     fn mock_reject_tampered_bag1_pad_row() {
         let failures = three_lane_failures(Tamper::Bag1PadRow);
-        report_failing_constraints("bag1 pad row", &failures);
+        report_failing_constraints("pad row, role-1 key cell", &failures);
         assert!(
-            failed_on(&failures, "bag1 real + key") || failed_on(&failures, "bag1 r1"),
-            "expected the key gate or the r1 lookup to reject: {:?}",
+            failed_on(&failures, "role 1 real + key") || failed_on(&failures, "W r_in"),
+            "expected the key gate or the r_in lookup to reject: {:?}",
             failures
         );
     }
 
-    /// Breaking the Bag2 pad convention on the last rounding-up row must break
-    /// the r3 membership lookup into the shared indexed view.
+    /// Breaking the pad convention on the join column `y`, which no per-row gate
+    /// constrains on a pad row, must break the membership lookups into the
+    /// shared indexed views. This is the direction that shows the two lookups
+    /// are load-bearing on the pad rows too, now that both roles read one group.
     #[test]
     fn mock_reject_tampered_bag2_pad_row() {
         let failures = three_lane_failures(Tamper::Bag2PadRow);
-        report_failing_constraints("bag2 pad row", &failures);
+        report_failing_constraints("pad row, view cell", &failures);
         assert!(
-            failed_on(&failures, "bag2 r3"),
-            "expected the r3 lookup to reject: {:?}",
+            failed_on(&failures, "W r_in") || failed_on(&failures, "W r_out"),
+            "expected a membership lookup to reject: {:?}",
             failures
         );
     }
 
-    /// Zeroing the value retrieved from every Bag2 lane past the first, while
-    /// leaving the root multiplicity honest, must be rejected. This is the
-    /// permanent negative test for the cross-lane message sum: it fails only
-    /// because the root gate adds all `c2` probe values and each probe's
-    /// membership lookup is really enforced.
+    /// Zeroing the value retrieved from every lane past the first, while leaving
+    /// the root multiplicity honest, must be rejected. This is the permanent
+    /// negative test for the cross-lane message sum: it fails only because the
+    /// root gate adds all `c` probe values and each probe's membership lookup is
+    /// really enforced.
     #[test]
     fn mock_reject_dropped_probe_val() {
         let failures = three_lane_failures(Tamper::DropProbeVal);
@@ -3187,13 +3268,14 @@ mod tests {
     }
 
     /// CONDITION (10), and the reason its equality is over the GLOBAL totals.
-    /// One joinable Bag1 tuple is moved to the residual side and Bag2 is
+    /// One joinable role-1 tuple is moved to the residual side and role 2 is
     /// re-reduced around it, so condition (7) still holds, condition (9) still
     /// holds (the hidden tuple is no longer clean, so it asks nothing of the
-    /// Bag2 side), every membership lookup still passes and the occurrence
-    /// ordering is untouched. Only the Cardinality Preservation Check can see
-    /// it, and it sees it whichever lane the tuple lives in, because the
-    /// equality compares the two totals accumulated over ALL Bag1 lanes.
+    /// role-2 side, and the mirror direction only loses hosts it does not need),
+    /// every membership lookup still passes and the occurrence ordering is
+    /// untouched. Only the Cardinality Preservation Check can see it, and it
+    /// sees it whichever lane the tuple lives in, because the equality compares
+    /// the two totals accumulated over ALL lanes.
     #[test]
     fn mock_reject_hidden_clean_tuple() {
         let failures = three_lane_failures(Tamper::HideOneCleanTuple);
@@ -3206,13 +3288,16 @@ mod tests {
         );
     }
 
-    /// CONDITION (9), the direction this circuit enforces. Every
-    /// predicate-passing tuple of both bags is declared clean and the residual
-    /// side is left empty, so both Conservation and both channels of condition
-    /// (10) agree on every row and only Pairwise Consistency can see the five
-    /// dangling Bag1 tuples of the slice. It must reject through the clean-key
-    /// consistency constraint, which reads the clean multiplicity summed over
-    /// ALL Bag2 lanes.
+    /// CONDITION (9). Every predicate-passing tuple of both roles is declared
+    /// clean and the residual side is left empty, so both Conservation and both
+    /// channels of condition (10) agree on every row and only Pairwise
+    /// Consistency can see the five dangling role-1 tuples of the slice. It must
+    /// reject through the clean-key consistency constraint, which reads the
+    /// clean multiplicity summed over ALL lanes.
+    ///
+    /// The six dangling role-2 tuples the all-clean partition also creates are
+    /// what the MIRROR direction sees, so its lookup fires here too; the
+    /// assertion below names the direction this test was written for.
     #[test]
     fn mock_reject_mark_all_clean() {
         let failures = three_lane_failures(Tamper::MarkAllClean);
@@ -3222,15 +3307,40 @@ mod tests {
             "the circuit rejected, but not through condition (9): {:?}",
             failures
         );
+        assert!(
+            failed_on(&failures, "pw: role2^c key in role1^c"),
+            "the mirror half of condition (9) did not see the dangling role-2 \
+             tuples: {:?}",
+            failures
+        );
     }
 
-    /// OCCURRENCE DISTINCTNESS ACROSS LANES. The bag's first kept occurrence is
-    /// copied over the FIRST row of the LAST Bag2 lane. Both copies pass all
-    /// four membership lookups, both are internally consistent, both channels of
-    /// condition (10) move by the same amount, and -- the point of the test --
-    /// every lane's own occurrence block is still sorted, so a PER-LANE ordering
-    /// would accept this witness and the COUNT would be inflated. It must reject
-    /// through the LANE SEAM of the global ordering.
+    /// CONDITION (9), the MIRROR direction, and the reason its host bits are not
+    /// free advice. One clean role-2 row is made to name a lane that does not
+    /// hold a clean role-1 row with its key. Exactly one host bit is still set,
+    /// so the "hosted by exactly one lane" gate still passes; conditions (7) and
+    /// (10) never read the host bits at all, and the direction-1 half reads the
+    /// clean channel rather than these columns. The mirror lookup is the only
+    /// thing that can reject, and if it could not, a prover could satisfy the
+    /// mirror direction for an arbitrary clean role-2 side.
+    #[test]
+    fn mock_reject_misnamed_host_lane() {
+        let failures = three_lane_failures(Tamper::MisnameHostLane);
+        report_failing_constraints("misnamed host lane", &failures);
+        assert!(
+            failed_on(&failures, "pw: role2^c key in role1^c"),
+            "expected the mirror lookup of condition (9) to reject: {:?}",
+            failures
+        );
+    }
+
+    /// OCCURRENCE DISTINCTNESS ACROSS LANES. The first kept occurrence is copied
+    /// over the FIRST row of the LAST lane. Both copies pass both membership
+    /// lookups, both are internally consistent, both channels of condition (10)
+    /// move by the same amount, and -- the point of the test -- every lane's own
+    /// occurrence block is still sorted, so a PER-LANE ordering would accept
+    /// this witness and the COUNT would be inflated. It must reject through the
+    /// LANE SEAM of the global ordering.
     #[test]
     fn mock_reject_duplicate_occurrence_across_lanes() {
         let failures = three_lane_failures(Tamper::DuplicateOccurrenceAcrossLanes);
@@ -3243,61 +3353,28 @@ mod tests {
         );
     }
 
-    /// c1 != c2. The two released capacities are independent, and the real
-    /// lastfm cell is c1 = 4, c2 = 3, so the symmetric case the other tests use
-    /// must not be the only one exercised: `c1 * c2` probe replicas, `c2` child
-    /// tables per Bag1 lane and `c1` rows in the totals stage all have to line
-    /// up.
-    #[test]
-    fn mock_asymmetric_lanes() {
-        let lane_rows = 6;
-        let bag1_pad_extra = 1; // n12 = 12 -> 2 Bag1 lanes
-        let bag2_pad_extra = 7; // n34 = 18 -> 3 Bag2 lanes
-        let c1 = lanes_for(SYNTH_BAG_ROWS + bag1_pad_extra, lane_rows);
-        let c2 = lanes_for(SYNTH_BAG_ROWS + bag2_pad_extra, lane_rows);
-        assert_eq!((c1, c2), (2, 3));
-
-        set_config_lanes(c1, c2);
-        let circuit = MyCircuit::<Fp> {
-            edges: synthetic_edges(),
-            bag1_pad_extra,
-            bag2_pad_extra,
-            lane_rows,
-            num_bag1_lanes: c1,
-            num_bag2_lanes: c2,
-            tamper: Tamper::None,
-            _marker: PhantomData,
-        };
-        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(SYNTH_CNT)]]).unwrap();
-        prover.assert_satisfied();
-    }
-
-    /// A released capacity large enough that the LAST Bag2 lane holds no real
-    /// row at all. Its child stage then sees an all-PAD input, emits nothing,
-    /// and its table degenerates to the single (0,0,0) dummy row followed by PAD.
-    /// Every Bag1 row must still be able to prove absence in it, which is the
-    /// one gap bracket (0, PAD) that lane offers. The lane's occurrence-id
-    /// column is all PAD, which is what the "once PAD, always PAD" half of the
-    /// ordering is for.
+    /// A released capacity large enough that the LAST lane holds no real row at
+    /// all. Its child stage then sees an all-PAD input, emits nothing, and its
+    /// table degenerates to the single (0,0,0) dummy row followed by PAD. Every
+    /// role-1 row must still be able to prove absence in it, which is the one
+    /// gap bracket (0, PAD) that lane offers, and no clean role-2 row may name
+    /// it as a host. The lane's occurrence-id column is all PAD, which is what
+    /// the "once PAD, always PAD" half of the ordering is for.
     #[test]
     fn mock_all_pad_bag2_lane() {
         let lane_rows = LANE_ROWS_SMALL; // 4
-        let bag1_pad_extra = 1; // n12 = 12 -> 3 Bag1 lanes
-        let bag2_pad_extra = 5; // n34 = 16 -> 4 Bag2 lanes, the last all pad
-        let c1 = lanes_for(SYNTH_BAG_ROWS + bag1_pad_extra, lane_rows);
-        let c2 = lanes_for(SYNTH_BAG_ROWS + bag2_pad_extra, lane_rows);
-        assert_eq!((c1, c2), (3, 4));
-        // lane 3 covers padded rows 12..16, and the bag only has 11 real rows
+        let pad_extra = 5; // n = 16 -> 4 lanes, the last all pad
+        let c = lanes_for(SYNTH_BAG_ROWS + pad_extra, lane_rows);
+        assert_eq!(c, 4);
+        // lane 3 covers padded rows 12..16, and W only has 11 real rows
         assert!(3 * lane_rows >= SYNTH_BAG_ROWS);
 
-        set_config_lanes(c1, c2);
+        set_config_lanes(c);
         let circuit = MyCircuit::<Fp> {
             edges: synthetic_edges(),
-            bag1_pad_extra,
-            bag2_pad_extra,
+            pad_extra,
             lane_rows,
-            num_bag1_lanes: c1,
-            num_bag2_lanes: c2,
+            num_lanes: c,
             tamper: Tamper::None,
             _marker: PhantomData,
         };
@@ -3305,10 +3382,10 @@ mod tests {
         prover.assert_satisfied();
     }
 
-    /// c1 = c2 = 1 degenerates to a single-group layout: this circuit and
+    /// c = 1 degenerates to a single-group layout: this circuit and
     /// `g_sql4_obj` must accept the same input and expose the same COUNT(*).
     /// They are no longer byte-identical -- this file realizes condition (7) as
-    /// an indicator on the bag rows rather than as a shuffled partition group,
+    /// an indicator on the W rows rather than as a shuffled partition group,
     /// because the section selectors that form needs would put the true clean
     /// and residual counts in the verifying key -- so this checks the answer and
     /// mutual satisfiability, not the shape.
@@ -3319,25 +3396,21 @@ mod tests {
 
         let baseline = crate::graph_sql::g_sql4_obj::MyCircuit::<Fp> {
             edges: edges.clone(),
-            bag1_pad_extra: 1,
-            bag2_pad_extra: 1,
+            pad_extra: 1,
             _marker: PhantomData,
         };
         let prover = MockProver::run(11, &baseline, vec![public.clone()]).unwrap();
         prover.assert_satisfied();
 
-        let lane_rows = 16; // n12 = n34 = 11 + 1 = 12 fits one lane of each kind
-        let c1 = lanes_for(SYNTH_BAG_ROWS + 1, lane_rows);
-        let c2 = lanes_for(SYNTH_BAG_ROWS + 1, lane_rows);
-        assert_eq!((c1, c2), (1, 1));
-        set_config_lanes(c1, c2);
+        let lane_rows = 16; // n = 11 + 1 = 12 fits one lane
+        let c = lanes_for(SYNTH_BAG_ROWS + 1, lane_rows);
+        assert_eq!(c, 1);
+        set_config_lanes(c);
         let laned = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra: 1,
-            bag2_pad_extra: 1,
+            pad_extra: 1,
             lane_rows,
-            num_bag1_lanes: c1,
-            num_bag2_lanes: c2,
+            num_lanes: c,
             tamper: Tamper::None,
             _marker: PhantomData,
         };
@@ -3345,7 +3418,7 @@ mod tests {
         prover.assert_satisfied();
     }
 
-    /// Real IPA proving at the Revealing-Join-Size degree with both DP releases
+    /// Real IPA proving at the Revealing-Join-Size degree with the DP release
     /// hosted in lanes. Multi-hour on the production datasets, so it is ignored
     /// by default. Run it explicitly, for example:
     ///
@@ -3381,32 +3454,26 @@ mod tests {
         let run = super::run_dp_lanes(&dataset, privacy, 1, Some(&proof_path));
         let p = &run.plan;
         println!(
-            "[gq4 dp-lanes] dataset={} privacy={} pads: bag1={} bag2={}",
+            "[gq4 dp-lanes] dataset={} privacy={} pad={}",
             dataset,
             privacy.label(),
-            p.pads[0],
-            p.pads[1]
+            p.pads[0]
         );
         println!(
-            "[gq4 dp-lanes] bag1_true={} n12={} lanes={} | bag2_true={} n34={} lanes={} \
-             | lane_rows={} effective_capacity={}/{} | probe replicas={}",
+            "[gq4 dp-lanes] true={} capacity={} lanes={} | lane_rows={} \
+             effective_capacity={} | probe replicas={}",
             p.true_size[0],
             p.capacity[0],
             p.lanes[0],
-            p.true_size[1],
-            p.capacity[1],
-            p.lanes[1],
             p.lane_rows,
             p.lanes[0] * p.lane_rows,
-            p.lanes[1] * p.lane_rows,
-            p.lanes[0] * p.lanes[1]
+            p.lanes[0] * p.lanes[0]
         );
         println!("Proof written to: {}", proof_path);
         println!(
-            "[gq4 dp-lanes] bag1_lanes={} bag2_lanes={} keygen {:.2}s prove {:.2}s \
-             verify {:.2}s total prove+verify {:?}",
+            "[gq4 dp-lanes] lanes={} keygen {:.2}s prove {:.2}s verify {:.2}s \
+             total prove+verify {:?}",
             p.lanes[0],
-            p.lanes[1],
             run.keygen_s,
             run.prove_mean(),
             run.verify_s,

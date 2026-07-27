@@ -23,7 +23,38 @@ use super::q5_obj::{
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
-pub const LANE_ROWS: usize = 63_000;
+/// Degree Q5's DP lane circuit is proved at. PINNED: the released capacity is
+/// absorbed by lanes, not by a bigger domain.
+///
+/// The value is the degree the SINGLE-COLUMN Q5 circuit takes at the sweep's
+/// reference budget: `degree_for("q5", ..)` sizes the domain from the released
+/// LS capacity, which at eps = 0.1 gives k = 17 (`results/simpl_q5.csv`). So at
+/// that budget a lane row and the baseline row it is compared against share a
+/// domain size and the comparison isolates the lane layout rather than the
+/// degree. At smaller eps the single-column circuit escalates (18 at 0.05, 19
+/// at 0.02, 20 at 0.01) while this circuit stays at 17 and spends the release
+/// on lanes instead, which is the whole point of the comparison.
+pub const DP_LANE_K: u32 = 17;
+
+/// Rows the u8 range-table `load` regions may claim ahead of the witness
+/// region: seven u8 tables of 256 fixed rows each.
+///
+/// The reserve stays at seven columns' worth even though the repaired circuit
+/// loads only four. It is a conservative margin, not a count:
+/// `SimpleFloorPlanner` starts a region at the first row free in the columns
+/// that region touches, and each `load` touches only its own fixed column, so
+/// all of them begin at row 0 and none of them displaces the witness region.
+pub const CHIP_LOAD_ROWS: usize = 7 * 256;
+
+/// Blinding rows halo2 keeps at the bottom of every advice column.
+pub const BLINDING_SLACK: usize = 64;
+
+/// Usable rows per lane at [`DP_LANE_K`]: a lane fills the domain left over
+/// after the range-table loads and the blinding reserve, the same rule
+/// `g_sql3_obj_dp` and `g_sql4_obj_dp` derive their `LANE_ROWS` by. Lanes are
+/// parallel COLUMN groups inside one 2^k circuit, so a lane shorter than the
+/// domain would pay for rows it never fills.
+pub const LANE_ROWS: usize = (1usize << DP_LANE_K) - CHIP_LOAD_ROWS - BLINDING_SLACK;
 
 pub const SEG: usize = 32;
 
@@ -2833,15 +2864,9 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 // to compute inline.
 // ---------------------------------------------------------------------------
 
-/// Degree Q5's DP lane circuit is proved at. PINNED: the released capacity is
-/// absorbed by lanes, not by a bigger domain.
-pub const DP_LANE_K: u32 = 16;
-
-/// k = 16 leaves this many rows to the range-chip loads before the main region.
-/// Kept at 7 u8 tables of 256 rows even though the repaired circuit loads only
-/// four: shrinking it would let releases through that the old feasibility check
-/// rejected, and the DP capacity scheme is meant to be preserved exactly.
-const CHIP_LOAD_ROWS: usize = 7 * 256;
+// The lane geometry ([`DP_LANE_K`], [`CHIP_LOAD_ROWS`], [`BLINDING_SLACK`] and
+// the [`LANE_ROWS`] derived from them) is declared at the top of this file,
+// next to the lane-count helpers that read it.
 
 /// Build the Q5 DP lane circuit and the plan describing it, or explain why the
 /// released capacity cannot be built.
@@ -2890,22 +2915,33 @@ fn try_dp_lane_setup(
     let n = ls_true + ls_pad_extra;
     let c = try_lanes_for_capacity(n)?;
 
-    // k is FIXED at 16: every column group must fit under the 7 u8-range chip
-    // loads plus blinding slack
+    // k is FIXED at DP_LANE_K: every column group must fit under the 7 u8-range
+    // chip loads plus blinding slack.
+    //
+    // A lane region is `LANE_ROWS + 1` rows (the group-by writes a sentinel at
+    // `LANE_ROWS` for its `Rotation::next()` comparisons), but `LANE_ROWS` is
+    // already `2^k - CHIP_LOAD_ROWS - BLINDING_SLACK`, and the sentinel plus
+    // halo2's real blinding factors sit well inside the 64-row BLINDING_SLACK
+    // reserve. Counting the sentinel here on TOP of the full reserve would
+    // overcount by exactly one row and reject every legal configuration, so
+    // this check uses `LANE_ROWS`, matching g_sql3_obj_dp / g_sql4_obj_dp. The
+    // authoritative fit check against the constraint system halo2 actually
+    // builds is `tests::structure_fits_base_degree`.
     let tallest = lineitem
         .len() // ls_mat / ls_part_pad, the tallest FIXED group
         .max(orders.len() + co_pad_extra)
         .max(nation.len() + nr_pad_extra)
-        .max(LANE_ROWS + 1) // laned pipeline + sentinel row
+        .max(LANE_ROWS) // laned pipeline
         .max(c * SEG + 1); // merge region + sentinel row
-    if CHIP_LOAD_ROWS + tallest + 64 > 1usize << DP_LANE_K {
+    if CHIP_LOAD_ROWS + tallest + BLINDING_SLACK > 1usize << DP_LANE_K {
         return Err(format!(
             "tallest column group ({} rows) does not fit k={} ({} rows, of which {} go to \
-             the u8 range-table loads and 64 to blinding)",
+             the u8 range-table loads and {} to blinding)",
             tallest,
             DP_LANE_K,
             1usize << DP_LANE_K,
-            CHIP_LOAD_ROWS
+            CHIP_LOAD_ROWS,
+            BLINDING_SLACK
         ));
     }
 
@@ -2967,7 +3003,7 @@ pub fn plan_dp_lanes(privacy: crate::bench_queries::Privacy) -> crate::dp_lane::
     dp_lane_setup(privacy).1
 }
 
-/// Real IPA proving at k = 16 with the DP release hosted in lanes.
+/// Real IPA proving at [`DP_LANE_K`] with the DP release hosted in lanes.
 ///
 /// The verifying and proving keys are built ONCE, outside the timed region;
 /// then `reps` proofs are generated and every one of them is verified.
@@ -3070,7 +3106,10 @@ pub fn run_dp_lanes(
 
 #[cfg(test)]
 mod tests {
-    use super::{lanes_for, set_config_lanes, MyCircuit, Tamper, LANE_ROWS, MAX_LANES};
+    use super::{
+        lanes_for, set_config_lanes, MyCircuit, Tamper, BLINDING_SLACK, CHIP_LOAD_ROWS, DP_LANE_K,
+        LANE_ROWS, MAX_LANES, SEG,
+    };
 
     use halo2_proofs::dev::{MockProver, VerifyFailure};
     use halo2_proofs::plonk::Circuit;
@@ -3223,6 +3262,67 @@ mod tests {
                  patch is costing more than it is worth",
                 degree,
                 c
+            );
+        }
+        set_config_lanes(1);
+    }
+
+    /// The lane geometry really fits [`DP_LANE_K`], checked against the
+    /// constraint system halo2 builds rather than against the arithmetic
+    /// `try_dp_lane_setup` reasons with.
+    ///
+    /// `LANE_ROWS` fills the domain (`2^k - CHIP_LOAD_ROWS - BLINDING_SLACK`),
+    /// so the sentinel row a lane writes at `LANE_ROWS` and halo2's own
+    /// unusable rows have to come out of the 64-row reserve. Both ends of the
+    /// lane cap are probed: lanes replicate columns, not rows, so the lane
+    /// count must not change the answer.
+    #[test]
+    fn structure_fits_base_degree() {
+        use halo2_proofs::plonk::ConstraintSystem;
+
+        for c in [1usize, MAX_LANES] {
+            set_config_lanes(c);
+            let mut cs = ConstraintSystem::<Fp>::default();
+            let _ = <MyCircuit<Fp> as Circuit<Fp>>::configure(&mut cs);
+            let blinding = cs.blinding_factors();
+
+            // The reserve LANE_ROWS was subtracted with has to cover what halo2
+            // actually reserves, otherwise a full lane runs into unusable rows.
+            assert!(
+                blinding + 1 <= BLINDING_SLACK,
+                "lanes={}: halo2 keeps {} blinding factors (+1 unusable row), \
+                 above the {}-row BLINDING_SLACK that sizes LANE_ROWS",
+                c,
+                blinding,
+                BLINDING_SLACK
+            );
+
+            // A lane region is LANE_ROWS + 1 rows: the group-by writes a
+            // sentinel at LANE_ROWS for its Rotation::next() comparisons.
+            let needed = CHIP_LOAD_ROWS + LANE_ROWS + 1 + blinding + 1;
+            assert!(
+                needed <= 1usize << DP_LANE_K,
+                "lanes={}: {} reserved rows + a lane ({} rows + sentinel) + {} blinding \
+                 + 1 needs {} rows, but 2^{} = {}",
+                c,
+                CHIP_LOAD_ROWS,
+                LANE_ROWS,
+                blinding,
+                needed,
+                DP_LANE_K,
+                1usize << DP_LANE_K
+            );
+
+            // The merge region is the other laned column group: SEG rows per
+            // lane plus its own sentinel.
+            let merge = CHIP_LOAD_ROWS + c * SEG + 1 + blinding + 1;
+            assert!(
+                merge <= 1usize << DP_LANE_K,
+                "lanes={}: the merge region needs {} rows, but 2^{} = {}",
+                c,
+                merge,
+                DP_LANE_K,
+                1usize << DP_LANE_K
             );
         }
         set_config_lanes(1);
@@ -3461,7 +3561,7 @@ mod tests {
         prover.assert_satisfied();
     }
 
-    /// Real k = 16 IPA proving over full TPC-H with the DP release hosted in
+    /// Real k = 17 IPA proving over full TPC-H with the DP release hosted in
     /// lanes. Hours on the production tables, so it is ignored by default.
     /// Run it explicitly, for example:
     ///
@@ -3470,7 +3570,7 @@ mod tests {
     ///
     /// The same code path is what `cargo run --bin dp_lane_bench -- q5` drives.
     #[test]
-    #[ignore = "real k=16 IPA proving over full TPC-H; run explicitly"]
+    #[ignore = "real k=17 IPA proving over full TPC-H; run explicitly"]
     fn test_dp_lanes() {
         let privacy = match std::env::var("VPJOIN_PRIVACY")
             .as_deref()

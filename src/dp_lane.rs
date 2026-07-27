@@ -12,7 +12,10 @@ pub struct DpLanePlan {
     pub k: u32,
     /// Rows one lane hosts.
     pub lane_rows: usize,
-    /// Lane count, one entry per laned bag (GQ4 lanes two bags).
+    /// Lane count, one entry per laned bag. GQ3 lanes one of its two bags (the
+    /// other is the public-size edge relation) and GQ4 lanes the ONE relation
+    /// its two column roles share, so both carry a single entry; Q5 carries one
+    /// per laned intermediate.
     pub lanes: Vec<usize>,
     /// Released capacity per laned bag, i.e. true size + DP pad.
     pub capacity: Vec<usize>,

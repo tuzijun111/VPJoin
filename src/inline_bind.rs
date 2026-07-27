@@ -470,12 +470,13 @@ pub fn prove_graph_base(
             },
             inst,
         ),
+        // GQ4 materializes ONE bag read in two column roles, so it takes a
+        // single pad. `pads` keeps its pair shape for GQ3 and Q5; only .0 is used.
         "gq4" => prove_one(
             params,
             &g_sql4_obj::MyCircuit::<Fp> {
                 edges: edges.to_vec(),
-                bag1_pad_extra: pads.0,
-                bag2_pad_extra: pads.1,
+                pad_extra: pads.0,
                 _marker: PhantomData,
             },
             inst,
@@ -523,8 +524,7 @@ pub fn prove_graph_bound(
             params,
             &BoundGq4 {
                 edges: edges.to_vec(),
-                bag1_pad_extra: pads.0,
-                bag2_pad_extra: pads.1,
+                pad_extra: pads.0,
                 columns,
                 x,
             },
@@ -915,15 +915,13 @@ pub fn graph_paired(
             params,
             &g_sql4_obj::MyCircuit::<Fp> {
                 edges: e.clone(),
-                bag1_pad_extra: pads.0,
-                bag2_pad_extra: pads.1,
+                pad_extra: pads.0,
                 _marker: PhantomData,
             },
             bi,
             &BoundGq4 {
                 edges: e,
-                bag1_pad_extra: pads.0,
-                bag2_pad_extra: pads.1,
+                pad_extra: pads.0,
                 columns,
                 x,
             },
@@ -1101,12 +1099,12 @@ pub fn graph_selftest(
         "gq4" => paired_runs(
             params,
             &g_sql4_obj::MyCircuit::<Fp> {
-                edges: e.clone(), bag1_pad_extra: pads.0, bag2_pad_extra: pads.1,
+                edges: e.clone(), pad_extra: pads.0,
                 _marker: PhantomData,
             },
             bi,
             &g_sql4_obj::MyCircuit::<Fp> {
-                edges: e, bag1_pad_extra: pads.0, bag2_pad_extra: pads.1,
+                edges: e, pad_extra: pads.0,
                 _marker: PhantomData,
             },
             bi,

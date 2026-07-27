@@ -44,6 +44,41 @@ rand_xorshift = "0.3"
 bincode = "1.3.3"
 rayon = "1.8"
 
+# Build profiles.
+#
+# THE DEV PROFILE IS THE RELEASE PROFILE. Every proving number in this repo comes
+# from a binary someone launched with `cargo run`, and an unoptimized build
+# (halo2 itself at opt-level 0) proves several times slower, so a plain
+# `cargo run` producing a debug number is a trap: the number looks like the
+# others and is not comparable with any of them. Rather than rely on every
+# command line carrying `--release`, the unoptimized build is removed: every
+# setting below is the release default, so
+#
+#   cargo run --bin dp_lane_bench -- ...
+#
+# and the same command with `--release` produce the same code. The two still
+# build into different directories (`target/debug` and `target/release`), so
+# prefer one spelling per harness rather than paying for both.
+#
+# `bench_queries::build_profile()` reads `debug_assertions`, so it labels these
+# builds `release`, which is what they are.
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+codegen-units = 16
+incremental = false
+
+# `cargo test` keeps the host-side `debug_assert!`s that guard witness
+# construction (q5_obj_dp, g_sql4_obj, decompose_bigInt); silencing them would
+# cost the test suite real checks. The test profile inherits the optimization
+# above, so tests are optimized too, but a timing taken under it is labelled
+# `debug` and is NOT a measurement profile: the benchmark binaries are.
+[profile.test]
+debug-assertions = true
+overflow-checks = true
+
 
 
 

@@ -32,7 +32,7 @@ pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
 }
 
 /// Test hook, off in every benchmark path: when set, the prover moves one
-/// joinable Bag1 tuple to the residual side and re-reduces Bag2 around it, so
+/// joinable role-1 tuple to the residual side and re-reduces role 2 around it, so
 /// the partition still passes Conservation, Non-Membership and Pairwise
 /// Consistency and only condition (4) can catch it. This is exactly the cheat
 /// a residual-side-only argument misses, so the negative test in this module is
@@ -40,8 +40,8 @@ pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
-/// semijoin reduction entirely and declares every real tuple of both bags
-/// clean, leaving the residual side empty. Conservation still holds and both
+/// semijoin reduction entirely and declares every real tuple clean in both
+/// roles, leaving the residual side empty. Conservation still holds and both
 /// channels of condition (4) then agree on every row, so this is exactly the
 /// escape that Pairwise Consistency has to close.
 pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
@@ -184,11 +184,24 @@ pub(crate) struct Gq4Derived {
     pub in_rows: Vec<(u64, u64, u64)>,
     /// OutBySrc input rows (key=src, val=dst, eid); row 0 is the (0,0,0) dummy.
     pub out_rows: Vec<(u64, u64, u64)>,
-    /// Bag1 paths A->B->C as (A,B,C,i_r1,j_r2,r1_eid,r2_eid), pre-filtered to A<B.
-    pub t12: Vec<(u64, u64, u64, u64, u64, u64, u64)>,
-    /// Bag2 paths C->D->A as (C,D,A,i_r3,j_r4,r3_eid,r4_eid), pre-filtered to C<D.
-    pub t34: Vec<(u64, u64, u64, u64, u64, u64, u64)>,
-    /// Message table: msg_key = pack2(A,C) -> COUNT(Bag2 rows with C<D).
+    /// The ONE materialized bag, W = {(x,y,z) : x->y and y->z are edges, x<y},
+    /// as (x,y,z,i,j,e_in,e_out): `i` indexes x->y inside `in_by_dst`'s group
+    /// for key y, `j` indexes y->z inside `out_by_src`'s group for key y.
+    ///
+    /// The separator (A,C) of the 4-cycle splits it into the path A->B->C and
+    /// the path C->D->A, and those two paths are THE SAME RELATION read with
+    /// different column roles: Bag1 is W read as (A,B,C) and Bag2 is W read as
+    /// (C,D,A). The two loops this replaced were literally the same computation
+    /// over the same two maps with the same filter, so `t34` was a
+    /// byte-for-byte second copy of `t12` (and relied, unstated, on two
+    /// successive `in_groups.iter()` passes yielding the same order). Role 1
+    /// adds y<z on top of W's own x<y and role 2 adds nothing, which together
+    /// is exactly A<B<C<D.
+    pub w: Vec<(u64, u64, u64, u64, u64, u64, u64)>,
+    /// Message table over the role-2 reading: msg_key = pack2(A,C) = pack2(z,x)
+    /// -> COUNT(W rows with that (z,x)). The key is REVERSED relative to the
+    /// role-1 probe key pack2(x,z), which is the whole of what makes one
+    /// relation serve as both bags.
     pub msg_map: BTreeMap<u64, u64>,
     /// Sorted, deduped msg keys plus the 0 and PAD sentinels, for gap witnesses.
     pub keys: Vec<u64>,
@@ -236,67 +249,53 @@ pub(crate) fn gq4_derive(edges: &[Edge]) -> Gq4Derived {
     }
 
     // -------------------
-    // Materialize Bag1: T12 = r1(A->B) |x| r2(B->C) on B
-    // row = (A,B,C,i_r1,j_r2,r1_eid,r2_eid)
+    // Materialize the ONE bag: W = r_in(x->y) |x| r_out(y->z) on y, filtered to
+    // x<y.  row = (x,y,z,i,j,e_in,e_out)
+    //
+    // Read as (A,B,C) this is Bag1, the path A->B->C; read as (C,D,A) it is
+    // Bag2, the path C->D->A. The two used to be materialized by two separate
+    // loops over the same `in_groups`/`out_groups` with the same filter, which
+    // produced identical rows at twice the cost.
     // -------------------
-    let mut t12: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
-    for (&b, incoming) in in_groups.iter() {
-        if let Some(outgoing) = out_groups.get(&b) {
-            for (i, (r1_eid, a)) in incoming.iter().enumerate() {
-                // EARLY FILTER: r1.src < r2.src  (A < B), mirroring
-                // `g_sql3_obj`.  The "contrib gate" computes
-                // real * msg_val * [A<B] * [B<C], so a row with A >= B
-                // contributes exactly zero; materializing it only pays for
-                // capacity.  Dropping it here is why GQ4 fits the same domain
-                // as GQ3 on the directed graph (wiki: 4,542,805 -> 2,255,867
-                // rows, i.e. k=23 -> k=22).
+    let mut w: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
+    for (&y, incoming) in in_groups.iter() {
+        if let Some(outgoing) = out_groups.get(&y) {
+            for (i, (e_in, x)) in incoming.iter().enumerate() {
+                // EARLY FILTER: x < y, mirroring `g_sql3_obj`.  In the role-1
+                // reading it is [A<B], which the "contrib gate" multiplies in,
+                // so a row with A >= B contributes exactly zero; in the role-2
+                // reading it is [C<D], and the "msg input from W" gate emits
+                // (in_key, in_val) = (PAD, 0) when it fails, so such a row
+                // contributes nothing to the message map either. Materializing
+                // it only pays for capacity. Dropping it here is why GQ4 fits
+                // the same domain as GQ3 on the directed graph (wiki:
+                // 4,542,805 -> 2,255,867 rows, i.e. k=23 -> k=22).
                 //
                 // Skip BEFORE the inner loop so `i` keeps its meaning as the
                 // index into `incoming`: it is looked up against
                 // `in_by_dst.idx`, so it must stay the original enumerate index.
-                if *a >= b {
+                if *x >= y {
                     continue;
                 }
-                for (j, (r2_eid, c)) in outgoing.iter().enumerate() {
-                    t12.push((*a, b, *c, i as u64, j as u64, *r1_eid, *r2_eid));
+                for (j, (e_out, z)) in outgoing.iter().enumerate() {
+                    w.push((*x, y, *z, i as u64, j as u64, *e_in, *e_out));
                 }
             }
         }
     }
 
     // -------------------
-    // Materialize Bag2: T34 = r3(C->D) |x| r4(D->A) on D
-    // row = (C,D,A,i_r3,j_r4,r3_eid,r4_eid)
-    // -------------------
-    let mut t34: Vec<(u64, u64, u64, u64, u64, u64, u64)> = vec![];
-    for (&d, incoming) in in_groups.iter() {
-        if let Some(outgoing) = out_groups.get(&d) {
-            for (i, (r3_eid, c)) in incoming.iter().enumerate() {
-                // EARLY FILTER: r3.src < r3.dst  (C < D).  The
-                // "msg input from bag2" gate sets keep = t34_real * [C<D] and
-                // emits (in_key, in_val) = (PAD, 0) when keep = 0, so a row
-                // with C >= D contributes nothing to the message map.  Same
-                // reasoning and same placement as the Bag1 filter above.
-                if *c >= d {
-                    continue;
-                }
-                for (j, (r4_eid, a)) in outgoing.iter().enumerate() {
-                    t34.push((*c, d, *a, i as u64, j as u64, *r3_eid, *r4_eid));
-                }
-            }
-        }
-    }
-
-    // -------------------
-    // Message map (host-side): msg_key = pack2(A,C),
-    // msg_val = count of Bag2 rows with C<D
+    // Message map (host-side), over the ROLE-2 reading of W: a row
+    // (x,y,z) = (C,D,A) contributes to msg_key = pack2(A,C) = pack2(z,x), with
+    // the key REVERSED relative to the role-1 probe key pack2(x,z).
+    // msg_val = COUNT of W rows with C<D, and every real row of W already
+    // satisfies x<y, so the filter is a debug_assert rather than a test.
     // -------------------
     let mut msg_map: BTreeMap<u64, u64> = BTreeMap::new();
-    for (c, d, a, _i, _j, _r3_eid, _r4_eid) in t34.iter().copied() {
-        if c < d {
-            let key = pack2(a, c);
-            *msg_map.entry(key).or_default() += 1;
-        }
+    for (x, y, z, _i, _j, _e_in, _e_out) in w.iter().copied() {
+        debug_assert!(x < y, "W is materialized pre-filtered to x<y");
+        let key = pack2(z, x);
+        *msg_map.entry(key).or_default() += 1;
     }
 
     // Sorted key list for gap witnesses (host-side).
@@ -310,8 +309,7 @@ pub(crate) fn gq4_derive(edges: &[Edge]) -> Gq4Derived {
     Gq4Derived {
         in_rows,
         out_rows,
-        t12,
-        t34,
+        w,
         msg_map,
         keys,
     }
@@ -450,13 +448,13 @@ impl<F: Field + Ord> AggSumByKeyChip<F> {
         // largest real key; `iz_same_next` would then report "same group" on the
         // last real row, the emit gate would write (PAD, 0) instead of that
         // group's key and sum, and the highest-key group would vanish from the
-        // map table. Every Bag1 row carrying that key could then certify its
+        // map table. Every probing row carrying that key could then certify its
         // ABSENCE with a gap witness that genuinely holds in the forged table
         // and take msg_val = 0, so the COUNT would silently undercount.
         //
         // Pinning the sentinel to PAD closes it, and is deliberately NOT a
         // strict-increase requirement on the last comparison: the aggregator's
-        // input includes the PAD-keyed rows of the non-kept Bag2 tuples, so the
+        // input includes the PAD-keyed rows of the non-kept tuples, so the
         // sorted view legitimately ends at PAD and that group must not be
         // emitted. Same reasoning and same shape as
         // `cp: sorted view sentinel is PAD` in `crate::circuits::card_preserve`.
@@ -1394,8 +1392,8 @@ pub struct Cycle4OrderedConfig<F: Field + Ord> {
     in_by_dst: IndexedViewConfig<F>,
     out_by_src: IndexedViewConfig<F>,
 
-    // Table-side gate of the four bag lookups, enabled on exactly the n_base
-    // real rows of both views. See "bag1 r1 from in_by_dst" for why.
+    // Table-side gate of the two bag lookups, enabled on exactly the n_base
+    // real rows of both views. See "W r_in from in_by_dst" for why.
     q_view_tbl: Selector,
 
     // Conservation of the edge relation: both indexed views are the same
@@ -1403,43 +1401,31 @@ pub struct Cycle4OrderedConfig<F: Field + Ord> {
     perm_edge_out: PermAnyConfig,
     perm_edge_in: PermAnyConfig,
 
-    // Bag1 (T12) rows: A->B->C
-    t12_a: Column<Advice>,
-    t12_b: Column<Advice>,
-    t12_c: Column<Advice>,
-    t12_i_r1: Column<Advice>,
-    t12_j_r2: Column<Advice>,
-    t12_r1_eid: Column<Advice>,
-    t12_r2_eid: Column<Advice>,
-    t12_real: Column<Advice>,
-    q_t12_lookup: Selector,
-    q_t12_key: Selector,
+    // The ONE materialized bag W: x->y->z with x<y. Read as (A,B,C) it is the
+    // path A->B->C, read as (C,D,A) it is the path C->D->A, and both readings
+    // live on the same row of the same eight columns.
+    w_x: Column<Advice>,
+    w_y: Column<Advice>,
+    w_z: Column<Advice>,
+    w_i: Column<Advice>,
+    w_j: Column<Advice>,
+    w_e1: Column<Advice>,
+    w_e2: Column<Advice>,
+    w_real: Column<Advice>,
+    q_w_lookup: Selector,
+    q_w_key: Selector,
+    q_w_msg_in: Selector,
 
-    // Bag2 (T34) rows: C->D->A
-    t34_c: Column<Advice>,
-    t34_d: Column<Advice>,
-    t34_a: Column<Advice>,
-    t34_i_r3: Column<Advice>,
-    t34_j_r4: Column<Advice>,
-    t34_r3_eid: Column<Advice>,
-    t34_r4_eid: Column<Advice>,
-    t34_real: Column<Advice>,
-    q_t34_lookup: Selector,
-    q_t34_flag: Selector,
-    q_t34_msg_in: Selector,
-
-    // ordering in bag2: C < D
-    q_cd: Selector,
-    lt_cd: LtConfig<F, NUM_BYTES>,
-
-    // message aggregator: msg_key=pack2(A,C), msg_val=count
+    // message aggregator over the role-2 reading: msg_key = pack2(A,C) =
+    // pack2(z,x), msg_val = count
     agg_msg: AggSumByKeyConfig<F>,
 
-    // message lookup per Bag1 row
+    // message lookup per row, on the role-1 probe key pack2(A,C) = pack2(x,z)
     msg_lookup: MapLookupConfig<F>,
 
-    // ordering checks for Bag1: A<B and B<C
-    q_order12: Selector,
+    // the two order checks on the row: [x<y], which is role 1's [A<B] and
+    // role 2's [C<D] at once, and [y<z], which is role 1's [B<C]
+    q_order: Selector,
     lt_ab: LtConfig<F, NUM_BYTES>,
     lt_bc: LtConfig<F, NUM_BYTES>,
 
@@ -1455,50 +1441,59 @@ pub struct Cycle4OrderedConfig<F: Field + Ord> {
     q_out: Selector,
 
     // ---------------- Cardinality Preservation Check ----------------
-    // condition (4): |R^c join| == |R join| over the bag tree t12 -> t34
-    cp_agg_34: CpAggConfig<F, NUM_BYTES>, // child Bag2, keyed by pack2(A,C)
-    cp_join_34: CpJoinConfig<F, NUM_BYTES>, // parent Bag1 -> child Bag2
+    // condition (4): |R^c join| == |R join| over the one bag tree edge
+    // role 1 -> role 2
+    cp_agg_2: CpAggConfig<F, NUM_BYTES>, // child = role 2, keyed by pack2(z,x)
+    cp_join_2: CpJoinConfig<F, NUM_BYTES>, // parent = role 1 -> child
     cp_root: CpRootConfig,
     q_cp_mu: Selector, // the two root product gates
 
-    // pred = t12_real * [A<B] * [B<C], folded into a column so that every gate
-    // of the check stays at degree <= 4
-    t12_pred: Column<Advice>,
-    q_t12_pred: Selector,
+    // the role-1 predicate bit, folded into a column so that every gate of the
+    // check stays at degree <= 4. Structurally it is keep * [y<z], with
+    // keep = w_real * [x<y] the role-2 bit, so role 1's rows are a per-row
+    // determined SUBSET of role 2's.
+    w_pred: Column<Advice>,
+    q_w_pred: Selector,
 
-    // clean indicator per bag row, and the Conservation Check that binds it
-    t12_cflag: Column<Advice>,
-    t34_cflag: Column<Advice>,
-    t12_filt_pad: Vec<Column<Advice>>, // 6: (A,B,C,r1_eid,r2_eid, pred * c)
-    t12_part_pad: Vec<Column<Advice>>, // 6: [clean rows | residual rows | pad rows]
-    perm_t12: PermAnyConfig,
-    t34_filt_pad: Vec<Column<Advice>>, // 6: (C,D,A,r3_eid,r4_eid, keep * c)
-    t34_part_pad: Vec<Column<Advice>>,
-    perm_t34: PermAnyConfig,
-    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1   ([t12, t34])
+    // clean indicator per role, and the Conservation Check that binds it. The
+    // two indicators genuinely differ: a row can be role-2 clean and role-1
+    // dangling, so the two partitions cannot be merged (and one row order could
+    // not put both clean sets in a prefix anyway).
+    w_cflag1: Column<Advice>,
+    w_cflag2: Column<Advice>,
+    filt1: Vec<Column<Advice>>, // 6: (x,y,z,e1,e2, pred * c1)
+    part1: Vec<Column<Advice>>, // 6: [clean rows | residual rows | pad rows]
+    perm1: PermAnyConfig,
+    filt2: Vec<Column<Advice>>, // 6: (x,y,z,e1,e2, keep * c2)
+    part2: Vec<Column<Advice>>,
+    perm2: PermAnyConfig,
+    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1   ([role1, role2])
     q_res_flag: Vec<Selector>, // rows of R^r: flag == 0
     q_pad_row: Vec<Selector>,  // rows past R^c U R^r: the canonical PAD tuple
 
     // ---------------- Pairwise Consistency ----------------
-    // condition (3): pi_K(t12^c) == pi_K(t34^c) on the one bag tree edge.
-    // Every vector below is indexed [t12, t34].
+    // condition (3): pi_K(R_1^c) == pi_K(R_2^c) on the one bag tree edge.
+    // Every vector below is indexed [role1, role2]; the two keys are the same
+    // two cells packed in OPPOSITE orders.
     pw_key: Vec<Column<Advice>>, // packed separator key of the partition rows
     q_pw_key: Vec<Selector>,     // pins pw_key over the clean rows
-    // Enabled over exactly the clean rows of its bag. It gates the input side of
+    // Enabled over exactly the clean rows of its role. It gates the input side of
     // its own direction and the table side of the other one, so the two lookups
     // need nothing beyond these two columns and these two selectors.
     q_pw_in: Vec<Selector>,
 
-    // ---------------- Occurrence distinctness per bag ----------------
-    // Every vector below is indexed [t12, t34]. `t_oid` is the occurrence id on
-    // the bag rows, `oid_sorted` its sorted view, and the two selectors pin the
-    // strict increase over R^c U R^r and the PAD tail.
-    t_oid: Vec<Column<Advice>>,
-    oid_sorted: Vec<Column<Advice>>,
-    perm_oid: Vec<PermAnyConfig>,
-    q_oid_sort: Vec<Selector>,
-    q_oid_pad: Vec<Selector>,
-    lt_oid: Vec<LtConfig<F, NUM_BYTES>>,
+    // ---------------- Occurrence distinctness ----------------
+    // ONE argument now, over the role-2 keep bit: `w_oid` is the occurrence id
+    // on the bag rows, `oid_sorted` its sorted view, and the two selectors pin
+    // the strict increase over R^c U R^r and the PAD tail. The role-1 copy is
+    // gone because role 1's rows are the role-2 rows that also satisfy [y<z],
+    // pinned per row by the `w_pred` gate.
+    w_oid: Column<Advice>,
+    oid_sorted: Column<Advice>,
+    perm_oid: PermAnyConfig,
+    q_oid_sort: Selector,
+    q_oid_pad: Selector,
+    lt_oid: LtConfig<F, NUM_BYTES>,
 }
 
 #[derive(Clone, Debug)]
@@ -1525,42 +1520,27 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         let in_by_dst = IndexedViewChip::<F>::configure(meta);
         let out_by_src = IndexedViewChip::<F>::configure(meta);
 
-        // Bag1 columns
-        let t12_a = meta.advice_column();
-        let t12_b = meta.advice_column();
-        let t12_c = meta.advice_column();
-        let t12_i_r1 = meta.advice_column();
-        let t12_j_r2 = meta.advice_column();
-        let t12_r1_eid = meta.advice_column();
-        let t12_r2_eid = meta.advice_column();
-        let t12_real = meta.advice_column();
-        for c in [
-            t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid, t12_real,
-        ] {
+        // The ONE tuple column group. The separator (A,C) splits GQ4 into the
+        // path A->B->C and the path C->D->A, and those are the same relation
+        // W = {(x,y,z) : x->y, y->z edges, x<y} read with different column
+        // roles, so the circuit materializes W once and uses it twice. Pad rows
+        // are all-zero with w_real = 0.
+        let w_x = meta.advice_column();
+        let w_y = meta.advice_column();
+        let w_z = meta.advice_column();
+        let w_i = meta.advice_column();
+        let w_j = meta.advice_column();
+        let w_e1 = meta.advice_column();
+        let w_e2 = meta.advice_column();
+        let w_real = meta.advice_column();
+        for c in [w_x, w_y, w_z, w_i, w_j, w_e1, w_e2, w_real] {
             meta.enable_equality(c);
         }
-        let q_t12_lookup = meta.complex_selector();
-        let q_t12_key = meta.selector();
+        let q_w_lookup = meta.complex_selector();
+        let q_w_key = meta.selector();
+        let q_w_msg_in = meta.selector();
 
-        // Bag2 columns
-        let t34_c = meta.advice_column();
-        let t34_d = meta.advice_column();
-        let t34_a = meta.advice_column();
-        let t34_i_r3 = meta.advice_column();
-        let t34_j_r4 = meta.advice_column();
-        let t34_r3_eid = meta.advice_column();
-        let t34_r4_eid = meta.advice_column();
-        let t34_real = meta.advice_column();
-        for c in [
-            t34_c, t34_d, t34_a, t34_i_r3, t34_j_r4, t34_r3_eid, t34_r4_eid, t34_real,
-        ] {
-            meta.enable_equality(c);
-        }
-        let q_t34_lookup = meta.complex_selector();
-        let q_t34_flag = meta.selector();
-        let q_t34_msg_in = meta.selector();
-
-        // Table-side gate of the four bag lookups below.
+        // Table-side gate of the two bag lookups below.
         //
         // Each `IndexedView` carries a sentinel row at `n_base` for the
         // Rotation::next() of its own sortedness gate. That row is outside the
@@ -1572,113 +1552,71 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // side that sentinel is a LIVE table row, so a prover can mint an edge
         // that the relation does not contain: set out_by_src's sentinel to
         // (key = D, idx = 0, val = A0, eid = anything) with D above every real
-        // src, and a Bag2 row (C0, D, A0) then passes "bag2 r4 from out_by_src"
-        // for an r4 = D->A0 edge that exists nowhere. Swapping it in for a clean
-        // Bag2 row of another clean key keeps both partition section lengths, so
-        // the honest vk still verifies.
+        // src, and a W row (x = C0, y = D, z = A0) then passes
+        // "W r_out from out_by_src" for an edge D->A0 that exists nowhere.
+        // Swapping it in for a clean row of another clean key keeps both
+        // partition section lengths, so the honest vk still verifies.
         //
         // Gating the table side over exactly the n_base real rows removes the
-        // sentinel from all four tables. On the ungated rows every table
+        // sentinel from both tables. On the ungated rows every table
         // expression reads 0, so the tuple (0,0,0,0) is in the table, which is
         // what the padded bag rows (all-zero, real = 0) look up anyway, and it
         // is a real row of both views regardless: base row 0 is the (0,0,0)
         // dummy edge with idx 0. The table side goes from degree 1 to degree 2,
-        // so these four lookups go from 2+2+1 = 5 to 2+2+2 = 6, still under the
+        // so these two lookups go from 2+2+1 = 5 to 2+2+2 = 6, still under the
         // 2+3+2 = 7 that the Cardinality Preservation Check's own membership
         // lookup already costs: cs.degree() does not move.
         let q_view_tbl = meta.complex_selector();
 
-        // Bag1 lookups:
-        // r1 via InByDst: key=B, idx=i_r1 -> val=A, eid=r1_eid
-        meta.lookup_any("bag1 r1 from in_by_dst", |m| {
-            let q = m.query_selector(q_t12_lookup);
+        // The TWO membership lookups of W. There used to be four, two per bag,
+        // but in W coordinates the Bag2 pair is literally the Bag1 pair: r3 is
+        // (y, i) -> (x, e1) against in_by_dst and r4 is (y, j) -> (z, e2)
+        // against out_by_src, the same cells of the same row against the same
+        // two views. Reading the row as (C,D,A) instead of (A,B,C) renames the
+        // columns and changes nothing that a lookup can see.
+        //
+        // r_in via InByDst: key=y, idx=i -> val=x, eid=e1
+        meta.lookup_any("W r_in from in_by_dst", |m| {
+            let q = m.query_selector(q_w_lookup);
             let t = m.query_selector(q_view_tbl);
             vec![
                 (
-                    q.clone() * m.query_advice(t12_b, Rotation::cur()),
+                    q.clone() * m.query_advice(w_y, Rotation::cur()),
                     t.clone() * m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t12_i_r1, Rotation::cur()),
+                    q.clone() * m.query_advice(w_i, Rotation::cur()),
                     t.clone() * m.query_advice(in_by_dst.idx, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t12_a, Rotation::cur()),
+                    q.clone() * m.query_advice(w_x, Rotation::cur()),
                     t.clone() * m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
                 ),
                 (
-                    q * m.query_advice(t12_r1_eid, Rotation::cur()),
+                    q * m.query_advice(w_e1, Rotation::cur()),
                     t * m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
                 ),
             ]
         });
-        // r2 via OutBySrc: key=B, idx=j_r2 -> val=C, eid=r2_eid
-        meta.lookup_any("bag1 r2 from out_by_src", |m| {
-            let q = m.query_selector(q_t12_lookup);
+        // r_out via OutBySrc: key=y, idx=j -> val=z, eid=e2
+        meta.lookup_any("W r_out from out_by_src", |m| {
+            let q = m.query_selector(q_w_lookup);
             let t = m.query_selector(q_view_tbl);
             vec![
                 (
-                    q.clone() * m.query_advice(t12_b, Rotation::cur()),
+                    q.clone() * m.query_advice(w_y, Rotation::cur()),
                     t.clone() * m.query_advice(out_by_src.sorted_key, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t12_j_r2, Rotation::cur()),
+                    q.clone() * m.query_advice(w_j, Rotation::cur()),
                     t.clone() * m.query_advice(out_by_src.idx, Rotation::cur()),
                 ),
                 (
-                    q.clone() * m.query_advice(t12_c, Rotation::cur()),
+                    q.clone() * m.query_advice(w_z, Rotation::cur()),
                     t.clone() * m.query_advice(out_by_src.sorted_val, Rotation::cur()),
                 ),
                 (
-                    q * m.query_advice(t12_r2_eid, Rotation::cur()),
-                    t * m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
-                ),
-            ]
-        });
-
-        // Bag2 lookups:
-        // r3 via InByDst: key=D, idx=i_r3 -> val=C, eid=r3_eid  (since r3 is C->D)
-        meta.lookup_any("bag2 r3 from in_by_dst", |m| {
-            let q = m.query_selector(q_t34_lookup);
-            let t = m.query_selector(q_view_tbl);
-            vec![
-                (
-                    q.clone() * m.query_advice(t34_d, Rotation::cur()),
-                    t.clone() * m.query_advice(in_by_dst.sorted_key, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t34_i_r3, Rotation::cur()),
-                    t.clone() * m.query_advice(in_by_dst.idx, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t34_c, Rotation::cur()),
-                    t.clone() * m.query_advice(in_by_dst.sorted_val, Rotation::cur()),
-                ),
-                (
-                    q * m.query_advice(t34_r3_eid, Rotation::cur()),
-                    t * m.query_advice(in_by_dst.sorted_eid, Rotation::cur()),
-                ),
-            ]
-        });
-        // r4 via OutBySrc: key=D, idx=j_r4 -> val=A, eid=r4_eid  (since r4 is D->A)
-        meta.lookup_any("bag2 r4 from out_by_src", |m| {
-            let q = m.query_selector(q_t34_lookup);
-            let t = m.query_selector(q_view_tbl);
-            vec![
-                (
-                    q.clone() * m.query_advice(t34_d, Rotation::cur()),
-                    t.clone() * m.query_advice(out_by_src.sorted_key, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t34_j_r4, Rotation::cur()),
-                    t.clone() * m.query_advice(out_by_src.idx, Rotation::cur()),
-                ),
-                (
-                    q.clone() * m.query_advice(t34_a, Rotation::cur()),
-                    t.clone() * m.query_advice(out_by_src.sorted_val, Rotation::cur()),
-                ),
-                (
-                    q * m.query_advice(t34_r4_eid, Rotation::cur()),
+                    q * m.query_advice(w_e2, Rotation::cur()),
                     t * m.query_advice(out_by_src.sorted_eid, Rotation::cur()),
                 ),
             ]
@@ -1687,9 +1625,9 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // -------- Conservation of the edge relation (condition (7) for R) -----
         // `e_eid`/`e_src`/`e_dst` were dead columns and the two views' input
         // columns were free advice tied only to their own sorted view, with
-        // nothing relating the views to each other, so the four bag lookups
+        // nothing relating the views to each other, so the bag lookups
         // above proved membership in two INDEPENDENT prover-invented relations:
-        // r1/r3 could come from one edge list and r2/r4 from another. Two
+        // r_in could come from one edge list and r_out from another. Two
         // shuffles fix that. `in_by_dst` holds (dst, src, eid) and `out_by_src`
         // holds (src, dst, eid), so both are compared against the base table's
         // (src, dst, eid) with the two key/val columns swapped on the in-side.
@@ -1718,40 +1656,53 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             )
         };
 
-        // Bag2 real is boolean
-        meta.create_gate("bag2 real boolean", |m| {
-            let q = m.query_selector(q_t34_flag);
-            let real = m.query_advice(t34_real, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            vec![q * real.clone() * (one - real)]
-        });
-
-        // ordering in Bag2: C < D, enabled only if real=1
-        let q_cd = meta.selector();
-        let lt_cd = LtChip::<F, NUM_BYTES>::configure(
+        // The two order checks of the row, enabled only if real=1. `lt_ab`
+        // compares (x,y), which is role 1's [A<B] and role 2's [C<D] at once,
+        // and `lt_bc` compares (y,z), which is role 1's [B<C]. The deleted
+        // `lt_cd` chip had operands (t34_c, t34_d) = (x, y) and so was the same
+        // predicate on the same cells as `lt_ab`.
+        let q_order = meta.selector();
+        let lt_ab = LtChip::<F, NUM_BYTES>::configure(
             meta,
-            |m| m.query_selector(q_cd) * m.query_advice(t34_real, Rotation::cur()),
-            |m| m.query_advice(t34_c, Rotation::cur()),
-            |m| m.query_advice(t34_d, Rotation::cur()),
+            |m| m.query_selector(q_order) * m.query_advice(w_real, Rotation::cur()),
+            |m| m.query_advice(w_x, Rotation::cur()),
+            |m| m.query_advice(w_y, Rotation::cur()),
+        );
+        let lt_bc = LtChip::<F, NUM_BYTES>::configure(
+            meta,
+            |m| m.query_selector(q_order) * m.query_advice(w_real, Rotation::cur()),
+            |m| m.query_advice(w_y, Rotation::cur()),
+            |m| m.query_advice(w_z, Rotation::cur()),
         );
 
         // Message aggregator
         let agg_msg = AggSumByKeyChip::<F>::configure(meta);
 
-        // Tie agg_msg inputs to Bag2 rows:
-        // keep = t34_real * [C<D]
-        // in_key = keep ? pack2(A,C) : PAD
+        // Tie agg_msg inputs to the ROLE-2 reading (C,D,A) = (x,y,z):
+        // keep = w_real * [x<y]
+        // in_key = keep ? pack2(A,C) = pack2(z,x) : PAD
         // in_val = keep
-        meta.create_gate("msg input from bag2", |m| {
-            let q = m.query_selector(q_t34_msg_in);
+        //
+        // The key is REVERSED relative to the role-1 probe key pack2(x,z) that
+        // "role 1 real + key" pins on the SAME two cells of the SAME row. That
+        // reversal is the whole mechanism: M(p,q) = |{w in W : x = p, z = q}| is
+        // aggregated on pack2(z,x) and probed on pack2(x,z), so
+        // answer = sum over w in W with y<z of M(z,x).
+        //
+        // The keep bit is real * [x<y], NOT the role-1 predicate. Aggregating
+        // over the role-1 predicate would make the message count only rows that
+        // also satisfy [y<z], i.e. it would silently require D<A on the
+        // C->D->A path and change the answer.
+        meta.create_gate("msg input from W (role 2)", |m| {
+            let q = m.query_selector(q_w_msg_in);
 
-            let a = m.query_advice(t34_a, Rotation::cur());
-            let c = m.query_advice(t34_c, Rotation::cur());
-            let key_expr = a * Expression::Constant(F::from(PACK_SHIFT)) + c;
+            let z = m.query_advice(w_z, Rotation::cur());
+            let x = m.query_advice(w_x, Rotation::cur());
+            let key_expr = z * Expression::Constant(F::from(PACK_SHIFT)) + x;
 
-            let real = m.query_advice(t34_real, Rotation::cur());
-            let cd = lt_cd.is_lt(m, None);
-            let keep = real.clone() * cd;
+            let real = m.query_advice(w_real, Rotation::cur());
+            let xy = lt_ab.is_lt(m, None);
+            let keep = real.clone() * xy;
 
             let one = Expression::Constant(F::ONE);
             let pad = Expression::Constant(F::from(PAD_U64));
@@ -1763,7 +1714,26 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             ]
         });
 
-        // Message lookup per Bag1 row (table is agg_msg.map_* gated by agg_msg.q_map_tbl)
+        // The ROLE-1 predicate bit, folded into a column so that every gate of
+        // the Cardinality Preservation Check below stays at degree <= 4, and
+        // stated STRUCTURALLY as pred = keep * [y<z] on top of the role-2 bit
+        // rather than as real * [x<y] * [y<z]. Beyond dropping the degree from 4
+        // to 3, that form is what licenses the single occurrence-distinctness
+        // argument: role 1's rows are exactly the role-2 rows that also pass a
+        // genuine Lt on (y,z), decided per row, so distinctness of the role-2
+        // occurrences carries over. Do not weaken this gate or the role-2
+        // partition tail pin without restoring the second argument.
+        let w_pred = meta.advice_column();
+        meta.enable_equality(w_pred);
+        let q_w_pred = meta.selector();
+        meta.create_gate("role 1 pred = keep * [y<z]", |m| {
+            let q = m.query_selector(q_w_pred);
+            let keep = m.query_advice(agg_msg.in_val, Rotation::cur());
+            let bc = lt_bc.is_lt(m, None);
+            vec![q * (m.query_advice(w_pred, Rotation::cur()) - keep * bc)]
+        });
+
+        // Message lookup per row (table is agg_msg.map_* gated by agg_msg.q_map_tbl)
         let msg_lookup = MapLookupChip::<F>::configure(
             meta,
             agg_msg.map_key,
@@ -1772,14 +1742,19 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             agg_msg.q_map_tbl,
         );
 
-        // Bag1 real is boolean + tie msg_lookup.key = pack2(A,C)
-        meta.create_gate("bag1 real + key", |m| {
-            let q = m.query_selector(q_t12_key);
-            let a = m.query_advice(t12_a, Rotation::cur());
-            let c = m.query_advice(t12_c, Rotation::cur());
-            let key_expr = a * Expression::Constant(F::from(PACK_SHIFT)) + c;
+        // w_real is boolean + tie msg_lookup.key to the ROLE-1 probe key,
+        // pack2(A,C) = pack2(x,z) FORWARD. This reads the same two cells as the
+        // aggregate's key gate above, on the same row, into a different advice
+        // column: the two packings are different numbers, so the two columns
+        // cannot merge. The booleanity polynomial here is the only one w_real
+        // needs; the deleted "bag2 real boolean" gate was a second copy of it.
+        meta.create_gate("role 1 real + key", |m| {
+            let q = m.query_selector(q_w_key);
+            let x = m.query_advice(w_x, Rotation::cur());
+            let z = m.query_advice(w_z, Rotation::cur());
+            let key_expr = x * Expression::Constant(F::from(PACK_SHIFT)) + z;
 
-            let real = m.query_advice(t12_real, Rotation::cur());
+            let real = m.query_advice(w_real, Rotation::cur());
             let one = Expression::Constant(F::ONE);
 
             vec![
@@ -1788,35 +1763,21 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             ]
         });
 
-        // ordering checks for Bag1: A<B and B<C, enabled only if real=1
-        let q_order12 = meta.selector();
-        let lt_ab = LtChip::<F, NUM_BYTES>::configure(
-            meta,
-            |m| m.query_selector(q_order12) * m.query_advice(t12_real, Rotation::cur()),
-            |m| m.query_advice(t12_a, Rotation::cur()),
-            |m| m.query_advice(t12_b, Rotation::cur()),
-        );
-        let lt_bc = LtChip::<F, NUM_BYTES>::configure(
-            meta,
-            |m| m.query_selector(q_order12) * m.query_advice(t12_real, Rotation::cur()),
-            |m| m.query_advice(t12_b, Rotation::cur()),
-            |m| m.query_advice(t12_c, Rotation::cur()),
-        );
-
-        // contrib = t12_real * msg_val * lt_ab * lt_bc
+        // contrib = w_pred * msg_val, i.e. the role-1 predicate times M(z,x).
+        // Spelling it through the folded bit instead of real * msgv * ab * bc
+        // drops this gate from degree 5 to 3; cs.degree() is set by the
+        // membership lookups either way.
         let contrib = meta.advice_column();
         meta.enable_equality(contrib);
         let q_contrib = meta.selector();
         meta.create_gate("contrib gate", |m| {
             let q = m.query_selector(q_contrib);
 
-            let real = m.query_advice(t12_real, Rotation::cur());
+            let pred = m.query_advice(w_pred, Rotation::cur());
             let msgv = m.query_advice(msg_lookup.val, Rotation::cur());
-            let ab = lt_ab.is_lt(m, None);
-            let bc = lt_bc.is_lt(m, None);
 
             let outc = m.query_advice(contrib, Rotation::cur());
-            vec![q * (outc - real * msgv * ab * bc)]
+            vec![q * (outc - pred * msgv)]
         });
 
         // prefix sum of contrib
@@ -1854,46 +1815,40 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         });
 
         // ================= Cardinality Preservation Check (condition (4)) =================
+        //
+        // `w_pred`, the role-1 predicate bit the check needs on the parent side,
+        // is allocated with the order chips above so that the "contrib gate" can
+        // read it too.
 
-        // The Bag1 predicate bit, folded into a column. The "contrib gate"
-        // above already multiplies the three factors out at degree 5; reusing
-        // the folded bit keeps every gate added below at degree <= 4 and lets
-        // the Conservation Check and the root product share one column.
-        let t12_pred = meta.advice_column();
-        meta.enable_equality(t12_pred);
-        let q_t12_pred = meta.selector();
-        meta.create_gate("bag1 pred = real * [A<B] * [B<C]", |m| {
-            let q = m.query_selector(q_t12_pred);
-            let real = m.query_advice(t12_real, Rotation::cur());
-            let ab = lt_ab.is_lt(m, None);
-            let bc = lt_bc.is_lt(m, None);
-            vec![q * (m.query_advice(t12_pred, Rotation::cur()) - real * ab * bc)]
-        });
-
-        // Clean indicator per bag row.
-        let t12_cflag = meta.advice_column();
-        let t34_cflag = meta.advice_column();
-        for c in [t12_cflag, t34_cflag] {
+        // Clean indicator per ROLE. The two are genuinely different bits: a row
+        // is role-2 clean iff it is kept and its pack2(z,x) is the key of a
+        // role-1 clean row, and role-1 clean iff its predicate holds and its
+        // pack2(x,z) carries a kept row. A row can be role-2 clean and role-1
+        // dangling, so the two clean SETS differ and no single row order puts
+        // both of them in a prefix: this is why the two partitions below stay
+        // separate even though there is now only one tuple group.
+        let w_cflag1 = meta.advice_column();
+        let w_cflag2 = meta.advice_column();
+        for c in [w_cflag1, w_cflag2] {
             meta.enable_equality(c);
         }
 
         // The indicator had no booleanity gate anywhere: only `enable_equality`
         // and the link gate below, which multiplies it by the predicate bit.
-        // Two degree-3 constraints under selectors the circuit already enables
-        // on every row of each bag.
+        // Two degree-3 constraints under a selector the circuit already enables
+        // on every row.
         meta.create_gate("clean indicator is boolean on the bag rows", |m| {
             let one = Expression::Constant(F::ONE);
-            let q12 = m.query_selector(q_t12_pred);
-            let q34 = m.query_selector(q_t34_flag);
-            let c12 = m.query_advice(t12_cflag, Rotation::cur());
-            let c34 = m.query_advice(t34_cflag, Rotation::cur());
+            let q = m.query_selector(q_w_pred);
+            let c1 = m.query_advice(w_cflag1, Rotation::cur());
+            let c2 = m.query_advice(w_cflag2, Rotation::cur());
             vec![
-                q12 * c12.clone() * (one.clone() - c12),
-                q34 * c34.clone() * (one - c34),
+                q.clone() * c1.clone() * (one.clone() - c1),
+                q * c2.clone() * (one - c2),
             ]
         });
 
-        // -------- Conservation Check per bag: R == R^c U R^r --------
+        // -------- Conservation Check per role: R == R^c U R^r --------
         // `g_sql4_obj.rs` partitions nothing, so the partition is introduced
         // here. Six columns per side: the bag tuple, the two edge ids that
         // identify the occurrence, and the clean indicator.
@@ -1913,8 +1868,14 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             (a, b, perm)
         }
 
-        let (t12_filt_pad, t12_part_pad, perm_t12) = mk_perm::<F>(meta, 6);
-        let (t34_filt_pad, t34_part_pad, perm_t34) = mk_perm::<F>(meta, 6);
+        // Two partitions of the SAME base tuple group, one per role. They look
+        // mergeable now that there is one bag and they are not: the two clean
+        // sets differ, merging would make condition (9) below compare a set with
+        // itself, and the two channels of condition (10) would collapse into
+        // one. Both sides stay width 6 and the same shape, which the halo2
+        // shuffle evaluator requires.
+        let (filt1, part1, perm1) = mk_perm::<F>(meta, 6);
+        let (filt2, part2, perm2) = mk_perm::<F>(meta, 6);
 
         // The indicator column pads with 0, so a bag row whose predicate fails
         // is never clean and contributes to neither channel of the check.
@@ -1941,22 +1902,25 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             });
         };
 
-        // Bag1's predicate bit is `t12_pred`; Bag2's is `agg_msg.in_val`, which
-        // the "msg input from bag2" gate already forces to t34_real * [C<D].
+        // Both link gates read the SAME five base columns, the tuple and the two
+        // edge ids of the occurrence, and differ only in the bit that keeps a row
+        // and in the indicator they carry. Role 1's bit is `w_pred`; role 2's is
+        // `agg_msg.in_val`, which the "msg input from W (role 2)" gate already
+        // forces to w_real * [x<y].
         link_filt_pad(
-            "link t12_filt_pad = (pred? bag1 tuple : PAD)",
-            perm_t12.q_perm1,
-            t12_pred,
-            vec![t12_a, t12_b, t12_c, t12_r1_eid, t12_r2_eid, t12_cflag],
-            t12_filt_pad.clone(),
+            "link filt1 = (pred? W tuple : PAD)",
+            perm1.q_perm1,
+            w_pred,
+            vec![w_x, w_y, w_z, w_e1, w_e2, w_cflag1],
+            filt1.clone(),
             pad_bag,
         );
         link_filt_pad(
-            "link t34_filt_pad = (keep? bag2 tuple : PAD)",
-            perm_t34.q_perm1,
+            "link filt2 = (keep? W tuple : PAD)",
+            perm2.q_perm1,
             agg_msg.in_val,
-            vec![t34_c, t34_d, t34_a, t34_r3_eid, t34_r4_eid, t34_cflag],
-            t34_filt_pad.clone(),
+            vec![w_x, w_y, w_z, w_e1, w_e2, w_cflag2],
+            filt2.clone(),
             pad_bag,
         );
 
@@ -1983,16 +1947,17 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // multiset of PAD tuples on the input side is then exactly the pad rows,
         // so the clean section can hold no more than n_cln flag-1 rows and the
         // duplicate has nowhere to go. Six degree-1 constraints under one
-        // selector per bag; pinning rather than gating out, so the shuffle keeps
+        // selector per role; pinning rather than gating out, so the shuffle keeps
         // proving that R == R^c U R^r over ALL n rows.
+        //
+        // The role-2 triple is additionally what pins the role-2 row count `m`,
+        // which is what the single occurrence-distinctness argument below counts
+        // against, so neither triple may be dropped.
         let q_cln_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
         let q_res_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
         let q_pad_row = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
 
-        for (idx, part) in [t12_part_pad.clone(), t34_part_pad.clone()]
-            .iter()
-            .enumerate()
-        {
+        for (idx, part) in [part1.clone(), part2.clone()].iter().enumerate() {
             let flag_col = *part.last().unwrap();
             let q_c = q_cln_flag[idx];
             let q_r = q_res_flag[idx];
@@ -2019,30 +1984,27 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
 
         // ================= Pairwise Consistency (condition (3)) =================
         // pi_K(R_i^c) == pi_K(R_j^c) on every join tree edge. Here the bag tree
-        // has one edge, t12 -- t34 on the packed separator key pack2(A,C), so
-        // the condition is two mutual Membership Checks between the clean
+        // has one edge, role 1 -- role 2 on the packed separator key pack2(A,C),
+        // so the condition is two mutual Membership Checks between the clean
         // sections of the two partitions.
         //
         // Both sides read the *partition* columns, whose tuples the Conservation
         // Check above ties to the bag rows: restricted to the clean rows, the
         // separator key of that group is exactly pi_K(R^c). A lookup over the
         // bag rows instead would certify membership in R_j, which is the weaker
-        // statement the four bag lookups already make.
+        // statement the two bag lookups already make.
         //
-        // t12_part_pad is (A,B,C,r1_eid,r2_eid,c) and t34_part_pad is
-        // (C,D,A,r3_eid,r4_eid,c), so the same packed key reads off different
-        // columns on the two sides. Folding it into one column per bag keeps
-        // both lookups at the degree of the circuit's other membership
-        // arguments, and reuses the packing the previous round already fixed.
+        // Both partitions hold (x,y,z,e1,e2,c), but they are read in different
+        // roles, so the shared separator key pack2(A,C) is pack2(x,z) on the
+        // role-1 side and pack2(z,x) on the role-2 side: the SAME two columns in
+        // OPPOSITE order. Folding it into one column per role keeps both lookups
+        // at the degree of the circuit's other membership arguments.
         let pw_key = (0..2).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let q_pw_key = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-        for (idx, (a_col, c_col)) in [
-            (t12_part_pad[0], t12_part_pad[2]),
-            (t34_part_pad[2], t34_part_pad[0]),
-        ]
-        .iter()
-        .copied()
-        .enumerate()
+        for (idx, (a_col, c_col)) in [(part1[0], part1[2]), (part2[2], part2[0])]
+            .iter()
+            .copied()
+            .enumerate()
         {
             let q = q_pw_key[idx];
             let key_col = pw_key[idx];
@@ -2057,13 +2019,13 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
 
         // The two containments run directly between `pw_key[0]` and `pw_key[1]`.
         // The earlier round routed each of them through an intermediate advice
-        // column holding [0] ++ uniq(keys of the other bag's clean section), but
-        // nothing in the circuit bound that column to the bag it claimed to
-        // enumerate: a prover could put t12's clean keys in the table t12 looks
-        // into and t34's in the table t34 looks into, and both lookups would pass
-        // for an arbitrary partition, which made condition (3) vacuous. Looking
-        // the two key columns up in each other leaves no free advice, and costs
-        // one advice column and one complex selector per direction less.
+        // column holding [0] ++ uniq(keys of the other role's clean section), but
+        // nothing in the circuit bound that column to the set it claimed to
+        // enumerate: a prover could put role 1's clean keys in the table role 1
+        // looks into and role 2's in the table role 2 looks into, and both lookups
+        // would pass for an arbitrary partition, which made condition (3) vacuous.
+        // Looking the two key columns up in each other leaves no free advice, and
+        // costs one advice column and one complex selector per direction less.
         //
         // The selectors must be complex: a simple selector may not appear in a
         // lookup expression, so the q_cln_flag pair of the Conservation Check
@@ -2087,18 +2049,18 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             });
         };
 
-        // pi_K(t12^c) subset of pi_K(t34^c): a Bag1 tuple left on the clean side
-        // with no clean Bag2 partner is rejected here. The mirror direction makes
+        // pi_K(R_1^c) subset of pi_K(R_2^c): a role-1 tuple left on the clean side
+        // with no clean role-2 partner is rejected here. The mirror direction makes
         // the two key sets equal rather than merely nested.
         pw_edge(
-            "pw: t12^c key in t34^c",
+            "pw: role1^c key in role2^c",
             q_pw_in[0],
             pw_key[0],
             q_pw_in[1],
             pw_key[1],
         );
         pw_edge(
-            "pw: t34^c key in t12^c",
+            "pw: role2^c key in role1^c",
             q_pw_in[1],
             pw_key[1],
             q_pw_in[0],
@@ -2110,25 +2072,26 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // check costs a single u8 range table.
         let cp_u8 = meta.fixed_column();
 
-        // Child side, over the Bag2 rows. Bag2 is a leaf of the bag tree, so
-        // its two multiplicities are the two per-tuple bits themselves: the
+        // Child side, over the ROLE-2 reading. Role 2 is a leaf of the bag tree,
+        // so its two multiplicities are the two per-tuple bits themselves: the
         // predicate bit `agg_msg.in_val` for the input channel and the bound
-        // indicator `keep * c` for the clean channel. The separator key is
-        // `agg_msg.in_key`, already forced to pack2(A,C) on the kept rows and
-        // to PAD elsewhere, and a PAD key never reaches the emitted table.
-        let cp_agg_34 = configure_cp_agg::<F, NUM_BYTES>(
+        // indicator `keep * c2` for the clean channel. The separator key is
+        // `agg_msg.in_key`, already forced to pack2(A,C) = pack2(z,x) on the kept
+        // rows and to PAD elsewhere, and a PAD key never reaches the emitted
+        // table.
+        let cp_agg_2 = configure_cp_agg::<F, NUM_BYTES>(
             meta,
             cp_u8,
             agg_msg.in_key,
             agg_msg.in_val,
-            t34_filt_pad[5],
+            filt2[5],
             PAD_U64,
         );
 
-        // Parent side, over the Bag1 rows, on the probe key that the
-        // "bag1 real + key" gate ties to pack2(A,C).
-        let cp_join_34 = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, msg_lookup.key);
-        wire_cp_edge(meta, &cp_join_34, &cp_agg_34, msg_lookup.key);
+        // Parent side, over the ROLE-1 reading, on the probe key that the
+        // "role 1 real + key" gate ties to pack2(A,C) = pack2(x,z).
+        let cp_join_2 = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, msg_lookup.key);
+        wire_cp_edge(meta, &cp_join_2, &cp_agg_2, msg_lookup.key);
 
         // Root multiplicities and the single equality that compares the two
         // join cardinalities. `mu_all` reproduces `contrib`, so the input side
@@ -2136,18 +2099,18 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         let cp_root = configure_cp_root::<F>(meta);
         let q_cp_mu = meta.selector();
         {
-            let s_all = cp_join_34.s_all;
-            let s_cln = cp_join_34.s_cln;
-            let cln_12 = t12_filt_pad[5];
+            let s_all = cp_join_2.s_all;
+            let s_cln = cp_join_2.s_cln;
+            let cln_1 = filt1[5];
             let mu_all = cp_root.mu_all;
             let mu_cln = cp_root.mu_cln;
-            meta.create_gate("cp: root multiplicities over bag1", move |m| {
+            meta.create_gate("cp: root multiplicities over role 1", move |m| {
                 let q = m.query_selector(q_cp_mu);
                 let all = m.query_advice(mu_all, Rotation::cur())
-                    - m.query_advice(t12_pred, Rotation::cur())
+                    - m.query_advice(w_pred, Rotation::cur())
                         * m.query_advice(s_all, Rotation::cur());
                 let cln = m.query_advice(mu_cln, Rotation::cur())
-                    - m.query_advice(cln_12, Rotation::cur())
+                    - m.query_advice(cln_1, Rotation::cur())
                         * m.query_advice(s_cln, Rotation::cur());
                 vec![q.clone() * all, q * cln]
             });
@@ -2159,16 +2122,16 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             // COUNT over the same (in_key, in_val) pair, and the only statement
             // that they agree was a host-side `debug_assert_eq!` inside
             // `assign`, which is compiled out in release and never executed by a
-            // hostile prover. So `contrib = real * msgv * [A<B] * [B<C]`, the
-            // number the circuit outputs, and `mu_all = pred * s_all`, the
-            // number condition (10) certifies, could differ freely: condition
-            // (10) certified a quantity unrelated to the answer.
+            // hostile prover. So `contrib = pred * msgv`, the number the circuit
+            // outputs, and `mu_all = pred * s_all`, the number condition (10)
+            // certifies, could differ freely: condition (10) certified a
+            // quantity unrelated to the answer.
             //
-            // One degree-2 equality per Bag1 row ties them. With it,
+            // One degree-2 equality per row ties them. With it,
             // contrib = pred * msgv = pred * s_all = mu_all on every row, so
             // `run_sum` and `sum_all` are two accumulations of the same values
             // and the certified cardinality IS the exposed COUNT. `q_cp_mu` is
-            // already enabled on every Bag1 row, so this costs no selector.
+            // already enabled on every row, so this costs no selector.
             let msg_val = msg_lookup.val;
             meta.create_gate("cp: answer channel equals certified channel", move |m| {
                 let q = m.query_selector(q_cp_mu);
@@ -2179,28 +2142,27 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             });
         }
 
-        // ============= occurrence distinctness of the two bags =============
-        // The two bags were pinned only ROW BY ROW: the four lookups above say
-        // that a row is SOME valid wedge occurrence, and nothing said that two
-        // rows are different occurrences or that the bag holds all of them.
+        // ============= occurrence distinctness of W =============
+        // The bag was pinned only ROW BY ROW: the two lookups above say that a
+        // row is SOME valid wedge occurrence, and nothing said that two rows are
+        // different occurrences or that the bag holds all of them.
         // Every argument downstream is blind to that. Conservation is a multiset
         // equality, so it accepts a duplicate as readily as the original;
         // Pairwise Consistency compares KEY SETS, so a duplicate of a key that
         // already has a partner is invisible; and condition (10) is a difference
         // of two channels, so any transformation that moves both channels
-        // equally passes. Concretely: overwrite one clean Bag2 row with a
-        // byte-copy of a clean Bag2 row of a DIFFERENT clean key. Both keys keep
+        // equally passes. Concretely: overwrite one role-2 clean row with a
+        // byte-copy of a role-2 clean row of a DIFFERENT clean key. Both keys keep
         // a clean occurrence, so both "pw: " lookups still pass; the clean and
         // residual section lengths do not move, so the honest vk still verifies;
         // and both cp channels move by the same amount, so `sum_all == sum_cln`
-        // holds. Only the answer changes. The mirror move on Bag1 works the same
-        // way. This is the root cause the partition-tail and sentinel fixes
-        // above do NOT reach.
+        // holds. Only the answer changes. This is the root cause the
+        // partition-tail and sentinel fixes above do NOT reach.
         //
         // What closes it is distinctness plus a pinned count. Give every bag row
         // an occurrence id, `pack2` of the two edge ids the row joins. That id is
         // a FUNCTION of the occurrence: the view's `idx` recurrence makes
-        // (key, idx) unique, so (B, i_r1, j_r2) determines (r1_eid, r2_eid).
+        // (key, idx) unique, so (y, i, j) determines (e1, e2).
         // Injectivity in the other direction is not needed for soundness -- a
         // collision would only make the constraint harder to satisfy -- it is a
         // completeness requirement, and honest edge ids are below n_base, hence
@@ -2208,99 +2170,96 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // increase over the first `m = n_cln + n_res` rows and pin the rest to
         // PAD. Then:
         //
-        //   * the tail pin of the partition already forces the number of rows
-        //     that pass the predicate to be exactly `m` (a passing row's tuple
-        //     cannot be the PAD tuple, since A < B rules out A = B = PAD), so
-        //     the sorted view holds exactly `m` real ids;
+        //   * the tail pin of the role-2 partition already forces the number of
+        //     rows that pass the role-2 keep bit to be exactly `m` (a kept row's
+        //     tuple cannot be the PAD tuple, since x < y rules out x = y = PAD),
+        //     so the sorted view holds exactly `m` real ids;
         //   * PAD cannot appear inside the increasing prefix, because the
         //     comparison at row m-1 reads the pinned row m and an 8-byte Lt can
         //     only certify PAD < PAD by a zero difference, which it rejects;
         //   * strict increase makes those `m` ids pairwise distinct: each step
         //     adds a difference in [1, 2^64], and m * 2^64 is nowhere near the
         //     field order, so the chain cannot wrap round onto itself;
-        //   * a passing row cannot smuggle its id into the PAD tail either, since
+        //   * a kept row cannot smuggle its id into the PAD tail either, since
         //     the two counts above force the number of PAD ids to be exactly
-        //     n - m, so no passing row's id may equal PAD.
+        //     n - m, so no kept row's id may equal PAD.
         //
-        // So the `m` rows that pass the predicate are `m` DISTINCT valid
-        // occurrences, and since the honest bag has exactly `m` of them, they
-        // are all of them. Both bags are now exactly the wedge joins of the edge
-        // relation in `e_*`, which is what makes the two channels of condition
-        // (10) count the right thing rather than merely count consistently.
+        // So the `m` rows that pass the keep bit are `m` DISTINCT valid
+        // occurrences, and since the honest W has exactly `m` of them, they
+        // are all of them. W is now exactly the x<y-filtered wedge join of the
+        // edge relation in `e_*`, which is what makes the two channels of
+        // condition (10) count the right thing rather than merely count
+        // consistently.
         //
-        // Cost: two advice columns, one width-1 shuffle and one Lt chip per bag,
-        // all sharing the check's u8 column. Highest new gate degree is 3.
-        let mut t_oid: Vec<Column<Advice>> = vec![];
-        let mut oid_sorted: Vec<Column<Advice>> = vec![];
-        let mut perm_oid: Vec<PermAnyConfig> = vec![];
-        let mut q_oid_sort: Vec<Selector> = vec![];
-        let mut q_oid_pad: Vec<Selector> = vec![];
-        let mut lt_oid: Vec<LtConfig<F, NUM_BYTES>> = vec![];
+        // ONE argument, over the ROLE-2 keep bit `agg_msg.in_val`, does both
+        // roles. The role-1 copy of it, over `w_pred` and the same two edge id
+        // columns, would be a second argument about the same rows: role 1's rows
+        // are the role-2 rows on which a genuine Lt certifies [y<z], decided per
+        // row by the "role 1 pred = keep * [y<z]" gate, so distinctness of the
+        // role-2 occurrences already gives distinctness of the role-1 subset, and
+        // the role-1 count is pinned by its own partition tail. That is why this
+        // deletion is licensed ONLY while that gate and the role-2 partition tail
+        // pin both stay. Saves two advice columns, one shuffle, one Lt chip
+        // (9 advice + 8 lookups) and two selectors.
+        //
+        // Cost: two advice columns, one width-1 shuffle and one Lt chip, sharing
+        // the check's u8 column. Highest new gate degree is 3.
+        let w_oid = meta.advice_column();
+        let oid_sorted = meta.advice_column();
+        meta.enable_equality(w_oid);
+        meta.enable_equality(oid_sorted);
 
-        // Bag1's predicate bit is `t12_pred` and its occurrence is (r1_eid,
-        // r2_eid); Bag2's bit is `agg_msg.in_val`, which the "msg input from
-        // bag2" gate forces to t34_real * [C<D], and its occurrence is
-        // (r3_eid, r4_eid). Both selectors are already enabled on every row of
-        // their bag, so the id gate costs no selector.
-        for (q_row, keep, e_hi, e_lo) in [
-            (q_t12_pred, t12_pred, t12_r1_eid, t12_r2_eid),
-            (q_t34_msg_in, agg_msg.in_val, t34_r3_eid, t34_r4_eid),
-        ] {
-            let oid = meta.advice_column();
-            let sid = meta.advice_column();
-            meta.enable_equality(oid);
-            meta.enable_equality(sid);
-
+        // The role-2 bit is `agg_msg.in_val`, which the "msg input from W
+        // (role 2)" gate forces to w_real * [x<y], and the occurrence is
+        // (w_e1, w_e2). `q_w_msg_in` is already enabled on every row, so the id
+        // gate costs no selector.
+        {
+            let keep = agg_msg.in_val;
             meta.create_gate(
-                "occ: id = pack2(edge ids), PAD when the predicate fails",
+                "occ: id = pack2(edge ids), PAD when the keep bit fails",
                 move |m| {
-                    let q = m.query_selector(q_row);
+                    let q = m.query_selector(q_w_msg_in);
                     let k = m.query_advice(keep, Rotation::cur());
                     let one = Expression::Constant(F::ONE);
-                    let id = m.query_advice(e_hi, Rotation::cur())
+                    let id = m.query_advice(w_e1, Rotation::cur())
                         * Expression::Constant(F::from(PACK_SHIFT))
-                        + m.query_advice(e_lo, Rotation::cur());
+                        + m.query_advice(w_e2, Rotation::cur());
                     let pad = Expression::Constant(F::from(PAD_U64));
                     vec![
-                        q * (m.query_advice(oid, Rotation::cur())
+                        q * (m.query_advice(w_oid, Rotation::cur())
                             - (k.clone() * id + (one - k) * pad)),
                     ]
                 },
             );
+        }
 
+        let perm_oid = {
             let q1 = meta.complex_selector();
             let q2 = meta.complex_selector();
-            let perm = PermAnyChip::configure(meta, q1, q2, vec![oid], vec![sid]);
+            PermAnyChip::configure(meta, q1, q2, vec![w_oid], vec![oid_sorted])
+        };
 
-            let q_sort = meta.selector();
-            let lt = LtChip::<F, NUM_BYTES>::configure_with_u8(
-                meta,
-                cp_u8,
-                |m| m.query_selector(q_sort),
-                |m| m.query_advice(sid, Rotation::cur()),
-                |m| m.query_advice(sid, Rotation::next()),
-            );
-            meta.create_gate("occ: ids strictly increase over R^c U R^r", move |m| {
-                let q = m.query_selector(q_sort);
-                vec![q * (lt.is_lt(m, None) - Expression::Constant(F::ONE))]
-            });
+        let q_oid_sort = meta.selector();
+        let lt_oid = LtChip::<F, NUM_BYTES>::configure_with_u8(
+            meta,
+            cp_u8,
+            |m| m.query_selector(q_oid_sort),
+            |m| m.query_advice(oid_sorted, Rotation::cur()),
+            |m| m.query_advice(oid_sorted, Rotation::next()),
+        );
+        meta.create_gate("occ: ids strictly increase over R^c U R^r", move |m| {
+            let q = m.query_selector(q_oid_sort);
+            vec![q * (lt_oid.is_lt(m, None) - Expression::Constant(F::ONE))]
+        });
 
-            let q_pad = meta.selector();
-            meta.create_gate("occ: id tail is PAD", move |m| {
-                let q = m.query_selector(q_pad);
-                vec![
-                    q * (m.query_advice(sid, Rotation::cur())
-                        - Expression::Constant(F::from(PAD_U64))),
-                ]
-            });
-
-            t_oid.push(oid);
-            oid_sorted.push(sid);
-            perm_oid.push(perm);
-            q_oid_sort.push(q_sort);
-            q_oid_pad.push(q_pad);
-            lt_oid.push(lt);
-        }
+        let q_oid_pad = meta.selector();
+        meta.create_gate("occ: id tail is PAD", move |m| {
+            let q = m.query_selector(q_oid_pad);
+            vec![
+                q * (m.query_advice(oid_sorted, Rotation::cur())
+                    - Expression::Constant(F::from(PAD_U64))),
+            ]
+        });
 
         Cycle4OrderedConfig {
             instance,
@@ -2312,32 +2271,20 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             q_view_tbl,
             perm_edge_out,
             perm_edge_in,
-            t12_a,
-            t12_b,
-            t12_c,
-            t12_i_r1,
-            t12_j_r2,
-            t12_r1_eid,
-            t12_r2_eid,
-            t12_real,
-            q_t12_lookup,
-            q_t12_key,
-            t34_c,
-            t34_d,
-            t34_a,
-            t34_i_r3,
-            t34_j_r4,
-            t34_r3_eid,
-            t34_r4_eid,
-            t34_real,
-            q_t34_lookup,
-            q_t34_flag,
-            q_t34_msg_in,
-            q_cd,
-            lt_cd,
+            w_x,
+            w_y,
+            w_z,
+            w_i,
+            w_j,
+            w_e1,
+            w_e2,
+            w_real,
+            q_w_lookup,
+            q_w_key,
+            q_w_msg_in,
             agg_msg,
             msg_lookup,
-            q_order12,
+            q_order,
             lt_ab,
             lt_bc,
             contrib,
@@ -2347,27 +2294,27 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             q_sum,
             out,
             q_out,
-            cp_agg_34,
-            cp_join_34,
+            cp_agg_2,
+            cp_join_2,
             cp_root,
             q_cp_mu,
-            t12_pred,
-            q_t12_pred,
-            t12_cflag,
-            t34_cflag,
-            t12_filt_pad,
-            t12_part_pad,
-            perm_t12,
-            t34_filt_pad,
-            t34_part_pad,
-            perm_t34,
+            w_pred,
+            q_w_pred,
+            w_cflag1,
+            w_cflag2,
+            filt1,
+            part1,
+            perm1,
+            filt2,
+            part2,
+            perm2,
             q_cln_flag,
             q_res_flag,
             q_pad_row,
             pw_key,
             q_pw_key,
             q_pw_in,
-            t_oid,
+            w_oid,
             oid_sorted,
             perm_oid,
             q_oid_sort,
@@ -2376,12 +2323,13 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         }
     }
 
+    /// `pad_extra` is a SINGLE knob: there is one materialized bag, so the two
+    /// pad counts this used to take were always two names for the same number.
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
         edges: Vec<Edge>,
-        bag1_pad_extra: usize,
-        bag2_pad_extra: usize,
+        pad_extra: usize,
     ) -> Result<AssignedCell<F, F>, Error> {
         let cfg = self.cfg.clone();
 
@@ -2394,10 +2342,9 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_high.clone()).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_ab.clone()).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone()).load(layouter)?;
-        LtChip::<F, NUM_BYTES>::construct(cfg.lt_cd.clone()).load(layouter)?;
         // Every Lt chip of the Cardinality Preservation Check shares one u8
         // fixed column, so a single load covers the whole check.
-        LtChip::<F, NUM_BYTES>::construct(cfg.cp_agg_34.lt_key_cur_next).load(layouter)?;
+        LtChip::<F, NUM_BYTES>::construct(cfg.cp_agg_2.lt_key_cur_next).load(layouter)?;
 
         let in_view_chip = IndexedViewChip::<F>::construct(cfg.in_by_dst.clone());
         let out_view_chip = IndexedViewChip::<F>::construct(cfg.out_by_src.clone());
@@ -2411,7 +2358,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // -------------------
                 let n_base = edges.len() + 1;
                 for i in 0..n_base {
-                    // the four bag lookups read the two views' rows 0..n_base-1
+                    // the two bag lookups read the two views' rows 0..n_base-1
                     // as their table, and nothing else
                     cfg.q_view_tbl.enable(&mut region, i)?;
                     // both views are the base table's (src, dst, eid) multiset
@@ -2450,15 +2397,14 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 }
 
                 // -------------------
-                // Host-side derivation: view inputs, both bags, message map.
+                // Host-side derivation: view inputs, the one bag, message map.
                 // Shared verbatim with `g_sql4_obj_dp`.
                 // -------------------
                 let derived = gq4_derive(&edges);
                 let Gq4Derived {
                     in_rows,
                     out_rows,
-                    t12,
-                    t34,
+                    w,
                     msg_map,
                     keys,
                 } = derived;
@@ -2467,333 +2413,109 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 in_view_chip.assign(&mut region, n_base, &in_rows)?;
                 out_view_chip.assign(&mut region, n_base, &out_rows)?;
 
-                // ============ clean/residual partition of the two bags ============
+                // ============ clean/residual partition, once per role ============
                 // The Cardinality Preservation Check needs two sides to
                 // compare, and this circuit partitions nothing, so the
                 // partition is built here. The bag tree has two nodes, so the
-                // semijoin reduction is exact: a bag tuple is clean iff its own
-                // predicate holds and it extends to a full 4-cycle.
-                let real34 = t34.len();
-                let n34 = std::cmp::max(real34 + bag2_pad_extra, 1);
-                let real12 = t12.len();
-                let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
+                // semijoin reduction is exact: a tuple is clean in its role iff
+                // that role's predicate holds and it extends to a full 4-cycle.
+                //
+                // ONE capacity knob: there is one materialized bag, so the two
+                // pad counts this used to take were two names for one number.
+                let real_w = w.len();
+                let n = std::cmp::max(real_w + pad_extra, 1);
 
-                // Bag2: keep = real * [C<D], key = pack2(A,C) on the kept rows
-                // and PAD elsewhere, exactly what the "msg input from bag2"
+                // Role 2, the reading (C,D,A) = (x,y,z): keep = real * [x<y],
+                // key = pack2(A,C) = pack2(z,x) REVERSED on the kept rows and
+                // PAD elsewhere, exactly what the "msg input from W (role 2)"
                 // gate forces on (agg_msg.in_key, agg_msg.in_val).
-                let mut keep34: Vec<u64> = vec![0; n34];
-                let mut key34: Vec<u64> = vec![PAD_U64; n34];
-                for i in 0..real34 {
-                    let (c, d, a, _i3, _j4, _e3, _e4) = t34[i];
-                    if c < d {
-                        keep34[i] = 1;
-                        key34[i] = pack2(a, c);
+                let mut keep2: Vec<u64> = vec![0; n];
+                let mut key2: Vec<u64> = vec![PAD_U64; n];
+                for i in 0..real_w {
+                    let (x, y, z, _i, _j, _e1, _e2) = w[i];
+                    if x < y {
+                        keep2[i] = 1;
+                        key2[i] = pack2(z, x);
                     }
                 }
 
-                // Bag1: pred = real * [A<B] * [B<C]; the probe key is
-                // pack2(A,C) on the real rows and 0 on the pad rows.
-                let mut pred12: Vec<u64> = vec![0; n12];
-                let mut key12: Vec<u64> = vec![0; n12];
-                for i in 0..real12 {
-                    let (a, b, c, _i1, _j2, _e1, _e2) = t12[i];
-                    if a < b && b < c {
-                        pred12[i] = 1;
+                // Role 1, the reading (A,B,C) = (x,y,z): pred = keep * [y<z];
+                // the probe key is pack2(A,C) = pack2(x,z) FORWARD on the real
+                // rows and 0 on the pad rows.
+                let mut pred1: Vec<u64> = vec![0; n];
+                let mut key1: Vec<u64> = vec![0; n];
+                for i in 0..real_w {
+                    let (x, y, z, _i, _j, _e1, _e2) = w[i];
+                    if keep2[i] == 1 && y < z {
+                        pred1[i] = 1;
                     }
-                    key12[i] = pack2(a, c);
+                    key1[i] = pack2(x, z);
                 }
 
-                // A Bag1 tuple is clean iff its predicate holds and its
-                // separator key carries at least one kept Bag2 tuple; a Bag2
+                // A role-1 tuple is clean iff its predicate holds and its
+                // separator key carries at least one kept role-2 tuple; a role-2
                 // tuple is clean iff it is kept and its key is the key of a
-                // clean Bag1 tuple.
-                let mut cln12: Vec<u64> = (0..n12)
-                    .map(|i| (pred12[i] == 1 && *msg_map.get(&key12[i]).unwrap_or(&0) > 0) as u64)
+                // clean role-1 tuple. The two clean SETS therefore differ, which
+                // is why the two partitions cannot be merged.
+                let mut cln1: Vec<u64> = (0..n)
+                    .map(|i| (pred1[i] == 1 && *msg_map.get(&key1[i]).unwrap_or(&0) > 0) as u64)
                     .collect();
 
-                // test hook only: hide one joinable Bag1 tuple in the residual
-                // side. `cln34` is recomputed from the reduced `cln12` just
+                // test hook only: hide one joinable role-1 tuple in the residual
+                // side. `cln2` is recomputed from the reduced `cln1` just
                 // below, so the two partitions stay partitions and conditions
                 // (1)-(3) still hold: only condition (4) can see this.
                 let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
                 if tamper {
-                    if let Some(h) = (0..n12).find(|&i| cln12[i] == 1) {
-                        cln12[h] = 0;
+                    if let Some(h) = (0..n).find(|&i| cln1[i] == 1) {
+                        cln1[h] = 0;
                     }
                 }
 
                 // test hook only: skip the reduction and declare every real
-                // tuple of both bags clean, which leaves the residual side
+                // tuple of both roles clean, which leaves the residual side
                 // empty. Conservation still holds and both channels of
                 // condition (4) then agree on every row, so only Pairwise
                 // Consistency can see the dangling tuples.
                 let mark_all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
                 if mark_all_clean {
-                    cln12 = pred12.clone();
+                    cln1 = pred1.clone();
                 }
 
-                let clean_keys12: HashSet<u64> = (0..n12)
-                    .filter(|&i| cln12[i] == 1)
-                    .map(|i| key12[i])
-                    .collect();
-                let cln34: Vec<u64> = if mark_all_clean {
-                    keep34.clone()
+                let clean_keys1: HashSet<u64> =
+                    (0..n).filter(|&i| cln1[i] == 1).map(|i| key1[i]).collect();
+                let cln2: Vec<u64> = if mark_all_clean {
+                    keep2.clone()
                 } else {
-                    (0..n34)
-                        .map(|i| (keep34[i] == 1 && clean_keys12.contains(&key34[i])) as u64)
+                    (0..n)
+                        .map(|i| (keep2[i] == 1 && clean_keys1.contains(&key2[i])) as u64)
                         .collect()
                 };
 
-                // both sides of the two Conservation Checks
+                // Both sides of both Conservation Checks. The five tuple columns
+                // are shared: only the keep bit and the indicator differ.
                 let pad_bag: [u64; 6] = [PAD_U64, PAD_U64, PAD_U64, PAD_U64, PAD_U64, 0];
-                let tuples34: Vec<[u64; 5]> = (0..n34)
+                let tuples: Vec<[u64; 5]> = (0..n)
                     .map(|i| {
-                        if i < real34 {
-                            let (c, d, a, _i3, _j4, e3, e4) = t34[i];
-                            [c, d, a, e3, e4]
+                        if i < real_w {
+                            let (x, y, z, _i, _j, e1, e2) = w[i];
+                            [x, y, z, e1, e2]
                         } else {
                             [0, 0, 0, 0, 0]
                         }
                     })
                     .collect();
-                let tuples12: Vec<[u64; 5]> = (0..n12)
-                    .map(|i| {
-                        if i < real12 {
-                            let (a, b, c, _i1, _j2, e1, e2) = t12[i];
-                            [a, b, c, e1, e2]
-                        } else {
-                            [0, 0, 0, 0, 0]
-                        }
-                    })
-                    .collect();
-                let (filt34, part34, n_cln34, n_res34) =
-                    split_partition(&tuples34, &keep34, &cln34, n34, &pad_bag);
-                let (filt12, part12, n_cln12, n_res12) =
-                    split_partition(&tuples12, &pred12, &cln12, n12, &pad_bag);
+                let (filt_2, part_2, n_cln2, n_res2) =
+                    split_partition(&tuples, &keep2, &cln2, n, &pad_bag);
+                let (filt_1, part_1, n_cln1, n_res1) =
+                    split_partition(&tuples, &pred1, &cln1, n, &pad_bag);
 
                 // -------------------
-                // Assign Bag2 rows + build agg inputs (key,value)
+                // ONE pass over the bag rows. Both roles read the same row, so
+                // the tuple columns, the two order witnesses, the aggregate
+                // input, the probe, the folded role-1 bit, both indicators, the
+                // contribution and the running sum are all assigned together.
                 // -------------------
-                // Debug print, silenced: `assign` runs during keygen as well as
-                // proving, so this fired several times per measured row.
-                // NOTE if re-enabling: it printed `t12.len()` under the label
-                // "n34". Harmless here only because |t12| == |t34| (both bags
-                // are the same unfiltered in x out wedge join), but the label
-                // and the variable do not match. Print `t34.len()` instead.
-                // println!("The length of n34 is: {}", t34.len());
-
-                let mut agg_in: Vec<(u64, u64)> = vec![(PAD_U64, 0); n34]; // default PAD bucket
-
-                let lt_cd_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_cd.clone());
-
-                for i in 0..n34 {
-                    cfg.q_t34_lookup.enable(&mut region, i)?;
-                    cfg.q_t34_flag.enable(&mut region, i)?;
-                    cfg.q_cd.enable(&mut region, i)?;
-                    cfg.q_t34_msg_in.enable(&mut region, i)?;
-
-                    if i < real34 {
-                        let (c, d, a, i_r3, j_r4, r3_eid, r4_eid) = t34[i];
-
-                        region.assign_advice(
-                            || "t34_c",
-                            cfg.t34_c,
-                            i,
-                            || Value::known(F::from(c)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_d",
-                            cfg.t34_d,
-                            i,
-                            || Value::known(F::from(d)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_a",
-                            cfg.t34_a,
-                            i,
-                            || Value::known(F::from(a)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_i_r3",
-                            cfg.t34_i_r3,
-                            i,
-                            || Value::known(F::from(i_r3)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_j_r4",
-                            cfg.t34_j_r4,
-                            i,
-                            || Value::known(F::from(j_r4)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_r3_eid",
-                            cfg.t34_r3_eid,
-                            i,
-                            || Value::known(F::from(r3_eid)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_r4_eid",
-                            cfg.t34_r4_eid,
-                            i,
-                            || Value::known(F::from(r4_eid)),
-                        )?;
-                        region.assign_advice(
-                            || "t34_real",
-                            cfg.t34_real,
-                            i,
-                            || Value::known(F::ONE),
-                        )?;
-
-                        // lt witness
-                        lt_cd_chip.assign(
-                            &mut region,
-                            i,
-                            Value::known(F::from(c)),
-                            Value::known(F::from(d)),
-                        )?;
-
-                        let keep = if c < d { 1u64 } else { 0u64 };
-                        let key = if keep == 1 { pack2(a, c) } else { PAD_U64 };
-                        agg_in[i] = (key, keep);
-                    } else {
-                        // padded row (dummy edge)
-                        region.assign_advice(
-                            || "t34_c0",
-                            cfg.t34_c,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_d0",
-                            cfg.t34_d,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_a0",
-                            cfg.t34_a,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_i0",
-                            cfg.t34_i_r3,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_j0",
-                            cfg.t34_j_r4,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_r3eid0",
-                            cfg.t34_r3_eid,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_r4eid0",
-                            cfg.t34_r4_eid,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-                        region.assign_advice(
-                            || "t34_real0",
-                            cfg.t34_real,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
-
-                        lt_cd_chip.assign(
-                            &mut region,
-                            i,
-                            Value::known(F::ZERO),
-                            Value::known(F::ZERO),
-                        )?;
-                        agg_in[i] = (PAD_U64, 0);
-                    }
-                }
-
-                // Aggregate Bag2 rows into msg map table (inside the circuit)
-                let _msg_emitted = agg_msg_chip.assign(&mut region, n34, &agg_in)?;
-
-                // ---- Conservation Check of Bag2, which binds its indicator ----
-                // input side: the raw indicator on the bag rows, which the link
-                // gate turns into keep * indicator on the filt_pad columns
-                for i in 0..n34 {
-                    region.assign_advice(
-                        || "t34_cflag",
-                        cfg.t34_cflag,
-                        i,
-                        || Value::known(F::from(cln34[i])),
-                    )?;
-                    cfg.perm_t34.q_perm1.enable(&mut region, i)?;
-                    cfg.perm_t34.q_perm2.enable(&mut region, i)?;
-                }
-                assign_perm_group(&mut region, "t34_filt_pad", &cfg.t34_filt_pad, &filt34)?;
-                assign_perm_group(&mut region, "t34_part_pad", &cfg.t34_part_pad, &part34)?;
-                // partition side: 1 on the clean rows, 0 on the residual rows
-                for i in 0..n_cln34 {
-                    cfg.q_cln_flag[1].enable(&mut region, i)?;
-                }
-                for i in n_cln34..(n_cln34 + n_res34) {
-                    cfg.q_res_flag[1].enable(&mut region, i)?;
-                }
-                // and the tail is the canonical PAD tuple, not free advice
-                for i in (n_cln34 + n_res34)..n34 {
-                    cfg.q_pad_row[1].enable(&mut region, i)?;
-                }
-
-                // ---- occurrence distinctness of Bag2 ----
-                // `pack2` of the two edge ids is injective only while both fit a
-                // 32-bit lane, which also keeps every real id strictly below the
-                // PAD id that marks the rows failing the predicate.
-                assert!(
-                    (n_base as u64) < PACK_SHIFT,
-                    "the occurrence id packs two edge ids into 32-bit lanes"
-                );
-                let oid34: Vec<u64> = (0..n34)
-                    .map(|i| {
-                        if keep34[i] == 1 {
-                            pack2(t34[i].5, t34[i].6)
-                        } else {
-                            PAD_U64
-                        }
-                    })
-                    .collect();
-                assign_occurrence_ids(
-                    &mut region,
-                    cfg.t_oid[1],
-                    cfg.oid_sorted[1],
-                    &cfg.perm_oid[1],
-                    cfg.q_oid_sort[1],
-                    cfg.q_oid_pad[1],
-                    &cfg.lt_oid[1],
-                    &oid34,
-                    n_cln34 + n_res34,
-                )?;
-
-                // ---- child side of the bag tree edge, both channels ----
-                // Bag2 is a leaf, so a row's input-channel multiplicity is its
-                // predicate bit and its clean-channel multiplicity is that bit
-                // times the clean indicator. Both already sit in columns the
-                // circuit carries, so the second channel costs one column and
-                // the stage groups them by the separator key in one pass.
-                let cp_rows_34: Vec<[u64; 3]> = (0..n34)
-                    .map(|i| [key34[i], keep34[i], keep34[i] * cln34[i]])
-                    .collect();
-                let cp_stage_34 = build_cp_stage(&cp_rows_34, PAD_U64);
-                assign_cp_agg(&mut region, &cfg.cp_agg_34, &cp_rows_34, &cp_stage_34)?;
-
-                // -------------------
-                // Assign Bag1 rows + lookup message + ordering + sum
-                // -------------------
-                // Debug print, silenced: `assign` runs during keygen as well as
-                // proving, so this fired several times per measured row.
-                // println!("The length of n12 is: {}", t12.len());
-
                 // `keys`, the sorted gap-witness key list (with the 0 and PAD
                 // sentinels), comes from `gq4_derive` above.
 
@@ -2803,53 +2525,35 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 let lt_high_chip =
                     LtChip::<F, NUM_BYTES>::construct(cfg.msg_lookup.lt_high.clone());
 
+                let mut agg_in: Vec<(u64, u64)> = vec![(PAD_U64, 0); n]; // default PAD bucket
                 let mut running: u64 = 0;
 
-                for i in 0..n12 {
-                    cfg.q_t12_lookup.enable(&mut region, i)?;
-                    cfg.q_t12_key.enable(&mut region, i)?;
+                for i in 0..n {
+                    cfg.q_w_lookup.enable(&mut region, i)?;
+                    cfg.q_w_key.enable(&mut region, i)?;
+                    cfg.q_w_msg_in.enable(&mut region, i)?;
                     cfg.msg_lookup.q_flag.enable(&mut region, i)?;
                     cfg.msg_lookup.q_complex.enable(&mut region, i)?;
-                    cfg.q_order12.enable(&mut region, i)?;
+                    cfg.q_order.enable(&mut region, i)?;
                     cfg.q_contrib.enable(&mut region, i)?;
 
-                    let (a, b, c, i_r1, j_r2, r1_eid, r2_eid, real) = if i < real12 {
-                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
-                        (a, b, c, i_r1, j_r2, r1_eid, r2_eid, 1u64)
+                    let (x, y, z, i_in, j_out, e1, e2, real) = if i < real_w {
+                        let (x, y, z, i_in, j_out, e1, e2) = w[i];
+                        (x, y, z, i_in, j_out, e1, e2, 1u64)
                     } else {
                         (0, 0, 0, 0, 0, 0, 0, 0u64)
                     };
 
-                    region.assign_advice(|| "t12_a", cfg.t12_a, i, || Value::known(F::from(a)))?;
-                    region.assign_advice(|| "t12_b", cfg.t12_b, i, || Value::known(F::from(b)))?;
-                    region.assign_advice(|| "t12_c", cfg.t12_c, i, || Value::known(F::from(c)))?;
+                    region.assign_advice(|| "w_x", cfg.w_x, i, || Value::known(F::from(x)))?;
+                    region.assign_advice(|| "w_y", cfg.w_y, i, || Value::known(F::from(y)))?;
+                    region.assign_advice(|| "w_z", cfg.w_z, i, || Value::known(F::from(z)))?;
+                    region.assign_advice(|| "w_i", cfg.w_i, i, || Value::known(F::from(i_in)))?;
+                    region.assign_advice(|| "w_j", cfg.w_j, i, || Value::known(F::from(j_out)))?;
+                    region.assign_advice(|| "w_e1", cfg.w_e1, i, || Value::known(F::from(e1)))?;
+                    region.assign_advice(|| "w_e2", cfg.w_e2, i, || Value::known(F::from(e2)))?;
                     region.assign_advice(
-                        || "t12_i_r1",
-                        cfg.t12_i_r1,
-                        i,
-                        || Value::known(F::from(i_r1)),
-                    )?;
-                    region.assign_advice(
-                        || "t12_j_r2",
-                        cfg.t12_j_r2,
-                        i,
-                        || Value::known(F::from(j_r2)),
-                    )?;
-                    region.assign_advice(
-                        || "t12_r1_eid",
-                        cfg.t12_r1_eid,
-                        i,
-                        || Value::known(F::from(r1_eid)),
-                    )?;
-                    region.assign_advice(
-                        || "t12_r2_eid",
-                        cfg.t12_r2_eid,
-                        i,
-                        || Value::known(F::from(r2_eid)),
-                    )?;
-                    region.assign_advice(
-                        || "t12_real",
-                        cfg.t12_real,
+                        || "w_real",
+                        cfg.w_real,
                         i,
                         || Value::known(F::from(real)),
                     )?;
@@ -2858,18 +2562,21 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     lt_ab_chip.assign(
                         &mut region,
                         i,
-                        Value::known(F::from(a)),
-                        Value::known(F::from(b)),
+                        Value::known(F::from(x)),
+                        Value::known(F::from(y)),
                     )?;
                     lt_bc_chip.assign(
                         &mut region,
                         i,
-                        Value::known(F::from(b)),
-                        Value::known(F::from(c)),
+                        Value::known(F::from(y)),
+                        Value::known(F::from(z)),
                     )?;
 
-                    // message lookup witness
-                    let key = if real == 1 { pack2(a, c) } else { 0 };
+                    // role-2 aggregate input, on the REVERSED key
+                    agg_in[i] = (key2[i], keep2[i]);
+
+                    // role-1 message lookup witness, on the FORWARD key
+                    let key = if real == 1 { key1[i] } else { 0 };
                     let inside = if key == 0 || msg_map.contains_key(&key) {
                         1u64
                     } else {
@@ -2940,10 +2647,8 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                         Value::known(F::from(high)),
                     )?;
 
-                    // contrib witness
-                    let ab = if a < b { 1u64 } else { 0u64 };
-                    let bc = if b < c { 1u64 } else { 0u64 };
-                    let contrib_u64 = real * val * ab * bc;
+                    // contrib witness: the role-1 predicate times M(z,x)
+                    let contrib_u64 = pred1[i] * val;
 
                     region.assign_advice(
                         || "contrib",
@@ -2952,22 +2657,30 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                         || Value::known(F::from(contrib_u64)),
                     )?;
 
-                    // the folded predicate bit and the clean indicator of this
-                    // bag row, the two inputs the check needs on the root side
-                    cfg.q_t12_pred.enable(&mut region, i)?;
-                    cfg.perm_t12.q_perm1.enable(&mut region, i)?;
-                    cfg.perm_t12.q_perm2.enable(&mut region, i)?;
+                    // the folded role-1 bit and both clean indicators of this
+                    // row, plus the input side of both Conservation Checks
+                    cfg.q_w_pred.enable(&mut region, i)?;
+                    cfg.perm1.q_perm1.enable(&mut region, i)?;
+                    cfg.perm1.q_perm2.enable(&mut region, i)?;
+                    cfg.perm2.q_perm1.enable(&mut region, i)?;
+                    cfg.perm2.q_perm2.enable(&mut region, i)?;
                     region.assign_advice(
-                        || "t12_pred",
-                        cfg.t12_pred,
+                        || "w_pred",
+                        cfg.w_pred,
                         i,
-                        || Value::known(F::from(pred12[i])),
+                        || Value::known(F::from(pred1[i])),
                     )?;
                     region.assign_advice(
-                        || "t12_cflag",
-                        cfg.t12_cflag,
+                        || "w_cflag1",
+                        cfg.w_cflag1,
                         i,
-                        || Value::known(F::from(cln12[i])),
+                        || Value::known(F::from(cln1[i])),
+                    )?;
+                    region.assign_advice(
+                        || "w_cflag2",
+                        cfg.w_cflag2,
+                        i,
+                        || Value::known(F::from(cln2[i])),
                     )?;
 
                     // running sum
@@ -2991,24 +2704,52 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     )?;
                 }
 
-                // ---- Conservation Check of Bag1, which binds its indicator ----
-                assign_perm_group(&mut region, "t12_filt_pad", &cfg.t12_filt_pad, &filt12)?;
-                assign_perm_group(&mut region, "t12_part_pad", &cfg.t12_part_pad, &part12)?;
-                for i in 0..n_cln12 {
-                    cfg.q_cln_flag[0].enable(&mut region, i)?;
-                }
-                for i in n_cln12..(n_cln12 + n_res12) {
-                    cfg.q_res_flag[0].enable(&mut region, i)?;
-                }
-                for i in (n_cln12 + n_res12)..n12 {
-                    cfg.q_pad_row[0].enable(&mut region, i)?;
+                // Aggregate the role-2 rows into the msg map table (in-circuit).
+                // This also writes agg_msg.in_key / in_val, which the
+                // "msg input from W (role 2)" gate ties to the row.
+                let _msg_emitted = agg_msg_chip.assign(&mut region, n, &agg_in)?;
+
+                // ---- both Conservation Checks, which bind the two indicators ----
+                // The input side's raw indicators went in with the bag rows
+                // above; the link gate turns each into keep * indicator on its
+                // own filt columns.
+                assign_perm_group(&mut region, "filt1", &cfg.filt1, &filt_1)?;
+                assign_perm_group(&mut region, "part1", &cfg.part1, &part_1)?;
+                assign_perm_group(&mut region, "filt2", &cfg.filt2, &filt_2)?;
+                assign_perm_group(&mut region, "part2", &cfg.part2, &part_2)?;
+                // partition side: 1 on the clean rows, 0 on the residual rows,
+                // and the tail pinned to the canonical PAD tuple rather than
+                // left as free advice
+                for (idx, (n_cln, n_res)) in [(n_cln1, n_res1), (n_cln2, n_res2)]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    for i in 0..n_cln {
+                        cfg.q_cln_flag[idx].enable(&mut region, i)?;
+                    }
+                    for i in n_cln..(n_cln + n_res) {
+                        cfg.q_res_flag[idx].enable(&mut region, i)?;
+                    }
+                    for i in (n_cln + n_res)..n {
+                        cfg.q_pad_row[idx].enable(&mut region, i)?;
+                    }
                 }
 
-                // ---- occurrence distinctness of Bag1 ----
-                let oid12: Vec<u64> = (0..n12)
+                // ---- occurrence distinctness, over the role-2 keep bit ----
+                // `pack2` of the two edge ids is injective only while both fit a
+                // 32-bit lane, which also keeps every real id strictly below the
+                // PAD id that marks the rows failing the keep bit. One argument
+                // covers both roles: role 1's rows are the role-2 rows that also
+                // pass the pinned [y<z] test.
+                assert!(
+                    (n_base as u64) < PACK_SHIFT,
+                    "the occurrence id packs two edge ids into 32-bit lanes"
+                );
+                let oid: Vec<u64> = (0..n)
                     .map(|i| {
-                        if pred12[i] == 1 {
-                            pack2(t12[i].5, t12[i].6)
+                        if keep2[i] == 1 {
+                            pack2(w[i].5, w[i].6)
                         } else {
                             PAD_U64
                         }
@@ -3016,33 +2757,47 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     .collect();
                 assign_occurrence_ids(
                     &mut region,
-                    cfg.t_oid[0],
-                    cfg.oid_sorted[0],
-                    &cfg.perm_oid[0],
-                    cfg.q_oid_sort[0],
-                    cfg.q_oid_pad[0],
-                    &cfg.lt_oid[0],
-                    &oid12,
-                    n_cln12 + n_res12,
+                    cfg.w_oid,
+                    cfg.oid_sorted,
+                    &cfg.perm_oid,
+                    cfg.q_oid_sort,
+                    cfg.q_oid_pad,
+                    &cfg.lt_oid,
+                    &oid,
+                    n_cln2 + n_res2,
                 )?;
+
+                // ---- child side of the bag tree edge, both channels ----
+                // Role 2 is a leaf, so a row's input-channel multiplicity is its
+                // keep bit and its clean-channel multiplicity is that bit times
+                // the role-2 clean indicator. Both already sit in columns the
+                // circuit carries, so the second channel costs one column and
+                // the stage groups them by the reversed separator key in one
+                // pass.
+                let cp_rows_2: Vec<[u64; 3]> = (0..n)
+                    .map(|i| [key2[i], keep2[i], keep2[i] * cln2[i]])
+                    .collect();
+                let cp_stage_2 = build_cp_stage(&cp_rows_2, PAD_U64);
+                assign_cp_agg(&mut region, &cfg.cp_agg_2, &cp_rows_2, &cp_stage_2)?;
 
                 // ============== PAIRWISE CONSISTENCY (condition (3)) ==============
                 // The two key sets of the one bag tree edge, read off the clean
                 // sections of the two partitions rather than off the bag rows,
-                // and each of them looked up in the other. `part12` is
-                // (A,B,C,...) and `part34` is (C,D,A,...), so the shared key
-                // pack2(A,C) reads off different columns on the two sides, the
-                // same way the "pw: clean key = pack2(A,C)" gate does.
+                // and each of them looked up in the other. Both partitions hold
+                // (x,y,z,...), but the shared key pack2(A,C) is pack2(x,z) in
+                // role 1 and pack2(z,x) in role 2, the same two columns in
+                // opposite order, exactly as the "pw: clean key = pack2(A,C)"
+                // gate reads them.
                 //
-                // There is no key table to fill: the column of one bag is the
+                // There is no key table to fill: the column of one role is the
                 // table of the other direction, so `q_pw_in[r]` over the clean
-                // rows of bag r is all the gating either lookup needs.
+                // rows of role r is all the gating either lookup needs.
                 let pw_keys: [Vec<u64>; 2] = [
-                    (0..n_cln12)
-                        .map(|i| pack2(part12[i][0], part12[i][2]))
+                    (0..n_cln1)
+                        .map(|i| pack2(part_1[i][0], part_1[i][2]))
                         .collect(),
-                    (0..n_cln34)
-                        .map(|i| pack2(part34[i][2], part34[i][0]))
+                    (0..n_cln2)
+                        .map(|i| pack2(part_2[i][2], part_2[i][0]))
                         .collect(),
                 ];
                 for r in 0..2 {
@@ -3060,21 +2815,16 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
 
                 // ============== CARDINALITY PRESERVATION CHECK ==============
                 // Parent side of the single bag tree edge: fetch both sigma
-                // values for this Bag1 row's separator key, or certify with a
-                // gap witness that the key occurs in no Bag2 tuple and take 0.
+                // values for this row's role-1 separator key, or certify with a
+                // gap witness that the key occurs in no role-2 tuple and take 0.
                 let fetched =
-                    assign_cp_join(&mut region, &cfg.cp_join_34, &key12, &cp_stage_34, PAD_U64)?;
+                    assign_cp_join(&mut region, &cfg.cp_join_2, &key1, &cp_stage_2, PAD_U64)?;
 
                 // Root multiplicities and the equality between the two sums.
-                let cp_mu: Vec<(u64, u64)> = (0..n12)
-                    .map(|i| {
-                        (
-                            pred12[i] * fetched[i].0,
-                            pred12[i] * cln12[i] * fetched[i].1,
-                        )
-                    })
+                let cp_mu: Vec<(u64, u64)> = (0..n)
+                    .map(|i| (pred1[i] * fetched[i].0, pred1[i] * cln1[i] * fetched[i].1))
                     .collect();
-                for i in 0..n12 {
+                for i in 0..n {
                     cfg.q_cp_mu.enable(&mut region, i)?;
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &cfg.cp_root, &cp_mu)?;
@@ -3090,7 +2840,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 }
 
                 // enable q_out at the last sum row
-                let out_row = n12 - 1;
+                let out_row = n - 1;
                 cfg.q_out.enable(&mut region, out_row)?;
                 let out_cell = region.assign_advice(
                     || "out",
@@ -3116,16 +2866,16 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
 /// Wrapper circuit (uses dataset Edge directly)
 pub struct MyCircuit<F: Field + Ord> {
     pub edges: Vec<Edge>,
-    pub bag1_pad_extra: usize,
-    pub bag2_pad_extra: usize,
+    /// ONE capacity knob: the circuit materializes one bag, read in two column
+    /// roles, so the two pad counts this used to carry were one number twice.
+    pub pad_extra: usize,
     pub _marker: PhantomData<F>,
 }
 impl<F: Field + Ord> Default for MyCircuit<F> {
     fn default() -> Self {
         Self {
             edges: vec![],
-            bag1_pad_extra: 0,
-            bag2_pad_extra: 0,
+            pad_extra: 0,
             _marker: PhantomData,
         }
     }
@@ -3145,12 +2895,7 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 
     fn synthesize(&self, cfg: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
         let chip = Cycle4OrderedChip::<F>::construct(cfg);
-        let out = chip.assign(
-            &mut layouter,
-            self.edges.clone(),
-            self.bag1_pad_extra,
-            self.bag2_pad_extra,
-        )?;
+        let out = chip.assign(&mut layouter, self.edges.clone(), self.pad_extra)?;
         chip.expose_public(&mut layouter, out, 0)?;
         Ok(())
     }
@@ -3363,20 +3108,19 @@ mod tests {
             },
             _ => crate::bench_queries::Privacy::Legacy,
         };
-        let (bag1_pad_extra, bag2_pad_extra) =
-            crate::bench_queries::graph_pads("gq4", &dataset, &edges, privacy);
+        // `graph_pads` keeps its (usize, usize) signature for GQ3 and Q5; the
+        // GQ4 consumer reads .0 only, since there is one bag to pad.
+        let (pad_extra, _) = crate::bench_queries::graph_pads("gq4", &dataset, &edges, privacy);
         println!(
-            "[gq4 test] dataset={} privacy={} pads: bag1={} bag2={}",
+            "[gq4 test] dataset={} privacy={} pad={}",
             dataset,
             privacy.label(),
-            bag1_pad_extra,
-            bag2_pad_extra
+            pad_extra
         );
 
         let circuit = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra,
-            bag2_pad_extra,
+            pad_extra,
             _marker: PhantomData,
         };
 
@@ -3488,54 +3232,54 @@ mod tests {
         // The third direction below only bites if the slice really has dangling
         // bag tuples: with none of them the all-clean partition would be the
         // reduced instance and condition (3) would rightly accept it. Count
-        // them on both ends of the bag tree edge, the same way `assign` does.
+        // them on both ends of the bag tree edge, the same way `assign` does:
+        // one relation W, read as (A,B,C) with the extra [y<z] for role 1 and as
+        // (C,D,A) with nothing extra for role 2, on the two opposite packings of
+        // the separator.
         let derived = gq4_derive(&edges);
-        let kept34_keys: HashSet<u64> = derived
-            .t34
+        let kept2_keys: HashSet<u64> = derived
+            .w
             .iter()
-            .filter(|&&(c, d, ..)| c < d)
-            .map(|&(c, _d, a, ..)| pack2(a, c))
+            .map(|&(x, _y, z, ..)| pack2(z, x))
             .collect();
-        let pred12_keys: HashSet<u64> = derived
-            .t12
+        let pred1_keys: HashSet<u64> = derived
+            .w
             .iter()
-            .filter(|&&(a, b, c, ..)| a < b && b < c)
-            .map(|&(a, _b, c, ..)| pack2(a, c))
+            .filter(|&&(_x, y, z, ..)| y < z)
+            .map(|&(x, _y, z, ..)| pack2(x, z))
             .collect();
-        let dangling12 = derived
-            .t12
+        let dangling1 = derived
+            .w
             .iter()
-            .filter(|&&(a, b, c, ..)| a < b && b < c && !kept34_keys.contains(&pack2(a, c)))
+            .filter(|&&(x, y, z, ..)| y < z && !kept2_keys.contains(&pack2(x, z)))
             .count();
-        let dangling34 = derived
-            .t34
+        let dangling2 = derived
+            .w
             .iter()
-            .filter(|&&(c, d, a, ..)| c < d && !pred12_keys.contains(&pack2(a, c)))
+            .filter(|&&(x, _y, z, ..)| !pred1_keys.contains(&pack2(z, x)))
             .count();
         println!(
-            "[gq4 cp] |t12|={} |t34|={} dangling: t12={} t34={}",
-            derived.t12.len(),
-            derived.t34.len(),
-            dangling12,
-            dangling34
+            "[gq4 cp] |W|={} dangling: role1={} role2={}",
+            derived.w.len(),
+            dangling1,
+            dangling2
         );
         assert!(
-            dangling12 + dangling34 > 0,
+            dangling1 + dangling2 > 0,
             "the slice has no dangling bag tuple, the all-clean direction would be vacuous"
         );
 
         let circuit = MyCircuit::<Fp> {
             edges,
-            bag1_pad_extra: 0,
-            bag2_pad_extra: 0,
+            pad_extra: 0,
             _marker: PhantomData,
         };
 
         let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(cnt)]]).unwrap();
         prover.assert_satisfied();
 
-        // Negative direction: the same witness with one joinable Bag1 tuple
-        // hidden in the residual side, and Bag2 re-reduced around it so that
+        // Negative direction: the same witness with one joinable role-1 tuple
+        // hidden in the residual side, and role 2 re-reduced around it so that
         // Conservation, Non-Membership and Pairwise Consistency all still hold.
         // Only condition (4) can see this, so the circuit must now reject.
         super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
@@ -3544,7 +3288,7 @@ mod tests {
         super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
 
         // The tampered witness produces exactly one failure, the
-        // "cp: cardinality preservation" gate at the last Bag1 row: the two
+        // "cp: cardinality preservation" gate at the last row: the two
         // Conservation Checks, the bag lookups and the membership + gap proof
         // at the separator are all still satisfied, so nothing but condition
         // (4) sees the hidden tuple.

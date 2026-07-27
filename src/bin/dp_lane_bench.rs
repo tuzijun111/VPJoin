@@ -1,9 +1,14 @@
 //! DP lane proving cost for the three circuits that materialize an
 //! intermediate under a released capacity: Q5, GQ3 and GQ4.
 //!
-//! Every row proves the query circuit at its PINNED Revealing-Join-Size degree
-//! with the DP release hosted in lanes, so the released capacity shows up as
-//! extra lanes rather than as a bigger domain. The proving and verifying keys
+//! Every row proves the query circuit at a PINNED degree with the DP release
+//! hosted in lanes, so the released capacity shows up as extra lanes rather
+//! than as a bigger domain. GQ3 and GQ4 pin the Revealing-Join-Size degree of
+//! their dataset; Q5 pins k = 17, the degree its single-column circuit takes at
+//! the sweep's reference budget eps = 0.1, so at that budget a lane row and the
+//! baseline row it is compared against share a domain size (at smaller eps the
+//! single-column circuit escalates to 18/19/20 and the lane circuit does not).
+//! The proving and verifying keys
 //! are built ONCE per row, outside the timed region; then `reps` proofs are
 //! generated and EVERY one of them is verified. The table reports the mean
 //! prove time and the min..max spread.
@@ -13,12 +18,15 @@
 //!   cargo test --release <module>::tests::test_dp_lanes -- --ignored --nocapture
 //!
 //! for the paper's runs: it drives the same `run_dp_lanes` entry point those
-//! tests call, and it makes the PROFILE explicit at the call site. The paper's
-//! DP lane numbers are the DEBUG-profile ones, so run it as
+//! tests call, and it makes the PROFILE explicit at the call site.
 //!
-//!   cargo run --bin dp_lane_bench -- ...
-//!
-//! with no `--release`. Nothing is written to disk; the table is printed.
+//! RELEASE is not something the caller has to remember: `[profile.dev]` in
+//! `Cargo.toml` carries the release settings, so a plain `cargo run` is
+//! optimized and no invocation of this binary can quietly produce an
+//! unoptimized number. That matters here because a lane row is only meaningful
+//! next to the single-column row it is compared against, which `cargo vpjoin`
+//! produces optimized. The header line of every run records the profile.
+//! Nothing is written to disk; the table is printed.
 //!
 //! Usage:
 //!   cargo run --bin dp_lane_bench                    # q5 + gq3 + gq4, all datasets
@@ -26,6 +34,8 @@
 //!   cargo run --bin dp_lane_bench -- gq3:lastfm      # one graph query, one dataset
 //!   cargo run --bin dp_lane_bench -- reps=5 gq4      # 5 repetitions instead of 3
 //!   cargo run --bin dp_lane_bench -- --help          # the selector syntax
+//!
+//! `cargo dp-lane ...` is an alias for the same thing, one word shorter.
 //!
 //! `q5` always runs on tpch-60K; a `:dataset` suffix on it is ignored. `gq3`
 //! and `gq4` expand over lastfm, facebook and wiki unless a suffix pins one.
@@ -332,15 +342,23 @@ fn main() {
     println!(
         "DP lane proving cost, {} build. privacy={} seed={} reps={} per row; keys are\n\
          built once outside the timed region and every proof is verified.\n",
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
+        halo2_experiments::bench_queries::build_profile(),
         regime_label,
         std::env::var("VPJOIN_DP_SEED").unwrap_or_else(|_| "default".into()),
         reps
     );
+
+    // `cargo run` is optimized (see `[profile.dev]` in Cargo.toml), so this
+    // only fires under the `test` profile or a hand-rolled one that leaves the
+    // assertions on. Those timings are not comparable with the ones the sweep
+    // reports, so say it rather than let the one-word label carry it.
+    if !plan_only && cfg!(debug_assertions) {
+        println!(
+            "WARNING: this build has debug assertions ON, so it is NOT the profile the\n\
+             single-column rows are measured under and the timings below are not comparable\n\
+             with them. Run it as `cargo run --bin dp_lane_bench -- ...` (or `cargo dp-lane`).\n"
+        );
+    }
 
     if plan_only {
         println!("VPJOIN_PLAN_ONLY=1 -- geometry only, nothing is proved.");
@@ -487,7 +505,7 @@ fn print_legend() {
     println!(
         "\ncapacity = released bag capacity (true size + DP pad), one per laned bag\n\
          pad      = pad_extra per materialized intermediate, in the circuit's own order\n\
-         lanes    = lane count per laned bag; GQ4 lanes two bags, so it probes lanes[0]*lanes[1] times\n\
+         lanes    = lane count per laned bag; GQ4's two column roles share ONE laned relation, so it probes lanes[0]^2 times\n\
          eps      = the VPJOIN_EPS entry this row was released under (dash outside the dp regime)"
     );
 }

@@ -194,10 +194,13 @@ total_prove_s,total_proof_bytes,wall_s,config,status"
     }
 }
 
-/// The profile this binary was compiled with.  `cargo test` (without
-/// `--release`) and `cargo run` (without `--release`) both build the
-/// unoptimized profile -- including halo2 itself at `opt-level = 0` -- under
-/// which the same circuit proves several times slower.  Timings are only
+/// The profile this binary was compiled with, read off `debug_assertions`.
+///
+/// `[profile.dev]` in `Cargo.toml` carries the release settings, so `cargo run`
+/// reports `release` with or without `--release`: there is no unoptimized build
+/// to fall into. `cargo test` is the exception, since `[profile.test]` turns
+/// the host-side `debug_assert!`s back on; it is optimized but reports `debug`,
+/// which is the honest label because those checks cost time. Timings are only
 /// comparable within one profile, so every row records which one produced it.
 pub const fn build_profile() -> &'static str {
     if cfg!(debug_assertions) {
@@ -752,9 +755,9 @@ pub fn count_gq4(edges: &[Edge]) -> u64 {
 
 /// Cyclic-query bag capacities for the submitted runs.  Hand-picked constants
 /// (`dp/legacy_capacities.md`), dataset specific, so keyed by dataset rather
-/// than hard-coded to the lastfm value.  GQ3 and GQ4 share them: both queries
-/// materialize two bags through the same pad knobs, and their Bag 1 is the
-/// same filtered wedge join of identical size.
+/// than hard-coded to the lastfm value.  GQ3 and GQ4 share them: their bags are
+/// the same filtered wedge join of identical size.  GQ3 pads two bags with this
+/// number; GQ4 materializes ONE bag and pads it once.
 fn cyclic_pad_extra(dataset: &str) -> usize {
     match dataset {
         "lastfm" => 18_067,
@@ -935,11 +938,11 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
                         ls_true, ls_sens, eps_ls, delta / 2.0, &mut rng,
                     );
                     // No clamp: the release is valid as-is.  The DP lane
-                    // circuit hosts the capacity in ceil(cap / 2^16)
-                    // parallel column-group lanes at fixed k = 16 and
-                    // asserts its own structural maximum; the single-column
-                    // circuit instead takes the degree bump computed in
-                    // `degree_for`.
+                    // circuit hosts the capacity in
+                    // ceil(cap / q5_obj_dp::LANE_ROWS) parallel column-group
+                    // lanes at fixed k = 17 and asserts its own structural
+                    // maximum; the single-column circuit instead takes the
+                    // degree bump computed in `degree_for`.
                     let ls_pad = ls_cap.capacity.saturating_sub(ls_true) as usize;
                     // stderr, like the `[params]` load lines: the released
                     // capacities also appear as columns in every harness's
@@ -989,6 +992,10 @@ pub struct BagStats {
     bag2_mf_b: u64,
     /// bag2 is a base relation whose size is public (GQ3), so no DP is owed.
     bag2_is_public: bool,
+    /// The two bags are the same relation read with different column roles
+    /// (GQ4), so their cardinalities are ONE statistic: one release covers
+    /// both, and both get the same capacity.
+    bags_are_one_statistic: bool,
 }
 
 pub fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
@@ -1019,13 +1026,21 @@ pub fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
             bag2_mf_a: 1,
             bag2_mf_b: 1,
             bag2_is_public: true,
+            bags_are_one_statistic: false,
         },
         // Both GQ4 bags are the SAME wedge shape (Bag1 is A->B->C joined on B,
         // Bag2 is C->D->A joined on D), and both apply an early ordering
         // filter on the incoming edge (A<B and C<D respectively), so both
-        // materialize `wedge(indeg_lt)` rows -- see the EARLY FILTER comments
-        // in `g_sql4_obj::synthesize`.  Modelling them with the unfiltered
+        // materialize `wedge(indeg_lt)` rows -- see the EARLY FILTER comment
+        // in `g_sql4_obj::gq4_derive`.  Modelling them with the unfiltered
         // `indeg` overstated wiki by 2x and pushed it to k=23.
+        //
+        // Since `g_sql4_obj` collapsed the two bags into ONE materialized
+        // relation W read in two column roles, `bags_are_one_statistic` is not
+        // merely a modelling claim about equal cardinalities: the two sizes are
+        // literally one number, the height of one column group. Both fields
+        // still carry it so that the (usize, usize) shape GQ3 and Q5 need
+        // survives; the gq4 consumer reads `.0` only.
         "gq4" => {
             let n = wedge(&indeg_lt);
             BagStats {
@@ -1036,6 +1051,9 @@ pub fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
                 bag2_mf_a: max_of(&indeg_lt),
                 bag2_mf_b: max_of(&outdeg),
                 bag2_is_public: false,
+                // same relation, different column roles: see the budget note
+                // in `graph_pads`
+                bags_are_one_statistic: true,
             }
         }
         other => panic!("no bag model for {}", other),
@@ -1064,6 +1082,11 @@ fn dp_rng(query: &str, dataset: &str) -> rand_xorshift::XorShiftRng {
 }
 
 /// `(bag1_pad_extra, bag2_pad_extra)` for a cyclic graph query.
+///
+/// The pair shape is kept because GQ3, Q5, `commit_diff.rs`,
+/// `tests/freq_noising_cost.rs` and `tests/graph_lane_plan.rs` all consume two
+/// pads.  For GQ4 the two entries are always equal (one materialized relation,
+/// one released capacity) and its consumers read `.0`.
 pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) -> (usize, usize) {
     match privacy {
         Privacy::Rjs => (0, 0),
@@ -1093,21 +1116,83 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
             // stored edge really does appear in both instances.)
             //
             // Budget: basic composition over 1 degree release + one capacity
-            // release per bag that needs one.  The single degree release
-            // serves every bag, since all of them join the same relation.
-            let n_size = if s.bag2_is_public { 1 } else { 2 };
-            let n_release = 1 + n_size;
+            // release per DISTINCT private cardinality.  The single degree
+            // release serves every bag, since all of them join the same
+            // relation.
+            //
+            // GQ4's two bags are the same relation read with different column
+            // roles: Bag 1 is {(A,B,C) : A->B->C, A<B} and Bag 2 is
+            // {(C,D,A) : C->D->A, C<D}, both of which are
+            // {(x,y,z) : x->y->z, x<y}.  Their cardinalities are therefore not
+            // two statistics but one, which `bag_stats` already reflects by
+            // returning the same `wedge(indeg_lt)` for both.  Releasing it
+            // twice with independent noise would spend double the budget to
+            // learn one number, and would hand the two bags different
+            // capacities for the same true size.  One release, used for both.
+            let n_size = if s.bag2_is_public || s.bags_are_one_statistic {
+                1
+            } else {
+                2
+            };
+
+            // A PUBLIC frequency bound, when the deployment can supply one,
+            // removes the degree release altogether: `VPJOIN_TAU_PUB=t`
+            // declares that no vertex has in- or out-degree above `t`, so
+            // nothing about the degree has to be learned from the data and the
+            // sensitivity is a constant `2t`.
+            //
+            // This is worth a lot at small epsilon, where the released bound is
+            // mostly noise rather than signal. On facebook the true max degree
+            // is 1,043 and at eps = 0.01 the release returns tau ~ 3,184, so
+            // two thirds of the sensitivity is noise ABOUT THE DEGREE, and that
+            // noise then multiplies into the capacity noise: the pad grows like
+            // 2*mu^2 where mu ~ ln(1/2 delta)/eps. Declaring the bound instead
+            // cuts the budget split (one release, not two) AND the sensitivity,
+            // which is the difference between a capacity that fits a runnable
+            // domain and one that does not.
+            //
+            // TWO OBLIGATIONS COME WITH IT. The bound must be
+            // DATA-INDEPENDENT: reading it off the graph would leak the maximum
+            // degree, which is exactly the statistic the release exists to
+            // protect. It has to come from the schema or the application ("this
+            // deployment caps out-degree at 2048"), not from the input. And a
+            // deployment whose data exceeds the declared cap must TRUNCATE the
+            // relation to it, which changes the answer; this harness instead
+            // refuses, because silently calibrating to a sensitivity below the
+            // true one would void the epsilon it reports.
+            let tau_pub: Option<u64> = std::env::var("VPJOIN_TAU_PUB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&t| t > 0);
+            let n_release = n_size + usize::from(tau_pub.is_none());
             let (eps, del) = (epsilon / n_release as f64, delta / n_release as f64);
 
-            // The released bound must cover BOTH degree statistics the
-            // sensitivity is built from, so it is taken over their maximum.
+            // The bound must cover BOTH degree statistics the sensitivity is
+            // built from, so it is taken over their maximum.
             let max_deg = s
                 .bag1_mf_a
                 .max(s.bag1_mf_b)
                 .max(s.bag2_mf_a)
                 .max(s.bag2_mf_b);
-            let tau_tilde = crate::dp_noise::dp_frequency_bound(max_deg, eps, del, &mut rng);
-            let tau = (2.0 * tau_tilde).ceil() as u64;
+            let (tau, tau_shown, released) = match tau_pub {
+                Some(t) => {
+                    assert!(
+                        t >= max_deg,
+                        "VPJOIN_TAU_PUB={} is below the data's maximum degree {} on {}/{}: the \
+                         noise would be calibrated to a sensitivity smaller than the true one and \
+                         the reported epsilon would be void. A deployment must TRUNCATE the \
+                         relation to the declared cap, which changes the answer; this harness \
+                         refuses instead of reporting a guarantee it does not provide.",
+                        t, max_deg, query, dataset
+                    );
+                    (2 * t, t as f64, false)
+                }
+                None => {
+                    let tt =
+                        crate::dp_noise::dp_frequency_bound(max_deg, eps, del, &mut rng);
+                    ((2.0 * tt).ceil() as u64, tt, true)
+                }
+            };
 
             let c1 = crate::dp_noise::dp_join_capacity_public_tau(
                 s.bag1_size,
@@ -1120,6 +1205,9 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
 
             let pad2 = if s.bag2_is_public {
                 0
+            } else if s.bags_are_one_statistic {
+                // one statistic, one release, one capacity
+                pad1
             } else {
                 let c2 = crate::dp_noise::dp_join_capacity_public_tau(
                     s.bag2_size,
@@ -1132,13 +1220,16 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
             };
             // stderr, for the reason given in `q5_pads`.
             eprintln!(
-                "  [dp] {} on {}: max_deg {} -> released tau {:.0} (sens {}), \
+                "  [dp] {} on {}: max_deg {} -> {} tau {:.0} (sens {}, {} release{}), \
                  bag1 {} (+{} pad), bag2 {} (+{} pad{})",
                 query,
                 dataset,
                 max_deg,
-                tau_tilde,
+                if released { "released" } else { "PUBLIC (declared, no release spent)" },
+                tau_shown,
                 tau,
+                n_release,
+                if n_release == 1 { "" } else { "s" },
                 s.bag1_size,
                 pad1,
                 s.bag2_size,
@@ -1152,6 +1243,10 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
 
 /// Rows the cyclic circuit lays out: one region whose height is the largest
 /// of the base table, bag2 (+its aggregation row) and bag1.
+///
+/// For GQ4 the two bags are one column group of one height, so `n1 == n2` and
+/// this reduces to `max(n_base + 1, n + 1)`, which is exactly the region height
+/// the single-bag layout needs: `k` does not move and no new SRS is required.
 pub fn graph_rows(edges: &[Edge], query: &str, pad1: usize, pad2: usize) -> u64 {
     let s = bag_stats(query, edges);
     let n_base = edges.len() as u64 + 1;
@@ -1248,10 +1343,11 @@ fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         "gq4" => {
             let cnt = count_gq4(&edges);
             let ins = [Fp::from(cnt)];
+            // ONE bag, read in two column roles, so ONE pad knob. `graph_pads`
+            // returns (pad1, pad1) for gq4 and the consumer reads .0 only.
             let c = g_sql4_obj::MyCircuit::<Fp> {
                     edges,
-                    bag1_pad_extra: pad1,
-                    bag2_pad_extra: pad2,
+                    pad_extra: pad1,
                     _marker: PhantomData,
             };
             let timed = maybe_run(mode, &label, &c, &ins, k);
@@ -1721,14 +1817,33 @@ pub fn run_one(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row 
 
 /// Expand a query list into the (query, dataset) pairs to run.
 pub fn plan(queries: &[String]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for q in queries {
-        if is_graph(q) {
-            for d in GRAPH_DATASETS {
-                out.push((q.clone(), d.to_string()));
+    let specs: Vec<(String, Option<String>)> = queries.iter().map(|q| (q.clone(), None)).collect();
+    plan_specs(&specs)
+}
+
+/// Expand `(query, dataset?)` specs into the pairs to run.
+///
+/// `None` means every dataset the query has: all three networks for a graph
+/// query, the single TPC-H label otherwise.  `Some(d)` pins one row, which is
+/// what a `gq4:lastfm` argument asks for; on the graph queries the three
+/// datasets differ by up to 16x in domain size, so being able to name one is
+/// the difference between a two-minute run and an hour.
+///
+/// Argument order is preserved and repeated pairs collapse, so
+/// `gq4 gq4:lastfm` runs each row once.
+pub fn plan_specs(specs: &[(String, Option<String>)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (q, ds) in specs {
+        let datasets: Vec<String> = match ds {
+            Some(d) => vec![d.clone()],
+            None if is_graph(q) => GRAPH_DATASETS.iter().map(|d| d.to_string()).collect(),
+            None => vec![tpch_label()],
+        };
+        for d in datasets {
+            let pair = (q.clone(), d);
+            if !out.contains(&pair) {
+                out.push(pair);
             }
-        } else {
-            out.push((q.clone(), tpch_label()));
         }
     }
     out

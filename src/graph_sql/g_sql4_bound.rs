@@ -15,8 +15,9 @@ pub const NC: usize = 2;
 pub struct BoundGq4 {
     // -- identical to g_sql4_obj::MyCircuit --
     pub edges: Vec<Edge>,
-    pub bag1_pad_extra: usize,
-    pub bag2_pad_extra: usize,
+    /// One pad knob, inherited from `g_sql4_obj::MyCircuit`: GQ4 materializes a
+    /// single bag read in two column roles.
+    pub pad_extra: usize,
     // -- binding additions --
     pub columns: Vec<Vec<u64>>,
     pub x: Fp,
@@ -29,8 +30,7 @@ impl Circuit<Fp> for BoundGq4 {
     fn without_witnesses(&self) -> Self {
         Self {
             edges: Vec::new(),
-            bag1_pad_extra: self.bag1_pad_extra,
-            bag2_pad_extra: self.bag2_pad_extra,
+            pad_extra: self.pad_extra,
             columns: Vec::new(),
             x: self.x,
         }
@@ -48,12 +48,7 @@ impl Circuit<Fp> for BoundGq4 {
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
         let chip = g_sql4_obj::Cycle4OrderedChip::construct(config.0);
-        let out = chip.assign(
-            &mut layouter,
-            self.edges.clone(),
-            self.bag1_pad_extra,
-            self.bag2_pad_extra,
-        )?;
+        let out = chip.assign(&mut layouter, self.edges.clone(), self.pad_extra)?;
         chip.expose_public(&mut layouter, out, 0)?;
         assign_bind(&mut layouter, &config.1, &self.columns, self.x)?;
         Ok(())

@@ -1,5 +1,7 @@
-# Convenience aliases. These do NOT change any build profile settings;
-# they only spell out the flags so the commands stay short.
+# Convenience aliases. These do NOT change any build profile settings; they only
+# spell out the flags so the commands stay short. The profiles themselves live
+# in Cargo.toml, where the dev profile is set to the release settings, so a
+# command without `--release` is optimized too.
 [alias]
 # Additional cost of the data commitment + the in-circuit witness-equality
 # check, with the check inlined into the query circuit (Appendix A).
@@ -10,3 +12,10 @@ commit-diff = "run --release --bin commit_diff --"
 # number is not comparable with a release one. The `profile` column of the CSV
 # records which was used.
 vpjoin = "run --release --bin vpjoin_bench --"
+
+# DP lane proving cost (Q5, GQ3, GQ4) at a pinned degree, sweeping VPJOIN_EPS.
+# No `--release` here on purpose: `[profile.dev]` in Cargo.toml already carries
+# the release settings, so this is exactly `cargo run --bin dp_lane_bench -- ...`
+# typed out in full, same build and same target directory. Either spelling
+# produces the optimized binary.
+dp-lane = "run --bin dp_lane_bench --"

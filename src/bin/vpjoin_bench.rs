@@ -22,8 +22,8 @@
 //! time is spent on a `k` that is then discarded.
 //!
 //! Usage:
-//!   cargo vpjoin <simplification|full|commit> [query ...]
-//!   cargo vpjoin <simplification|full|commit> [out.csv] [query ...]
+//!   cargo vpjoin <simplification|full|commit> [query[:dataset] ...]
+//!   cargo vpjoin <simplification|full|commit> [out.csv] [query[:dataset] ...]
 //!
 //!   Every result is printed to stdout, and the run ends with an aligned
 //!   summary table of all completed rows, so the terminal output alone is a
@@ -32,6 +32,10 @@
 //!   file is written at all.
 //!
 //!   queries:  q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4     (default: all)
+//!             A graph query runs all three networks; `gq4:lastfm` pins one
+//!             row, the same spelling `dp_lane_bench` takes.  Worth using: the
+//!             three networks differ by up to 16x in domain size, so gq3/gq4
+//!             on lastfm is k=18 against k=22 on facebook and wiki.
 //!   env:      VPJOIN_DATA   root holding data/ graph_data/ proof/
 //!                           (default: <crate>/src)
 //!             VPJOIN_RESUME =1 to keep the rows already in <out.csv> and only
@@ -55,7 +59,8 @@
 //! same profile `cargo test` uses.
 
 use halo2_experiments::bench_queries::{
-    build_profile, data_root, degree_for, plan, run_one, Mode, Privacy, Row, ALL_QUERIES,
+    build_profile, data_root, degree_for, plan_specs, run_one, tpch_label, Mode, Privacy, Row,
+    ALL_QUERIES, GRAPH_DATASETS,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -86,11 +91,13 @@ fn load_completed(path: &str) -> HashMap<String, String> {
 
 fn usage() -> String {
     format!(
-        "usage: vpjoin_bench <simplification|full|commit> [out.csv] [query ...]\n  \
-         queries: {}\n  \
+        "usage: vpjoin_bench <simplification|full|commit> [out.csv] [query[:dataset] ...]\n  \
+         queries:  {}\n  \
+         datasets: {} (graph queries only; default all three)\n  \
          results are always printed to stdout; an argument ending in .csv also\n  \
          writes them to that file (and enables VPJOIN_RESUME=1).",
-        ALL_QUERIES.join(" ")
+        ALL_QUERIES.join(" "),
+        GRAPH_DATASETS.join(" ")
     )
 }
 
@@ -197,9 +204,12 @@ fn main() {
         }
     };
     // The output file is optional and recognised by its `.csv` suffix; every
-    // other argument after the mode is a query name.
+    // other argument after the mode is a query, optionally pinned to one
+    // dataset with a `:dataset` suffix (`gq4:lastfm`), the same spelling
+    // `dp_lane_bench` takes.  Without a suffix a graph query runs all three
+    // networks.
     let mut out_path: Option<String> = None;
-    let mut queries: Vec<String> = Vec::new();
+    let mut specs: Vec<(String, Option<String>)> = Vec::new();
     for a in &args[1..] {
         if a.ends_with(".csv") {
             if out_path.is_some() {
@@ -207,19 +217,52 @@ fn main() {
                 std::process::exit(2);
             }
             out_path = Some(a.clone());
-        } else if ALL_QUERIES.contains(&a.as_str()) {
-            queries.push(a.clone());
-        } else {
+            continue;
+        }
+        let (q, ds) = match a.split_once(':') {
+            Some((q, d)) => (q.to_string(), Some(d.to_string())),
+            None => (a.clone(), None),
+        };
+        if !ALL_QUERIES.contains(&q.as_str()) {
             eprintln!(
-                "unknown argument `{}` (expected a query {} or a path ending in .csv)",
+                "unknown argument `{}` (expected a query {}, optionally `query:dataset`, \
+                 or a path ending in .csv)",
                 a,
                 ALL_QUERIES.join(" ")
             );
             std::process::exit(2);
         }
+        if let Some(d) = &ds {
+            if q.starts_with("gq") {
+                if !GRAPH_DATASETS.contains(&d.as_str()) {
+                    eprintln!(
+                        "unknown dataset `{}` in `{}` (expected one of {})",
+                        d,
+                        a,
+                        GRAPH_DATASETS.join(" ")
+                    );
+                    std::process::exit(2);
+                }
+            } else if *d != tpch_label() {
+                // The TPC-H queries have exactly one dataset per run, chosen by
+                // VPJOIN_DATA and named by VPJOIN_LABEL, so a suffix naming
+                // anything else is a mistake worth reporting rather than
+                // dropping on the floor.
+                eprintln!(
+                    "`{}` has one dataset per run, currently `{}`: select the tables with \
+                     VPJOIN_TABLES / VPJOIN_DATA and name them with VPJOIN_LABEL, not with \
+                     a `:{}` suffix",
+                    q,
+                    tpch_label(),
+                    d
+                );
+                std::process::exit(2);
+            }
+        }
+        specs.push((q, ds));
     }
-    if queries.is_empty() {
-        queries = ALL_QUERIES.iter().map(|s| s.to_string()).collect();
+    if specs.is_empty() {
+        specs = ALL_QUERIES.iter().map(|s| (s.to_string(), None)).collect();
     }
 
     // Privacy regime for the queries that materialize intermediates (Q5, GQ3,
@@ -257,7 +300,7 @@ fn main() {
         _ => HashMap::new(),
     };
 
-    let all_jobs = plan(&queries);
+    let all_jobs = plan_specs(&specs);
     let jobs: Vec<_> = all_jobs
         .iter()
         .filter(|(q, d)| !existing.contains_key(&format!("{}/{}", q, d)))
@@ -282,14 +325,14 @@ fn main() {
     );
     if cfg!(debug_assertions) {
         println!(
-            "build profile: DEBUG (unoptimized, opt-level=0 -- including halo2 itself).\n\
-             This is the SAME profile as `cargo test ... qN_obj::tests::test_1` without \
-             --release."
+            "build profile: DEBUG ASSERTIONS ON. This is the `test` profile, which keeps the \
+             host-side debug_assert!s; it is not a measurement profile -- do not mix its \
+             timings with the ones below."
         );
     } else {
         println!(
-            "build profile: RELEASE (optimized). `cargo test` without --release builds DEBUG \
-             and is several times slower -- do not mix the two in one comparison."
+            "build profile: RELEASE (optimized). `[profile.dev]` in Cargo.toml carries the \
+             release settings, so `cargo run` is optimized with or without --release."
         );
     }
     if resume {

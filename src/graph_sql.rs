@@ -1,6 +1,5 @@
 pub mod g_sql1_bound; // bound version: g_sql1_obj + inlined witness-binding check
 pub mod g_sql1_obj;
-pub mod pone_baseline; // additive PoneglyphDB-style binary-join-chain baseline for GQ1-GQ4
 
 pub mod g_sql2_bound;
 pub mod g_sql2_obj;
