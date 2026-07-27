@@ -24,15 +24,17 @@
 //! spelled out here.
 //!
 //! * (7) is per lane and that is *stronger* than the union statement, not
-//!   weaker. Lane `l` owns the padded Bag1 rows `[l*lane_rows, (l+1)*lane_rows)`
-//!   and its own 8-column partition group, and one shuffle per lane forces
-//!   lane `l`'s multiset of `(attributes, clean indicator)` to equal its own
-//!   group's `[clean | residual | pad]` multiset. The lane row blocks are
-//!   disjoint and cover the whole released capacity, so summing the `c` lane
-//!   statements gives `Bag1 == Bag1^c U Bag1^r`. Nothing can be moved between
-//!   lanes, because a lane's shuffle only ever sees its own columns. Bag2 is
-//!   not laned (its height is |E| + pads, public in every regime), so its
-//!   Conservation Check is the sibling's, verbatim.
+//!   weaker. Lane `l` owns the padded Bag1 rows
+//!   `[l*lane_rows, l*lane_rows + lane_live_rows(l))` and its own 8-column
+//!   partition group, and one shuffle per lane forces lane `l`'s multiset of
+//!   `(attributes, clean indicator)` to equal its own group's
+//!   `[clean | residual | pad]` multiset. The lane row blocks are disjoint and
+//!   cover the whole released capacity EXACTLY -- every lane but the last is a
+//!   full `lane_rows` and the last stops at the capacity -- so summing the `c`
+//!   lane statements gives `Bag1 == Bag1^c U Bag1^r`. Nothing can be moved
+//!   between lanes, because a lane's shuffle only ever sees its own columns.
+//!   Bag2 is not laned (its height is |E| + pads, public in every regime), so
+//!   its Conservation Check is the sibling's, verbatim.
 //!
 //! * (9) has one direction per orientation, and only one of them is a union
 //!   statement over the lanes.
@@ -147,6 +149,41 @@ pub fn lanes_for(n: usize, lane_rows: usize) -> usize {
     ((n + lane_rows - 1) / lane_rows).max(1)
 }
 
+/// Live rows of lane `l`: the rows that are assigned and gated.
+///
+/// Every lane but the last is full. The LAST one stops at the released
+/// capacity rather than at `c * lane_rows`, so the rows the lane count rounds
+/// up to never exist: they are not assigned, no selector covers them and no
+/// table side reads them.
+///
+/// TWO TIERS OF PADDING MEET HERE AND ONLY THE SECOND IS DROPPED.
+///   * true bag size -> `capacity` is the DP pad. It is INSIDE the capacity, so
+///     it stays assigned and stays gated exactly as before. Hiding the true
+///     size is what the release pays for.
+///   * `capacity` -> `c * lane_rows` is pure lane quantization, and that is what
+///     goes away. Nothing but the arithmetic of the lane count put it there.
+///
+/// The boundary is a function of `capacity`, `c` and `lane_rows` only, all
+/// three of which are public: the capacity is the released value the harness
+/// prints and already the thing that fixes the lane count. No row range in this
+/// file may be a function of the true bag size, since selectors are fixed
+/// columns and a selector pattern lands in the verifying key.
+pub fn lane_live_rows(l: usize, num_lanes: usize, lane_rows: usize, capacity: usize) -> usize {
+    assert!(l < num_lanes, "lane {} outside 0..{}", l, num_lanes);
+    assert!(
+        capacity > (num_lanes - 1) * lane_rows && capacity <= num_lanes * lane_rows,
+        "released capacity {} is not hosted by exactly {} lanes of {} rows",
+        capacity,
+        num_lanes,
+        lane_rows
+    );
+    if l + 1 < num_lanes {
+        lane_rows
+    } else {
+        capacity - (num_lanes - 1) * lane_rows
+    }
+}
+
 /// Lane count for a released Bag1 capacity at a caller-supplied base degree,
 /// `Err` when the release needs more lanes than the structural cap allows.
 ///
@@ -210,8 +247,9 @@ pub enum Tamper {
     /// Bump one lane total by 1 (the copy constraint into the totals stage and
     /// the totals accumulator must both reject).
     LaneTotal,
-    /// Break the pad-row convention on the last rounding-up row (the
-    /// "bag1 real + key" gate and the r1 membership lookup must reject).
+    /// Break the pad-row convention on the LAST row of the released capacity,
+    /// which is the last live row of the last lane (the "bag1 real + key" gate
+    /// and the r1 membership lookup must reject).
     PadRow,
     /// Move one joinable Bag2 tuple to the residual side and re-reduce both bags
     /// around it, so the partition still conserves both bags and the two clean
@@ -284,6 +322,36 @@ pub struct LaneConfig<F: Field + Ord> {
     cln_run: Column<Advice>,
 }
 
+/// The row selectors one lane's machinery reads. Bundled because there are
+/// thirteen of them and because there are now TWO sets: a selector is one fixed
+/// column, so it is on or off for every lane at once, and the last lane is
+/// live on fewer rows than the rest.
+///
+/// The `full` set serves lanes `0..c-1`, enabled on all `lane_rows` rows. The
+/// `last` set serves lane `c-1`, enabled on its [`lane_live_rows`] rows only,
+/// and folds the thirteen down to four columns, one per distinct ROW RANGE,
+/// which is all a selector is: `0..live` for every gate, `0..live` for every
+/// lookup and the shuffle (complex, since only a complex selector may be read
+/// by one), `1..live` for the two prefix sums and `0..live-1` for the gate that
+/// reads `Rotation::next()`. The full lanes keep their thirteen so their layout
+/// is unchanged.
+#[derive(Clone, Copy, Debug)]
+struct LaneSelectors {
+    q_t12_lookup: Selector,
+    q_t12_key: Selector,
+    q_flag: Selector,
+    q_complex: Selector,
+    q_order: Selector,
+    q_contrib: Selector,
+    q_sum0: Selector,
+    q_sum: Selector,
+    q_cln_bind: Selector,
+    q_part12: Selector,
+    q_part12_mono: Selector,
+    q_perm12_in: Selector,
+    q_perm12_out: Selector,
+}
+
 #[derive(Clone, Debug)]
 pub struct Gq3DpConfig<F: Field + Ord> {
     instance: Column<Instance>,
@@ -333,23 +401,13 @@ pub struct Gq3DpConfig<F: Field + Ord> {
     cp_u8: Column<Fixed>,
 
     // ---------------- lanes (shared selectors, per-lane columns) ----------
-    // All lanes are active on the SAME rows 0..lane_rows, so one selector of
-    // each kind serves every lane; only the columns replicate.
+    // Lanes 0..c-1 are active on the SAME rows 0..lane_rows, so one selector of
+    // each kind serves all of them; only the columns replicate. Lane c-1 stops
+    // at the released capacity and reads `last` instead.
     lanes: Vec<LaneConfig<F>>,
     lane_u8: Column<Fixed>, // one u8 range table for all 4c lane Lt chips
-    q_t12_lookup: Selector, // r1/r2 membership lookups (complex)
-    q_t12_key: Selector,
-    q_flag: Selector,
-    q_complex: Selector, // msg member / msg gap lookups (complex)
-    q_order: Selector,
-    q_contrib: Selector,
-    q_sum0: Selector, // lane-local prefix sums, row 0 of every lane
-    q_sum: Selector,  // lane-local prefix sums, rows 1..lane_rows
-    q_cln_bind: Selector, // clean indicator of a lane's Bag1 rows
-    q_part12: Selector,   // partition flag booleanity, all rows of a lane
-    q_part12_mono: Selector, // partition flag non-increasing, rows 0..lane_rows-1
-    q_perm12_in: Selector,   // input side of every lane's Conservation shuffle
-    q_perm12_out: Selector,  // partition side of every lane's Conservation shuffle
+    full: LaneSelectors,    // rows 0..lane_rows, every lane but the last
+    last: LaneSelectors,    // rows 0..lane_live_rows(c-1, ..), the last lane
 
     // ---------------- cross-lane totals (the only stitch) ------------------
     lane_tot: Column<Advice>, // row l = lane l's total, by copy constraint
@@ -411,7 +469,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
 
     /// One full structural replica of the Bag1 column group. Every lane gets
     /// the same gates, the same lookups and the same shuffle; only the columns
-    /// differ.
+    /// and the row selectors differ.
     #[allow(clippy::too_many_arguments)]
     fn configure_lane(
         meta: &mut ConstraintSystem<F>,
@@ -422,20 +480,23 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         ck3: Column<Advice>,
         q_t3_tbl: Selector,
         lane_u8: Column<Fixed>,
-        q_t12_lookup: Selector,
-        q_t12_key: Selector,
-        q_flag: Selector,
-        q_complex: Selector,
-        q_order: Selector,
-        q_contrib: Selector,
-        q_sum0: Selector,
-        q_sum: Selector,
-        q_cln_bind: Selector,
-        q_part12: Selector,
-        q_part12_mono: Selector,
-        q_perm12_in: Selector,
-        q_perm12_out: Selector,
+        sel: &LaneSelectors,
     ) -> LaneConfig<F> {
+        let LaneSelectors {
+            q_t12_lookup,
+            q_t12_key,
+            q_flag,
+            q_complex,
+            q_order,
+            q_contrib,
+            q_sum0,
+            q_sum,
+            q_cln_bind,
+            q_part12,
+            q_part12_mono,
+            q_perm12_in,
+            q_perm12_out,
+        } = *sel;
         let t12_a = meta.advice_column();
         let t12_b = meta.advice_column();
         let t12_c = meta.advice_column();
@@ -959,8 +1020,8 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         );
 
         // ---------------- lanes ----------------
-        // Shared selectors: every lane is active on the same rows, so one
-        // selector of each kind drives all c replicas. That is what keeps the
+        // Shared selectors: lanes 0..c-1 are active on the same rows, so one
+        // selector of each kind drives all of them. That is what keeps the
         // selector count constant in the lane count even though every lane
         // carries a full copy of the OBJ machinery.
         let q_t12_lookup = meta.complex_selector();
@@ -976,13 +1037,57 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         let q_part12_mono = meta.selector();
         let q_perm12_in = meta.complex_selector();
         let q_perm12_out = meta.complex_selector();
+        let full = LaneSelectors {
+            q_t12_lookup,
+            q_t12_key,
+            q_flag,
+            q_complex,
+            q_order,
+            q_contrib,
+            q_sum0,
+            q_sum,
+            q_cln_bind,
+            q_part12,
+            q_part12_mono,
+            q_perm12_in,
+            q_perm12_out,
+        };
+
+        // The last lane stops at the released capacity, so it cannot share the
+        // ones above: a selector is a fixed column and turns its gate on for
+        // every lane at once. Four more columns cover its four distinct row
+        // ranges, whatever c is, and `q_sum0` stays shared because row 0 is live
+        // in every lane.
+        //
+        // `q_last_complex` is complex because it gates lookups and a shuffle;
+        // `q_last_row` is simple and drives gates only, exactly like the nine
+        // simple selectors it stands in for.
+        let q_last_row = meta.selector();
+        let q_last_complex = meta.complex_selector();
+        let q_last_sum = meta.selector();
+        let q_last_mono = meta.selector();
+        let last = LaneSelectors {
+            q_t12_lookup: q_last_complex,
+            q_t12_key: q_last_row,
+            q_flag: q_last_row,
+            q_complex: q_last_complex,
+            q_order: q_last_row,
+            q_contrib: q_last_row,
+            q_sum0,
+            q_sum: q_last_sum,
+            q_cln_bind: q_last_row,
+            q_part12: q_last_row,
+            q_part12_mono: q_last_mono,
+            q_perm12_in: q_last_complex,
+            q_perm12_out: q_last_complex,
+        };
 
         // One u8 range table for every lane Lt chip: `load` costs one 256-row
         // region per distinct u8 column, and that must not grow with c.
         let lane_u8 = meta.fixed_column();
 
         let lanes: Vec<LaneConfig<F>> = (0..num_lanes)
-            .map(|_| {
+            .map(|l| {
                 Self::configure_lane(
                     meta,
                     &in_by_dst,
@@ -995,19 +1100,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     // of condition (9) and the input selector of the other.
                     q_t3_lookup,
                     lane_u8,
-                    q_t12_lookup,
-                    q_t12_key,
-                    q_flag,
-                    q_complex,
-                    q_order,
-                    q_contrib,
-                    q_sum0,
-                    q_sum,
-                    q_cln_bind,
-                    q_part12,
-                    q_part12_mono,
-                    q_perm12_in,
-                    q_perm12_out,
+                    if l + 1 == num_lanes { &last } else { &full },
                 )
             })
             .collect();
@@ -1137,19 +1230,8 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             cp_u8,
             lanes,
             lane_u8,
-            q_t12_lookup,
-            q_t12_key,
-            q_flag,
-            q_complex,
-            q_order,
-            q_contrib,
-            q_sum0,
-            q_sum,
-            q_cln_bind,
-            q_part12,
-            q_part12_mono,
-            q_perm12_in,
-            q_perm12_out,
+            full,
+            last,
             lane_tot,
             tot_run,
             lane_cln,
@@ -1163,11 +1245,14 @@ impl<F: Field + Ord> Gq3DpChip<F> {
 
     /// Assign one lane's block of the padded Bag1 pipeline.
     ///
-    /// `base` is the global index of this lane's row 0, so lane l covers the
-    /// padded rows `[l*lane_rows, (l+1)*lane_rows)`. Rows past `t12.len()` are
-    /// pad rows and are witnessed with exactly the pad convention g_sql3_obj
-    /// uses: all-zero tuple, key 0, in_set 1, val 0, contrib 0. Map row 0 is
-    /// (0,0) and view row 0 is (0,0,0), so a pad row satisfies every lookup.
+    /// `base` is the global index of this lane's row 0 and `live_rows` its
+    /// [`lane_live_rows`], so lane l covers the padded rows
+    /// `[l*lane_rows, l*lane_rows + live_rows)`: a full lane_rows except in the
+    /// last lane, which stops at the released capacity. Rows past `t12.len()`
+    /// are DP pad rows and are witnessed with exactly the pad convention
+    /// g_sql3_obj uses: all-zero tuple, key 0, in_set 1, val 0, contrib 0. Map
+    /// row 0 is (0,0) and view row 0 is (0,0,0), so a pad row satisfies every
+    /// lookup.
     ///
     /// Returns the lane's last `run_sum` cell (the value the totals stage
     /// copies) together with that total.
@@ -1175,7 +1260,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
     fn assign_lane(
         lane: &LaneConfig<F>,
         region: &mut Region<'_, F>,
-        lane_rows: usize,
+        live_rows: usize,
         base: usize,
         t12: &[(u64, u64, u64, u64, u64, u64, u64)],
         msg_map: &BTreeMap<u64, u64>,
@@ -1202,9 +1287,13 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         // clean and residual blocks only ever hold this lane's real rows and the
         // group's tail is the all-zero pad tuple with flag 0. The flag comes out
         // non-increasing, which is what its gate asks for.
-        let mut part_rows: Vec<[u64; 8]> = Vec::with_capacity(lane_rows);
+        //
+        // The group is exactly `live_rows` tall, which is what the shuffle needs:
+        // both of its sides are gated by this lane's own selectors over the same
+        // rows, so the multiset equality is over the live rows and nothing else.
+        let mut part_rows: Vec<[u64; 8]> = Vec::with_capacity(live_rows);
         for pass in 0..2 {
-            for r in 0..lane_rows {
+            for r in 0..live_rows {
                 let i = base + r;
                 if i >= real12 {
                     continue;
@@ -1217,7 +1306,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 part_rows.push([a, b, c, i_r1, j_r2, r1_eid, r2_eid, clean]);
             }
         }
-        while part_rows.len() < lane_rows {
+        while part_rows.len() < live_rows {
             part_rows.push([0u64; 8]);
         }
         // test hook only: demote the last clean row of this lane's group. The flag
@@ -1240,7 +1329,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             }
         }
 
-        for r in 0..lane_rows {
+        for r in 0..live_rows {
             let i = base + r;
 
             let (a, b, c, i_r1, j_r2, r1_eid, r2_eid, real) = if i < real12 {
@@ -1250,8 +1339,8 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 (0, 0, 0, 0, 0, 0, 0, 0u64)
             };
 
-            // Tamper::PadRow breaks the pad convention on the very last
-            // rounding-up row: t12_a moves but msg key stays 0.
+            // Tamper::PadRow breaks the pad convention on the last row of the
+            // released capacity: t12_a moves but msg key stays 0.
             let a_written = if tamper == Tamper::PadRow && i == pad_row_global {
                 7u64
             } else {
@@ -1458,10 +1547,14 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             )?);
         }
 
+        // The drain into the totals stage is the cell at row `live_rows - 1`,
+        // which is now the last row of the RELEASED capacity in the last lane
+        // rather than the last row of the lane's full height. Both prefix-sum
+        // gates stop there with it.
         Ok((
-            last_cell.expect("lane_rows > 0 guarantees a last row"),
+            last_cell.expect("live_rows > 0 guarantees a last row"),
             running,
-            last_cln_cell.expect("lane_rows > 0 guarantees a last row"),
+            last_cln_cell.expect("live_rows > 0 guarantees a last row"),
             cln_running,
         ))
     }
@@ -1518,12 +1611,13 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 let real3 = derived.t3.len();
                 let n3 = std::cmp::max(real3 + bag2_pad_extra, 1);
                 let real12 = derived.t12.len();
-                let n12 = std::cmp::max(real12 + bag1_pad_extra, 1);
-                let capacity = num_lanes * lane_rows;
+                // The RELEASED capacity: the public value the lane count is
+                // derived from, and now also where the last lane stops.
+                let capacity = std::cmp::max(real12 + bag1_pad_extra, 1);
                 assert!(
-                    capacity >= n12,
+                    num_lanes * lane_rows >= capacity,
                     "released Bag1 capacity {} exceeds {} lanes of {} rows",
-                    n12,
+                    capacity,
                     num_lanes,
                     lane_rows
                 );
@@ -1836,31 +1930,62 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 // -------------------
                 // Bag1: the pad-driven pipeline, spread over the lanes
                 // -------------------
-                // Shared selectors: enabled once on rows 0..lane_rows, which
-                // switches ON every lane at the same time. The lane count is a
-                // function of the released capacity only, so nothing here can
+                // Two selector sets, one row range each. `full` covers all
+                // `lane_rows` rows and switches ON every lane but the last;
+                // `last` covers the live rows of the last lane, which stop at
+                // the RELEASED capacity. Both ranges are functions of the
+                // capacity, `c` and `lane_rows`, all public, so nothing here can
                 // depend on the true bag size -- and that is still true of the
-                // OBJ selectors added below: none of their enable ranges is a
-                // function of the clean/residual split, which is why no lane's
-                // shape leaks |Bag1^c|.
-                for r in 0..lane_rows {
-                    cfg.q_t12_lookup.enable(&mut region, r)?;
-                    cfg.q_t12_key.enable(&mut region, r)?;
-                    cfg.q_flag.enable(&mut region, r)?;
-                    cfg.q_complex.enable(&mut region, r)?;
-                    cfg.q_order.enable(&mut region, r)?;
-                    cfg.q_contrib.enable(&mut region, r)?;
-                    cfg.q_cln_bind.enable(&mut region, r)?;
-                    cfg.q_part12.enable(&mut region, r)?;
-                    if r + 1 < lane_rows {
-                        cfg.q_part12_mono.enable(&mut region, r)?;
+                // OBJ selectors: none of their enable ranges is a function of
+                // the clean/residual split, which is why no lane's shape leaks
+                // |Bag1^c|.
+                //
+                // Row 0 is live in every lane, so `q_sum0` stays shared and is
+                // enabled once, outside both loops.
+                let live_last = lane_live_rows(num_lanes - 1, num_lanes, lane_rows, capacity);
+                cfg.full.q_sum0.enable(&mut region, 0)?;
+                if num_lanes > 1 {
+                    for r in 0..lane_rows {
+                        cfg.full.q_t12_lookup.enable(&mut region, r)?;
+                        cfg.full.q_t12_key.enable(&mut region, r)?;
+                        cfg.full.q_flag.enable(&mut region, r)?;
+                        cfg.full.q_complex.enable(&mut region, r)?;
+                        cfg.full.q_order.enable(&mut region, r)?;
+                        cfg.full.q_contrib.enable(&mut region, r)?;
+                        cfg.full.q_cln_bind.enable(&mut region, r)?;
+                        cfg.full.q_part12.enable(&mut region, r)?;
+                        if r + 1 < lane_rows {
+                            cfg.full.q_part12_mono.enable(&mut region, r)?;
+                        }
+                        cfg.full.q_perm12_in.enable(&mut region, r)?;
+                        cfg.full.q_perm12_out.enable(&mut region, r)?;
+                        if r > 0 {
+                            cfg.full.q_sum.enable(&mut region, r)?;
+                        }
                     }
-                    cfg.q_perm12_in.enable(&mut region, r)?;
-                    cfg.q_perm12_out.enable(&mut region, r)?;
-                    if r == 0 {
-                        cfg.q_sum0.enable(&mut region, r)?;
-                    } else {
-                        cfg.q_sum.enable(&mut region, r)?;
+                }
+                // The same list against the same names, so the two ranges stay
+                // visibly parallel. Several of these names alias one column in
+                // the `last` set, and enabling a selector twice on a row is
+                // idempotent; `Assignment::enable_selector` is a no-op under the
+                // prover in any case, since selectors are fixed and were
+                // committed at keygen.
+                for r in 0..live_last {
+                    cfg.last.q_t12_lookup.enable(&mut region, r)?;
+                    cfg.last.q_t12_key.enable(&mut region, r)?;
+                    cfg.last.q_flag.enable(&mut region, r)?;
+                    cfg.last.q_complex.enable(&mut region, r)?;
+                    cfg.last.q_order.enable(&mut region, r)?;
+                    cfg.last.q_contrib.enable(&mut region, r)?;
+                    cfg.last.q_cln_bind.enable(&mut region, r)?;
+                    cfg.last.q_part12.enable(&mut region, r)?;
+                    if r + 1 < live_last {
+                        cfg.last.q_part12_mono.enable(&mut region, r)?;
+                    }
+                    cfg.last.q_perm12_in.enable(&mut region, r)?;
+                    cfg.last.q_perm12_out.enable(&mut region, r)?;
+                    if r > 0 {
+                        cfg.last.q_sum.enable(&mut region, r)?;
                     }
                 }
 
@@ -1872,7 +1997,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     let (cell, total, cln_cell, cln_total) = Self::assign_lane(
                         lane,
                         &mut region,
-                        lane_rows,
+                        lane_live_rows(l, num_lanes, lane_rows, capacity),
                         l * lane_rows,
                         &derived.t12,
                         &derived.msg_map,
@@ -2254,8 +2379,8 @@ pub fn run_dp_lanes(
 #[cfg(test)]
 mod tests {
     use super::{
-        lane_rows_for, lanes_for, lanes_for_capacity, set_config_lanes, MyCircuit, Tamper,
-        BASE_DEGREE, LANE_ROWS, MAX_LANES,
+        lane_live_rows, lane_rows_for, lanes_for, lanes_for_capacity, set_config_lanes, MyCircuit,
+        Tamper, BASE_DEGREE, LANE_ROWS, MAX_LANES,
     };
 
     use crate::data::graph_data_processing::Edge;
@@ -2278,8 +2403,14 @@ mod tests {
     }
 
     /// 6 wedges survive the A<B pre-filter, so 5 pad rows give a released
-    /// capacity of 11, which at 4 rows per lane really spans 3 lanes and
-    /// leaves row 11 as a rounding-up pad.
+    /// capacity of 11, which at 4 rows per lane really spans 3 lanes and leaves
+    /// the LAST lane 3 rows tall instead of 4.
+    ///
+    /// That short last lane is why every negative direction below is also a test
+    /// of the shortened boundary: a lane that stopped being fully constrained
+    /// past its capacity would still satisfy `mock_three_lanes`, and only these
+    /// would notice. `Tamper::PadRow` in particular breaks the last row of the
+    /// released capacity, which is the last LIVE row of that short lane.
     fn three_lane_circuit(tamper: Tamper) -> (MyCircuit<Fp>, usize) {
         let edges = synthetic_edges();
         let lane_rows = 4;
@@ -2320,6 +2451,38 @@ mod tests {
         // facebook and wiki at eps=0.1 collapse to a single lane at k=22
         assert_eq!(lanes_for_capacity(3_287_746, 22), 1);
         assert_eq!(lanes_for_capacity(2_725_688, 22), 1);
+    }
+
+    /// The live rows of the c lanes must TILE the released capacity: every lane
+    /// but the last full, the last stopping exactly at the capacity, and the sum
+    /// equal to it. Anything else either drops a released row or leaves lane
+    /// quantization behind.
+    #[test]
+    fn live_rows_tile_the_capacity() {
+        for lane_rows in [1usize, 2, 3, 4, 7, 260_800] {
+            for capacity in [1usize, 2, 5, 11, 12, 13, 277_610] {
+                let c = lanes_for(capacity, lane_rows);
+                let live: Vec<usize> = (0..c)
+                    .map(|l| lane_live_rows(l, c, lane_rows, capacity))
+                    .collect();
+                assert_eq!(
+                    live.iter().sum::<usize>(),
+                    capacity,
+                    "lane_rows={lane_rows} capacity={capacity}"
+                );
+                for (l, &n) in live.iter().enumerate() {
+                    assert!(n >= 1 && n <= lane_rows, "lane {l} has {n} live rows");
+                    if l + 1 < c {
+                        assert_eq!(n, lane_rows, "lane {l} is not full");
+                    }
+                }
+            }
+        }
+
+        // the measured lastfm release the bench times: 2 lanes, and the second
+        // one holds 6.4% of a lane
+        assert_eq!(lane_live_rows(0, 2, 260_800, 277_610), 260_800);
+        assert_eq!(lane_live_rows(1, 2, 260_800, 277_610), 16_810);
     }
 
     /// c = 3 lanes at k = 11: the padded Bag1 pipeline really spans three
@@ -2404,13 +2567,14 @@ mod tests {
     #[test]
     fn mock_lane_geometries() {
         // (lane_rows, bag1_pad_extra, expected lanes)
-        let cases: [(usize, usize, usize); 6] = [
-            (2, 0, 3), // 6 real rows, no pad: lane 2 is entirely real
+        let cases: [(usize, usize, usize); 7] = [
+            (2, 0, 3), // 6 real rows, no pad: lane 2 is entirely real and full
             (1, 0, 6), // one row per lane, q_sum never fires
-            (4, 5, 3), // 11 released rows over 12: one rounding-up pad
-            (3, 1, 3), // 7 released rows over 9: two rounding-up pads
+            (4, 5, 3), // 11 released rows over 3 lanes of 4: last lane 3 tall
+            (3, 1, 3), // 7 released rows over 3 lanes of 3: last lane 1 tall
             (5, 0, 2), // real rows straddle the lane-0/lane-1 boundary
-            (16, 5, 1),
+            (4, 7, 4), // 13 released over 4 lanes of 4: last lane is ONE pad row
+            (16, 5, 1), // one lane, live on 11 of its 16 rows
         ];
         for (lane_rows, bag1_pad_extra, want_c) in cases {
             let c = lanes_for(6 + bag1_pad_extra, lane_rows);
@@ -2785,13 +2949,17 @@ mod tests {
             p.pads[0],
             p.pads[1]
         );
+        // `lane_span` is what the lanes COULD hold; the assigned rows are the
+        // released capacity, since the last lane stops there.
         println!(
-            "[gq3 dp-lanes] bag1_true={} n12={} lanes={} lane_rows={} effective_capacity={}",
+            "[gq3 dp-lanes] bag1_true={} n12={} lanes={} lane_rows={} lane_span={} \
+             assigned_rows={}",
             p.true_size[0],
             p.capacity[0],
             p.lanes[0],
             p.lane_rows,
-            p.lanes[0] * p.lane_rows
+            p.lanes[0] * p.lane_rows,
+            p.capacity[0]
         );
         println!("Proof written to: {}", proof_path);
         println!(

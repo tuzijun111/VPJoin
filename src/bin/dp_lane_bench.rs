@@ -341,12 +341,40 @@ fn main() {
 
     println!(
         "DP lane proving cost, {} build. privacy={} seed={} reps={} per row; keys are\n\
-         built once outside the timed region and every proof is verified.\n",
+         built once outside the timed region and every proof is verified.",
         halo2_experiments::bench_queries::build_profile(),
         regime_label,
         std::env::var("VPJOIN_DP_SEED").unwrap_or_else(|_| "default".into()),
         reps
     );
+    // A declared degree cap changes every capacity a graph row is proved at, so
+    // it belongs in the banner and not only in the per-row `[dp]` line: two
+    // sweeps run under different caps are not comparable, and the difference is
+    // otherwise invisible in the table.
+    {
+        let caps: Vec<String> = ["lastfm", "facebook", "wiki"]
+            .iter()
+            .filter_map(|d| {
+                halo2_experiments::bench_queries::declared_degree_cap(d)
+                    .map(|t| format!("{}={}", d, t))
+            })
+            .collect();
+        let overridden = std::env::var("VPJOIN_TAU_PUB").ok();
+        match (overridden, caps.is_empty()) {
+            (Some(v), _) => println!(
+                "declared degree cap: VPJOIN_TAU_PUB={} for every graph row (overrides the \
+                 built-in caps)",
+                v
+            ),
+            (None, false) => println!(
+                "declared degree cap: {} (built in; VPJOIN_TAU_PUB overrides, =0 restores the \
+                 released-tau mechanism)",
+                caps.join(", ")
+            ),
+            (None, true) => {}
+        }
+    }
+    println!();
 
     // `cargo run` is optimized (see `[profile.dev]` in Cargo.toml), so this
     // only fires under the `test` profile or a hand-rolled one that leaves the

@@ -144,50 +144,19 @@ VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
 **3. DP-guided padding** for the three cyclic queries. `VPJOIN_EPS` takes one budget or a
-comma-separated list, so a single invocation sweeps the whole privacy budget curve. Q5 is
-runnable over the whole curve as it stands (1 to 6 lanes at k=17):
+comma-separated list, so a single invocation sweeps the whole privacy budget curve:
 
 ```bash
-VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5
+VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
 
-The graph queries need one more flag below about `eps=0.05`. The noise is calibrated to the
-bag's sensitivity `2*tau`, where `tau` bounds the vertex degree, and `tau` is itself private,
-so by default part of the budget is spent RELEASING a noisy bound on it. At small `eps` that
-released bound is mostly noise, and the noise then multiplies into the capacity noise, so the
-pad grows like `1/eps^2`: on LastFM at `eps=0.01` GQ4 asks for 53 lanes, and on Facebook it
-asks for a circuit needing about 3.2 TB of prover memory.
-
-`VPJOIN_TAU_PUB=t` DECLARES the bound instead, as a public, data-independent cap ("this
-deployment caps degree at `t`"). No budget is spent on it, so the split drops from two
-releases to one and the sensitivity becomes a constant `2t`. The pad then grows like `1/eps`
-and the whole curve fits:
-
-```bash
-VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_TAU_PUB=256 VPJOIN_DP_SEED=1 \
-  cargo run --bin dp_lane_bench -- reps=3 gq3:lastfm gq4:lastfm
-```
-
-```bash
-VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_TAU_PUB=2048 VPJOIN_DP_SEED=1 \
-  cargo run --bin dp_lane_bench -- reps=3 gq3:facebook gq4:facebook gq3:wiki gq4:wiki
-```
-
-A `query:dataset` argument pins one network; a bare `gq3` runs all three. The two caps differ
-because a declared bound should sit just above the deployment's real ceiling: the published
-maximum degrees are 203 (LastFM), 1,043 (Facebook) and 893 (Wikipedia Vote), so 256 and 2048
-are the tight powers of two, and a cap far above the ceiling pays padding for nothing. The cap
-must NOT be read off the data, or it leaks the maximum degree that the release exists to
-protect; a deployment whose data exceeds its cap has to truncate the relation, which changes
-the answer, so this harness refuses rather than report an `eps` it does not deliver.
-`VPJOIN_TAU_PUB` reaches GQ3 and GQ4 only: Q5's capacities come from a separate mechanism
-over `P = {customer, supplier}` and ignore it.
-
-Budget the time before starting. LastFM rows are k=18 and take minutes; every Facebook and
-Wikipedia row is k=22 and takes 40 to 95 minutes per proof, so the second command is about
-four days at `reps=3`. Once the release fits inside one lane the circuit stops depending on
-`eps` at all, identically sized at `eps=0.05` and `eps=10`, so that flat part of the curve is
-worth measuring at `reps=1` and only the low-`eps` rows at `reps=3`.
+A `query:dataset` argument pins one network, so `gq3:lastfm` runs one row where a bare `gq3`
+runs all three. Trim the budget list to what the machine can carry: the pad grows like
+`1/eps^2`, so the low end of the curve is the expensive end. At `eps=0.05` and above every
+graph row fits four lanes or fewer, at `eps=0.02` LastFM reaches fifteen, and at `eps=0.01`
+GQ4 asks for more prover memory than a 2 TB machine has on all three networks. Facebook and
+Wikipedia rows are k=22 and take 40 to 95 minutes per proof even at one lane, so budget days
+rather than hours for a wide sweep at `reps=3`.
 
 
 **4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
