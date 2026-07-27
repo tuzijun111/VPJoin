@@ -29,8 +29,10 @@
 //!   partition group, and one shuffle per lane forces lane `l`'s multiset of
 //!   `(attributes, clean indicator)` to equal its own group's
 //!   `[clean | residual | pad]` multiset. The lane row blocks are disjoint and
-//!   cover the whole released capacity EXACTLY -- every lane but the last is a
-//!   full `lane_rows` and the last stops at the capacity -- so summing the `c`
+//!   TILE the assigned pipeline exactly -- every lane but the last is a full
+//!   `lane_rows` and the last stops at the layout capacity, which is the
+//!   released capacity or the full lane span depending on
+//!   [`MyCircuit::released_capacity`] -- so summing the `c`
 //!   lane statements gives `Bag1 == Bag1^c U Bag1^r`. Nothing can be moved
 //!   between lanes, because a lane's shuffle only ever sees its own columns.
 //!   Bag2 is not laned (its height is |E| + pads, public in every regime), so
@@ -79,6 +81,37 @@
 //!
 //! Everything else, including the message table, the ordering checks, the
 //! COUNT(*) prefix sum and the whole lane geometry, is unchanged.
+//!
+//! # What the verifying key discloses
+//!
+//! Selectors are fixed columns, so every row range a lane is gated on is
+//! committed at keygen and is visible to the verifier. The field that decides
+//! those ranges is [`MyCircuit::released_capacity`], and it is a STRUCTURAL
+//! input the caller supplies. It is never reconstructed from the witness: a
+//! capacity computed as `t12.len() + bag1_pad_extra` would put the true bag
+//! size in the verifying key wherever the pad is a public constant.
+//!
+//!   * `Some(cap)`: the last lane stops at `cap`, so the vk pins `cap` (and
+//!     with it the lane count). SOUND ONLY WHERE `cap` IS A GENUINE RELEASE,
+//!     i.e. a number the verifier is told anyway. Under `Privacy::Dp` it is
+//!     the DP release, whose whole point is to be published; under
+//!     `Privacy::Rjs` it is the true bag size, which that regime reveals by
+//!     definition.
+//!   * `None`: every lane is filled to `lane_rows` and the vk pins only the
+//!     lane count `c = ceil(cap / lane_rows)`. This is what `Privacy::Legacy`
+//!     must use: its pad is a public CONSTANT, so `cap = true_size + constant`
+//!     and a `cap` in the vk would pin the true bag size, which is the one
+//!     statistic the padding exists to hide.
+//!
+//! `None` is the default, so a caller that says nothing gets the layout this
+//! file had before the short last lane existed. The policy that maps a privacy
+//! regime onto the two lives in [`crate::dp_lane::vk_released_capacity`].
+//!
+//! What the vk discloses about the UNLANED stages is unchanged and is not a
+//! function of this field: the two indexed views, the Bag2 pipeline and the
+//! message table size their row ranges from |E| and from the number of
+//! distinct separator keys, both public in every regime, which is exactly why
+//! Bag2 is not laned in the first place.
 
 use halo2_proofs::plonk::Expression;
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -151,10 +184,12 @@ pub fn lanes_for(n: usize, lane_rows: usize) -> usize {
 
 /// Live rows of lane `l`: the rows that are assigned and gated.
 ///
-/// Every lane but the last is full. The LAST one stops at the released
-/// capacity rather than at `c * lane_rows`, so the rows the lane count rounds
-/// up to never exist: they are not assigned, no selector covers them and no
-/// table side reads them.
+/// Every lane but the last is full. The LAST one stops at `capacity` rather
+/// than at `c * lane_rows`, so the rows the lane count rounds up to never
+/// exist: they are not assigned, no selector covers them and no table side
+/// reads them. A caller that passes `capacity = c * lane_rows` gets the full
+/// layout back, and that is what [`MyCircuit::released_capacity`] `= None`
+/// does.
 ///
 /// TWO TIERS OF PADDING MEET HERE AND ONLY THE SECOND IS DROPPED.
 ///   * true bag size -> `capacity` is the DP pad. It is INSIDE the capacity, so
@@ -1053,11 +1088,14 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             q_perm12_out,
         };
 
-        // The last lane stops at the released capacity, so it cannot share the
+        // The last lane MAY stop short of `lane_rows`, so it cannot share the
         // ones above: a selector is a fixed column and turns its gate on for
         // every lane at once. Four more columns cover its four distinct row
         // ranges, whatever c is, and `q_sum0` stays shared because row 0 is live
-        // in every lane.
+        // in every lane. These four are laid out unconditionally, so the
+        // constraint system does not move with `released_capacity`; under
+        // `None` they simply cover all `lane_rows` rows and the layout is the
+        // full one.
         //
         // `q_last_complex` is complex because it gates lookups and a shuffle;
         // `q_last_row` is simple and drives gates only, exactly like the nine
@@ -1567,11 +1605,28 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         bag1_pad_extra: usize,
         bag2_pad_extra: usize,
         lane_rows: usize,
+        released_capacity: Option<usize>,
         tamper: Tamper,
     ) -> Result<AssignedCell<F, F>, Error> {
         let cfg = self.cfg.clone();
         let num_lanes = cfg.lanes.len();
         assert!(lane_rows > 0, "lane_rows must be positive");
+
+        // -------------------
+        // The capacity the LAYOUT is cut to. Structural input, settled here,
+        // before a single row of witness is derived: selectors are fixed
+        // columns, so this number is committed at keygen and lands in the
+        // verifying key. `Some(cap)` is the caller's public release and the
+        // last lane stops at it; `None` fills every lane, which discloses only
+        // the lane count. See the module header for which regime may use which.
+        // -------------------
+        let capacity = released_capacity.unwrap_or(num_lanes * lane_rows);
+        // The live rows must TILE the lanes exactly. `lane_live_rows` re-checks
+        // it for every lane; calling it here first makes a capacity that does
+        // not fit the geometry fail on the caller's own numbers rather than
+        // deep inside the region.
+        let live_of = |l: usize| lane_live_rows(l, num_lanes, lane_rows, capacity);
+        let live_last = live_of(num_lanes - 1);
 
         // Load all LT tables used. The shared chips keep a u8 column each; all
         // 4c lane chips share `lane_u8` and every Lt chip of the Cardinality
@@ -1611,16 +1666,33 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 let real3 = derived.t3.len();
                 let n3 = std::cmp::max(real3 + bag2_pad_extra, 1);
                 let real12 = derived.t12.len();
-                // The RELEASED capacity: the public value the lane count is
-                // derived from, and now also where the last lane stops.
-                let capacity = std::cmp::max(real12 + bag1_pad_extra, 1);
-                assert!(
-                    num_lanes * lane_rows >= capacity,
-                    "released Bag1 capacity {} exceeds {} lanes of {} rows",
-                    capacity,
-                    num_lanes,
-                    lane_rows
-                );
+                // The capacity this WITNESS implies. It is checked against the
+                // structural one and never used in its place, which is the
+                // whole point: `real12` is the private statistic.
+                //
+                //   * `Some(cap)`: exact equality. A drift either drops real
+                //     rows past the release (unsound: rows outside the last
+                //     lane's live range are not assigned and not gated) or pins
+                //     a capacity the release never announced (a disclosure).
+                //     Either way it is a panic here, not a silent layout.
+                //   * `None`: the layout runs to the full lane span, so the
+                //     implied capacity only has to FIT it.
+                let implied = std::cmp::max(real12 + bag1_pad_extra, 1);
+                match released_capacity {
+                    Some(cap) => assert_eq!(
+                        implied, cap,
+                        "this witness implies a Bag1 capacity of {} rows ({} real + {} pad) \
+                         but the caller released {}",
+                        implied, real12, bag1_pad_extra, cap
+                    ),
+                    None => assert!(
+                        num_lanes * lane_rows >= implied,
+                        "released Bag1 capacity {} exceeds {} lanes of {} rows",
+                        implied,
+                        num_lanes,
+                        lane_rows
+                    ),
+                }
 
                 // ---------------- clean / residual partition of the two bags ----------------
                 // Identical to the sibling's, and computed over the WHOLE bag: a
@@ -1933,16 +2005,18 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 // Two selector sets, one row range each. `full` covers all
                 // `lane_rows` rows and switches ON every lane but the last;
                 // `last` covers the live rows of the last lane, which stop at
-                // the RELEASED capacity. Both ranges are functions of the
-                // capacity, `c` and `lane_rows`, all public, so nothing here can
-                // depend on the true bag size -- and that is still true of the
-                // OBJ selectors: none of their enable ranges is a function of
-                // the clean/residual split, which is why no lane's shape leaks
-                // |Bag1^c|.
+                // the layout capacity: the caller's release under `Some`, the
+                // full lane span under `None`. Both ranges are functions of
+                // that structural number, `c` and `lane_rows`, none of which is
+                // read off the witness, so nothing here can depend on the true
+                // bag size -- and that is still true of the OBJ selectors: none
+                // of their enable ranges is a function of the clean/residual
+                // split, which is why no lane's shape leaks |Bag1^c|.
                 //
                 // Row 0 is live in every lane, so `q_sum0` stays shared and is
-                // enabled once, outside both loops.
-                let live_last = lane_live_rows(num_lanes - 1, num_lanes, lane_rows, capacity);
+                // enabled once, outside both loops. `live_last` is the one
+                // computed at the top of `assign`, from the structural capacity
+                // alone.
                 cfg.full.q_sum0.enable(&mut region, 0)?;
                 if num_lanes > 1 {
                     for r in 0..lane_rows {
@@ -1997,7 +2071,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     let (cell, total, cln_cell, cln_total) = Self::assign_lane(
                         lane,
                         &mut region,
-                        lane_live_rows(l, num_lanes, lane_rows, capacity),
+                        live_of(l),
                         l * lane_rows,
                         &derived.t12,
                         &derived.msg_map,
@@ -2102,14 +2176,30 @@ impl<F: Field + Ord> Gq3DpChip<F> {
     }
 }
 
-/// Wrapper circuit. `lane_rows` and `num_lanes` are circuit STRUCTURE derived
-/// from the publicly released capacity, not witness.
+/// Wrapper circuit. `lane_rows`, `num_lanes` and `released_capacity` are
+/// circuit STRUCTURE: they decide which rows are assigned and gated, so they
+/// land in the verifying key and none of them may be derived from the witness.
 pub struct MyCircuit<F: Field + Ord> {
     pub edges: Vec<Edge>,
     pub bag1_pad_extra: usize,
     pub bag2_pad_extra: usize,
     pub lane_rows: usize,
     pub num_lanes: usize,
+    /// The RELEASED Bag1 capacity, when the caller is supplying a genuine
+    /// public release.
+    ///
+    ///   * `Some(cap)`: the last lane stops at `cap`, so the assigned rows
+    ///     total `cap` rather than `num_lanes * lane_rows`, and `cap` is what
+    ///     the verifying key pins. Only pass it where `cap` is public already:
+    ///     `Privacy::Dp` (the DP release) and `Privacy::Rjs` (the true size,
+    ///     which that regime reveals by definition).
+    ///   * `None`: every lane is filled to `lane_rows`, exactly as before the
+    ///     short last lane existed, and the vk pins only the lane count. This
+    ///     is the behaviour-preserving default and the one `Privacy::Legacy`
+    ///     must use, since its pad is a public constant.
+    ///
+    /// The check that the witness really implies this capacity is in `assign`.
+    pub released_capacity: Option<usize>,
     pub tamper: Tamper,
     pub _marker: PhantomData<F>,
 }
@@ -2122,6 +2212,8 @@ impl<F: Field + Ord> Default for MyCircuit<F> {
             bag2_pad_extra: 0,
             lane_rows: LANE_ROWS,
             num_lanes: 1,
+            // behaviour-preserving: full lanes, lane count only in the vk
+            released_capacity: None,
             tamper: Tamper::None,
             _marker: PhantomData,
         }
@@ -2133,10 +2225,21 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
-        // keep the lane geometry: it is circuit STRUCTURE, not witness
+        // Keep the whole lane geometry: it is circuit STRUCTURE, not witness,
+        // and dropping the capacity here is what broke keygen at c > 1 (the
+        // layout collapsed to a single row, which no lane count but 1 tiles).
+        //
+        // `bag1_pad_extra` is set to the release rather than to 0 on purpose.
+        // The bag itself is gone, so the honest reading of this circuit is an
+        // EMPTY relation padded to the whole released capacity: 0 real rows
+        // plus `cap` pad rows. That is what the drift check in `assign`
+        // compares against, so it stays exact instead of having to special-case
+        // a witness-free circuit.
         Self {
             lane_rows: self.lane_rows,
             num_lanes: self.num_lanes,
+            released_capacity: self.released_capacity,
+            bag1_pad_extra: self.released_capacity.unwrap_or(0),
             ..Self::default()
         }
     }
@@ -2159,6 +2262,7 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
             self.bag1_pad_extra,
             self.bag2_pad_extra,
             self.lane_rows,
+            self.released_capacity,
             self.tamper,
         )?;
         chip.expose_public(&mut layouter, out, 0)?;
@@ -2179,6 +2283,9 @@ struct Gq3DpSetup {
     edges: Vec<Edge>,
     bag1_pad_extra: usize,
     bag2_pad_extra: usize,
+    /// The Bag1 capacity this regime may pin in the verifying key, or `None`
+    /// where it may not. See [`crate::dp_lane::vk_released_capacity`].
+    released_capacity: Option<usize>,
     plan: crate::dp_lane::DpLanePlan,
 }
 
@@ -2231,10 +2338,24 @@ fn try_dp_lane_setup(
         true_size: vec![stats.bag1_size as usize],
         pads: vec![bag1_pad_extra, bag2_pad_extra],
     };
+    // POLICY, applied here and nowhere else in this file: whether the circuit
+    // may stop its last lane at the released capacity, which is the same thing
+    // as whether it may pin that capacity in the verifying key.
+    //   * Privacy::Dp  -> Some(n12). The release is public, so the vk discloses
+    //                     nothing the harness did not already print.
+    //   * Privacy::Rjs -> Some(n12), which equals the true bag size. That
+    //                     regime reveals the join size by definition.
+    //   * Privacy::Legacy -> None. Its pad is a public CONSTANT, so a capacity
+    //                     in the vk would pin the true bag size; fall back to
+    //                     the full-lane layout, which discloses only the lane
+    //                     count.
+    let released_capacity = crate::dp_lane::vk_released_capacity(privacy, n12);
+
     Ok(Gq3DpSetup {
         edges,
         bag1_pad_extra,
         bag2_pad_extra,
+        released_capacity,
         plan,
     })
 }
@@ -2303,6 +2424,9 @@ pub fn run_dp_lanes(
         bag2_pad_extra: setup.bag2_pad_extra,
         lane_rows: setup.plan.lane_rows,
         num_lanes: c,
+        // `Some` only where the capacity is a genuine public release; see the
+        // policy comment in `try_dp_lane_setup`.
+        released_capacity: setup.released_capacity,
         tamper: Tamper::None,
         _marker: PhantomData,
     };
@@ -2386,7 +2510,7 @@ mod tests {
     use crate::data::graph_data_processing::Edge;
     use crate::graph_sql::g_sql3_obj::{gq3_derive, pack2};
     use halo2_proofs::dev::MockProver;
-    use halo2_proofs::plonk::Circuit;
+    use halo2_proofs::plonk::{keygen_vk, Circuit};
     use halo2curves::pasta::Fp;
 
     use std::collections::HashSet;
@@ -2424,10 +2548,25 @@ mod tests {
             bag2_pad_extra: 0,
             lane_rows,
             num_lanes: c,
+            released_capacity: released(bag1_pad_extra),
             tamper,
             _marker: PhantomData,
         };
         (circuit, c)
+    }
+
+    /// True Bag1 size on [`synthetic_edges`]: 6 wedges survive the A<B
+    /// pre-filter. Every geometry below is stated as `6 + pad`.
+    const SYNTH_BAG1_ROWS: usize = 6;
+
+    /// The released capacity a pad implies here, handed to the circuit as a
+    /// GENUINE release. This is the `Privacy::Dp` / `Privacy::Rjs` arm: the
+    /// number is public, so the last lane may stop at it and the vk may pin it.
+    /// The `None` arm (`Privacy::Legacy`) is exercised by
+    /// `mock_some_and_none_at_the_same_geometry` and
+    /// `full_lanes_keep_the_capacity_out_of_the_key`.
+    fn released(bag1_pad_extra: usize) -> Option<usize> {
+        Some(SYNTH_BAG1_ROWS + bag1_pad_extra)
     }
 
     #[test]
@@ -2483,6 +2622,324 @@ mod tests {
         // one holds 6.4% of a lane
         assert_eq!(lane_live_rows(0, 2, 260_800, 277_610), 260_800);
         assert_eq!(lane_live_rows(1, 2, 260_800, 277_610), 16_810);
+
+        // `released_capacity = None` passes `c * lane_rows`, which must give
+        // every lane back its full height whatever the lane count is
+        for c in [1usize, 2, 7] {
+            for l in 0..c {
+                assert_eq!(lane_live_rows(l, c, 4, c * 4), 4);
+            }
+        }
+    }
+
+    /// `keygen_vk` at the degree the mock tests use, as its PINNED
+    /// representation. `PinnedVerificationKey` carries the domain, the whole
+    /// constraint system, the permutation and every fixed commitment, i.e.
+    /// everything the verifier holds, and its `Debug` string is exactly what
+    /// halo2 hashes into the key's `transcript_repr`. Comparing those strings
+    /// is comparing the keys; this fork exposes no cheaper equality.
+    fn pinned_vk(circuit: &MyCircuit<Fp>) -> String {
+        use halo2_proofs::poly::commitment::ParamsProver;
+        use halo2_proofs::poly::ipa::commitment::ParamsIPA;
+        use halo2curves::pasta::EqAffine;
+
+        let params: ParamsIPA<EqAffine> = ParamsIPA::new(11);
+        let vk = keygen_vk(&params, circuit).expect("keygen_vk must not fail");
+        format!("{:?}", vk.pinned())
+    }
+
+    /// DEFECT 2. halo2's structural guarantee is that a verifying key cannot
+    /// depend on witness data, and `without_witnesses()` is where a circuit
+    /// states it: keygen has to go through on a circuit carrying no bag at all.
+    /// A capacity reconstructed from the witness collapsed to `max(0 + 0, 1)`
+    /// there, which no lane count but 1 tiles, so this panicked at every c > 1.
+    ///
+    /// The second half is the property worth protecting: with the capacity kept
+    /// as a structural field, the witness-free key is a function of
+    /// `(lane_rows, num_lanes, released_capacity)` and of nothing else, so two
+    /// completely different graphs give the SAME key.
+    ///
+    /// WHAT THIS CANNOT ASSERT, AND WHY. The witness-free key is NOT equal to
+    /// the key of the witness-bearing circuit, and that gap is not the
+    /// capacity's doing: it is exactly as wide with `released_capacity = None`,
+    /// where the field plays no part in any row range at all. It comes from the
+    /// UNLANED stages, which size their rows from |E| and from the number of
+    /// distinct separator keys (the two indexed views, the Bag2 pipeline, the
+    /// message table), plus halo2's selector compression, which folds selectors
+    /// into fixed columns using the enable pattern it observes: an empty edge
+    /// list changes `num_fixed_columns` and the compressed gate expressions.
+    /// Both quantities are public in every regime, which is why Bag2 is not
+    /// laned in the first place. `run_dp_lanes` accordingly keygens on the
+    /// witness-bearing circuit, as it always has. What the released capacity
+    /// itself contributes to the key is isolated in
+    /// `full_lanes_keep_the_capacity_out_of_the_key`.
+    #[test]
+    fn without_witnesses_keygens_at_every_lane_count() {
+        let other_edges: Vec<Edge> = [(0, 5), (5, 9), (9, 0), (2, 7), (7, 2), (1, 9)]
+            .into_iter()
+            .map(|(src, dst)| Edge { src, dst })
+            .collect();
+
+        // (lane_rows, pad, expected lanes): one lane, and the three-lane
+        // geometry with a short last lane
+        for (lane_rows, bag1_pad_extra, want_c) in [(16usize, 5usize, 1usize), (4, 5, 3)] {
+            let c = lanes_for(SYNTH_BAG1_ROWS + bag1_pad_extra, lane_rows);
+            assert_eq!(c, want_c);
+            set_config_lanes(c);
+
+            let circuit = MyCircuit::<Fp> {
+                edges: synthetic_edges(),
+                bag1_pad_extra,
+                bag2_pad_extra: 0,
+                lane_rows,
+                num_lanes: c,
+                released_capacity: released(bag1_pad_extra),
+                tamper: Tamper::None,
+                _marker: PhantomData,
+            };
+            // the defect-2 fix: this is what panicked at c > 1
+            let empty = <MyCircuit<Fp> as Circuit<Fp>>::without_witnesses(&circuit);
+            assert_eq!(empty.lane_rows, lane_rows);
+            assert_eq!(empty.num_lanes, c);
+            assert_eq!(empty.released_capacity, released(bag1_pad_extra));
+            let vk_empty = pinned_vk(&empty);
+
+            // a different graph, the same structural fields: same key
+            let other = MyCircuit::<Fp> {
+                edges: other_edges.clone(),
+                bag1_pad_extra,
+                bag2_pad_extra: 0,
+                lane_rows,
+                num_lanes: c,
+                released_capacity: released(bag1_pad_extra),
+                tamper: Tamper::None,
+                _marker: PhantomData,
+            };
+            set_config_lanes(c);
+            let vk_other_empty =
+                pinned_vk(&<MyCircuit<Fp> as Circuit<Fp>>::without_witnesses(&other));
+            // HONEST ABOUT WHAT THIS PROVES. `without_witnesses` discards the
+            // edges by construction, so this equality cannot fail and is not
+            // evidence that the key is witness-independent. It is a guard on
+            // `without_witnesses` ITSELF: if a later edit made it carry any
+            // part of the witness through, the two keys would diverge here.
+            // The property that the capacity stays out of the key is tested by
+            // `full_lanes_keep_the_capacity_out_of_the_key`, which varies a
+            // real witness quantity at a fixed lane count.
+            assert_eq!(
+                vk_empty, vk_other_empty,
+                "lane_rows={lane_rows} c={c}: without_witnesses carried witness data through"
+            );
+            // The same run with `None`: the capacity field is preserved as
+            // `None` and keygen still goes through, on the full-lane layout.
+            set_config_lanes(c);
+            let full = MyCircuit::<Fp> {
+                edges: synthetic_edges(),
+                bag1_pad_extra,
+                bag2_pad_extra: 0,
+                lane_rows,
+                num_lanes: c,
+                released_capacity: None,
+                tamper: Tamper::None,
+                _marker: PhantomData,
+            };
+            let empty_full = <MyCircuit<Fp> as Circuit<Fp>>::without_witnesses(&full);
+            assert_eq!(empty_full.released_capacity, None);
+            assert_eq!(empty_full.bag1_pad_extra, 0);
+            let vk_empty_full = pinned_vk(&empty_full);
+
+            // The gap documented above, pinned so the diagnosis is checkable
+            // rather than asserted in prose: it is there under `Some` and under
+            // `None` alike, so nothing about it is the capacity's. If a later
+            // change ever makes the unlaned stages structural too, both of
+            // these become equalities and this is the test to strengthen.
+            set_config_lanes(c);
+            assert_ne!(pinned_vk(&circuit), vk_empty);
+            set_config_lanes(c);
+            assert_ne!(pinned_vk(&full), vk_empty_full);
+        }
+    }
+
+    /// DEFECT 1. Under `Privacy::Legacy` the pad is a public CONSTANT, so a
+    /// capacity in the verifying key would pin `true_size = capacity - pad`.
+    /// That regime therefore passes `None`, and this is what `None` buys: two
+    /// pads that land on the same lane count give BYTE-IDENTICAL keys, so the
+    /// key cannot be inverted for the bag size. With `Some` the two keys
+    /// differ, which is the point of a genuine release: the capacity is public
+    /// and the last lane may stop at it.
+    #[test]
+    fn full_lanes_keep_the_capacity_out_of_the_key() {
+        let lane_rows = 4;
+        // 11 and 12 released rows both need exactly 3 lanes of 4
+        let (pad_a, pad_b) = (5usize, 6usize);
+        let c = lanes_for(SYNTH_BAG1_ROWS + pad_a, lane_rows);
+        assert_eq!(c, lanes_for(SYNTH_BAG1_ROWS + pad_b, lane_rows));
+        assert_eq!(c, 3);
+
+        let build = |pad: usize, released_capacity: Option<usize>| MyCircuit::<Fp> {
+            edges: synthetic_edges(),
+            bag1_pad_extra: pad,
+            bag2_pad_extra: 0,
+            lane_rows,
+            num_lanes: c,
+            released_capacity,
+            tamper: Tamper::None,
+            _marker: PhantomData,
+        };
+
+        set_config_lanes(c);
+        let none_a = pinned_vk(&build(pad_a, None));
+        set_config_lanes(c);
+        let none_b = pinned_vk(&build(pad_b, None));
+        assert_eq!(
+            none_a, none_b,
+            "with `None` the verifying key must not move with the pad, or it pins \
+             the true bag size wherever the pad is a public constant"
+        );
+
+        set_config_lanes(c);
+        let some_a = pinned_vk(&build(pad_a, released(pad_a)));
+        set_config_lanes(c);
+        let some_b = pinned_vk(&build(pad_b, released(pad_b)));
+        assert_ne!(
+            some_a, some_b,
+            "a released capacity IS pinned by the key: two different releases must \
+             give two different keys"
+        );
+        assert_ne!(
+            some_a, none_a,
+            "the short last lane must be visible in the key at all, or the `Some` \
+             arm is not doing anything"
+        );
+        // 12 released rows fill all three lanes, so `Some(12)` and `None` are
+        // the same layout and must give the same key.
+        set_config_lanes(c);
+        assert_eq!(
+            pinned_vk(&build(pad_b, Some(c * lane_rows))),
+            none_b,
+            "a release that exactly fills the lanes is the full-lane layout"
+        );
+    }
+
+    /// The `Some` / `None` pair at ONE geometry: both must prove, both must
+    /// reject a wrong COUNT(*), and they must differ in exactly the way the
+    /// field promises, namely how far the last lane runs.
+    #[test]
+    fn mock_some_and_none_at_the_same_geometry() {
+        let lane_rows = 4;
+        let bag1_pad_extra = 5;
+        let c = lanes_for(SYNTH_BAG1_ROWS + bag1_pad_extra, lane_rows);
+        assert_eq!(c, 3);
+        // 11 released rows over 3 lanes of 4: the two arms really do differ
+        assert_eq!(lane_live_rows(c - 1, c, lane_rows, 11), 3);
+        assert_eq!(lane_live_rows(c - 1, c, lane_rows, c * lane_rows), 4);
+
+        for released_capacity in [released(bag1_pad_extra), None] {
+            let build = |tamper| {
+                set_config_lanes(c);
+                MyCircuit::<Fp> {
+                    edges: synthetic_edges(),
+                    bag1_pad_extra,
+                    bag2_pad_extra: 0,
+                    lane_rows,
+                    num_lanes: c,
+                    released_capacity,
+                    tamper,
+                    _marker: PhantomData,
+                }
+            };
+            let prover =
+                MockProver::run(11, &build(Tamper::None), vec![vec![Fp::from(3u64)]]).unwrap();
+            assert_eq!(
+                prover.verify(),
+                Ok(()),
+                "released_capacity={released_capacity:?} must prove"
+            );
+
+            let wrong =
+                MockProver::run(11, &build(Tamper::None), vec![vec![Fp::from(4u64)]]).unwrap();
+            assert!(
+                wrong.verify().is_err(),
+                "released_capacity={released_capacity:?} accepted a wrong COUNT(*)"
+            );
+
+            // `Tamper::PadRow` breaks the LAST live row of the last lane, which
+            // is row 10 under `Some(11)` and row 11 under `None`. Both must be
+            // inside the gated range, or the arm has an unconstrained tail.
+            let tampered =
+                MockProver::run(11, &build(Tamper::PadRow), vec![vec![Fp::from(3u64)]]).unwrap();
+            assert!(
+                tampered.verify().is_err(),
+                "released_capacity={released_capacity:?} left its last row unconstrained"
+            );
+        }
+    }
+
+    /// A released capacity that does not TILE the lanes is a caller error and
+    /// must abort, not silently re-cut the layout: too many rows would leave
+    /// the overflow ungated, too few would leave a whole lane with no live row.
+    #[test]
+    #[should_panic(expected = "is not hosted by exactly 3 lanes of 4 rows")]
+    fn released_capacity_above_the_lane_span_panics() {
+        let lane_rows = 4;
+        let bag1_pad_extra = 8; // 6 + 8 = 14 rows, which needs 4 lanes of 4
+        let c = 3;
+        set_config_lanes(c);
+        let circuit = MyCircuit::<Fp> {
+            edges: synthetic_edges(),
+            bag1_pad_extra,
+            bag2_pad_extra: 0,
+            lane_rows,
+            num_lanes: c,
+            released_capacity: released(bag1_pad_extra),
+            tamper: Tamper::None,
+            _marker: PhantomData,
+        };
+        let _ = MockProver::run(11, &circuit, vec![vec![Fp::from(3u64)]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not hosted by exactly 4 lanes of 4 rows")]
+    fn released_capacity_below_the_lane_span_panics() {
+        let lane_rows = 4;
+        let bag1_pad_extra = 5; // 6 + 5 = 11 rows, which 3 lanes of 4 host
+        let c = 4;
+        set_config_lanes(c);
+        let circuit = MyCircuit::<Fp> {
+            edges: synthetic_edges(),
+            bag1_pad_extra,
+            bag2_pad_extra: 0,
+            lane_rows,
+            num_lanes: c,
+            released_capacity: released(bag1_pad_extra),
+            tamper: Tamper::None,
+            _marker: PhantomData,
+        };
+        let _ = MockProver::run(11, &circuit, vec![vec![Fp::from(3u64)]]);
+    }
+
+    /// A release that does not match the witness is a panic, not a layout. Too
+    /// small drops real rows past the last lane's live range, where nothing
+    /// gates them; too large pins a capacity the release never announced.
+    #[test]
+    #[should_panic(expected = "but the caller released 12")]
+    fn released_capacity_that_drifts_from_the_witness_panics() {
+        let lane_rows = 4;
+        let bag1_pad_extra = 5;
+        let c = lanes_for(SYNTH_BAG1_ROWS + bag1_pad_extra, lane_rows);
+        set_config_lanes(c);
+        let circuit = MyCircuit::<Fp> {
+            edges: synthetic_edges(),
+            bag1_pad_extra,
+            bag2_pad_extra: 0,
+            lane_rows,
+            num_lanes: c,
+            // the witness implies 11; claim 12, which still tiles the lanes
+            released_capacity: Some(12),
+            tamper: Tamper::None,
+            _marker: PhantomData,
+        };
+        let _ = MockProver::run(11, &circuit, vec![vec![Fp::from(3u64)]]);
     }
 
     /// c = 3 lanes at k = 11: the padded Bag1 pipeline really spans three
@@ -2586,6 +3043,7 @@ mod tests {
                 bag2_pad_extra: 0,
                 lane_rows,
                 num_lanes: c,
+                released_capacity: released(bag1_pad_extra),
                 tamper: Tamper::None,
                 _marker: PhantomData,
             };
@@ -2604,6 +3062,7 @@ mod tests {
                 bag2_pad_extra: 0,
                 lane_rows,
                 num_lanes: c,
+                released_capacity: released(bag1_pad_extra),
                 tamper: Tamper::None,
                 _marker: PhantomData,
             };
@@ -2737,6 +3196,7 @@ mod tests {
                     bag2_pad_extra: 3,
                     lane_rows,
                     num_lanes: c,
+                    released_capacity: released(bag1_pad_extra),
                     tamper,
                     _marker: PhantomData,
                 }
@@ -2797,6 +3257,7 @@ mod tests {
             bag2_pad_extra: 3,
             lane_rows,
             num_lanes: c,
+            released_capacity: released(bag1_pad_extra),
             tamper: Tamper::PartitionFlag,
             _marker: PhantomData,
         };
@@ -2831,6 +3292,7 @@ mod tests {
             bag2_pad_extra: 3,
             lane_rows,
             num_lanes: c,
+            released_capacity: released(bag1_pad_extra),
             tamper: Tamper::HostWrongLane,
             _marker: PhantomData,
         };
@@ -2909,6 +3371,7 @@ mod tests {
             bag2_pad_extra: 0,
             lane_rows,
             num_lanes: c,
+            released_capacity: released(5),
             tamper: Tamper::None,
             _marker: PhantomData,
         };

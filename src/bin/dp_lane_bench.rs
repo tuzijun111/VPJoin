@@ -74,6 +74,15 @@
 //!   VPJOIN_PLAN_ONLY=1  print the planned degree, lane counts, released
 //!                   capacities and pads, then exit BEFORE any keygen or
 //!                   proving. Cheap; use it to check a selection first.
+//!   VPJOIN_FULL_LANES=1  fill EVERY lane to `lane_rows` instead of stopping
+//!                   the last one at the released capacity. Off by default, in
+//!                   which case the `dp` and `rjs` regimes stop short (their
+//!                   capacity is public, so the verifying key may pin it) and
+//!                   `legacy` fills, since its pad is a public constant and a
+//!                   capacity in the key would pin the true bag size. Setting
+//!                   it forces the full layout everywhere, which is the A/B
+//!                   arm for measuring what the short last lane is worth: same
+//!                   binary, same witness, same lane count.
 
 use halo2_experiments::bench_queries::{Privacy, GRAPH_DATASETS};
 use halo2_experiments::dp_lane::{DpLanePlan, DpLaneRun};
@@ -374,6 +383,20 @@ fn main() {
             (None, true) => {}
         }
     }
+    // Which layout the last lane gets, since it changes both the prover's work
+    // and what the verifying key discloses. Two runs under different settings
+    // are two different circuits, so it belongs in the banner next to the
+    // degree cap rather than only in the source.
+    println!(
+        "last lane: {}",
+        if std::env::var("VPJOIN_FULL_LANES").as_deref() == Ok("1") {
+            "FULL (VPJOIN_FULL_LANES=1 forces every lane to lane_rows in every regime; \
+             the vk pins only the lane count)"
+        } else {
+            "stops at the released capacity under dp/rjs, where that capacity is public \
+             and the vk may pin it; full under legacy, whose pad is a public constant"
+        }
+    );
     println!();
 
     // `cargo run` is optimized (see `[profile.dev]` in Cargo.toml), so this

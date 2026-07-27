@@ -775,6 +775,13 @@ pub fn count_gq4(edges: &[Edge]) -> u64 {
 pub fn declared_degree_cap(dataset: &str) -> Option<u64> {
     match dataset {
         "lastfm" => Some(384),
+        // Facebook and Wikipedia Vote take the tight power of two above their
+        // published maximum degrees, 1,043 and 893. Unlike LastFM's 384 these
+        // follow a rule anyone can check rather than a lane boundary, and they
+        // are what makes eps=0.01 exist at all on these graphs: under the
+        // released-tau mechanism GQ4 wants 5 lanes on Facebook (3.25 TB) and 4
+        // on Wikipedia (2.30 TB), both above what a 2 TB machine can carry.
+        "facebook" | "wiki" => Some(2048),
         _ => None,
     }
 }
