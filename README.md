@@ -143,20 +143,11 @@ cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
 VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
-**3. DP-guided padding** for the three cyclic queries. `VPJOIN_EPS` takes one budget or a
-comma-separated list, so a single invocation sweeps the whole privacy budget curve:
+**3. DP-guided padding** for the three cyclic queries:
 
 ```bash
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
-
-A `query:dataset` argument pins one network, so `gq3:lastfm` runs one row where a bare `gq3`
-runs all three. Trim the budget list to what the machine can carry: the pad grows like
-`1/eps^2`, so the low end of the curve is the expensive end. At `eps=0.05` and above every
-graph row fits four lanes or fewer, at `eps=0.02` LastFM reaches fifteen, and at `eps=0.01`
-GQ4 asks for more prover memory than a 2 TB machine has on all three networks. Facebook and
-Wikipedia rows are k=22 and take 40 to 95 minutes per proof even at one lane, so budget days
-rather than hours for a wide sweep at `reps=3`.
 
 
 **4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
