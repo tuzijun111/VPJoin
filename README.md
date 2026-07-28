@@ -66,6 +66,7 @@ src/
   sql/            # TPC-H query circuits (Q3, Q5, Q8, Q9, Q18)
   graph_sql/      # Graph pattern query circuits (GQ1--GQ4)
   circuits/card_preserve.rs  # Cardinality Preservation Check
+  circuits/conserve_idx.rs   # indexed Conservation Check (revised One-Pass OBJ)
   data/           # TPC-H dataset files and parsing utilities
   graph_data/     # Network dataset files and parsing
   proof/          # Persisted public parameters (param15..param19) and some proof artifacts
@@ -138,6 +139,25 @@ database-commitment layer:
 cargo vpjoin full
 ```
 
+Every query ships two realizations of the gate. `VPJOIN_OBJ=new` selects the
+revised One-Pass OBJ (`src/sql/*_obj_new.rs`, `src/graph_sql/*_obj_new.rs`);
+unset, the harness proves the shipped four-condition circuit. Both prove the
+same statement over the same inputs at the same `k`, so the paired difference is
+the realization's cost. Several of the revised circuits sit one gate degree
+higher (8 against 7); that costs no FFT, since halo2 sizes the extended domain
+at the next power of two above `degree - 1` and 7, 8 and 9 all land on the same
+8x domain. Rows proved with it carry `+new` in the `config` column:
+
+```bash
+VPJOIN_OBJ=new cargo vpjoin simplification q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4
+```
+
+The variable is read by `cargo vpjoin` only. `cargo commit-diff` measures the
+commitment layer against the shipped circuits and ignores it.
+
+Prefix any of these with `VPJOIN_PLAN_ONLY=1` to print the planned degrees and
+check the parameter files exist without proving anything.
+
 
 **2. Additional in-circuit cost of binding a proof to a committed database.** The reported cost is the median paired difference:
 
@@ -154,6 +174,17 @@ VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```bash
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
+
+`VPJOIN_OBJ=new` works here too, at identical lane geometry and released
+capacity, so the paired difference isolates the gate rather than the padding:
+
+```bash
+VPJOIN_OBJ=new VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3
+```
+
+GQ4 is absent from that line on purpose: `g_sql4_obj_dp.rs` never materialized a
+partition, so it already realizes the revised conditions and there is only one
+circuit to run.
 
 
 **4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
@@ -184,4 +215,7 @@ VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-
 ```bash
 VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
+
+These go through `cargo vpjoin`, so prefixing any of them with `VPJOIN_OBJ=new`
+repeats the sweep on the revised gate.
 

@@ -25,6 +25,19 @@ where
     _marker: PhantomData<F>,
 }
 
+impl PermAnyConfig {
+    /// A config carrying only the two selectors, for callers that wire the
+    /// shuffle themselves (see `circuits::conserve_idx::configure_conserve_laned`).
+    pub fn bare(q_perm1: Selector, q_perm2: Selector) -> Self {
+        Self {
+            q_perm1,
+            q_perm2,
+            input: vec![],
+            table: vec![],
+        }
+    }
+}
+
 impl<'a, F: Field> PermAnyChip<F> {
     pub fn construct(config: PermAnyConfig) -> Self {
         Self {

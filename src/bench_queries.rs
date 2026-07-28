@@ -370,6 +370,15 @@ impl Timed {
 }
 
 /// Prove the query circuit unless we are only measuring the commitment layer.
+/// Which OBJ realization to prove, for the queries that ship more than one.
+/// `VPJOIN_OBJ=new` selects the revised One-Pass OBJ; anything else, including
+/// the variable being unset, keeps the shipped circuit.
+fn obj_variant() -> String {
+    std::env::var("VPJOIN_OBJ")
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
 fn maybe_run<C: Circuit<Fp>>(
     mode: Mode,
     label: &str,
@@ -1310,7 +1319,10 @@ pub fn graph_degree(query: &str, dataset: &str, privacy: Privacy) -> u32 {
 }
 
 fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
-    use crate::graph_sql::{g_sql1_obj, g_sql2_obj, g_sql3_obj, g_sql4_obj};
+    use crate::graph_sql::{
+        g_sql1_obj, g_sql1_obj_new, g_sql2_obj, g_sql2_obj_new, g_sql3_obj, g_sql3_obj_new,
+        g_sql4_obj, g_sql4_obj_new,
+    };
     use std::marker::PhantomData;
 
     let t_all = Instant::now();
@@ -1348,33 +1360,62 @@ fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         "gq1" => {
             let cnt = count_gq1(&edges);
             let ins = [Fp::from(cnt)];
-            let c = g_sql1_obj::Path3OrdCircuit::<Fp> {
+            let timed = if obj_variant() == "new" {
+                row.config = format!("{}+new", row.config);
+                let c = g_sql1_obj_new::Path3OrdCircuit::<Fp> {
                     edges,
                     _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
+            } else {
+                let c = g_sql1_obj::Path3OrdCircuit::<Fp> {
+                    edges,
+                    _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
             };
-            let timed = maybe_run(mode, &label, &c, &ins, k);
             (cnt, timed)
         }
         "gq2" => {
             let cnt = count_gq2(&edges);
             let ins = [Fp::from(cnt)];
-            let c = g_sql2_obj::GraphPath4OrderCircuit::<Fp> {
+            let timed = if obj_variant() == "new" {
+                row.config = format!("{}+new", row.config);
+                let c = g_sql2_obj_new::GraphPath4OrderCircuit::<Fp> {
                     edges,
                     _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
+            } else {
+                let c = g_sql2_obj::GraphPath4OrderCircuit::<Fp> {
+                    edges,
+                    _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
             };
-            let timed = maybe_run(mode, &label, &c, &ins, k);
             (cnt, timed)
         }
         "gq3" => {
             let cnt = count_gq3(&edges);
             let ins = [Fp::from(cnt)];
-            let c = g_sql3_obj::MyCircuit::<Fp> {
+            let timed = if obj_variant() == "new" {
+                row.config = format!("{}+new", row.config);
+                let c = g_sql3_obj_new::MyCircuit::<Fp> {
                     edges,
                     bag1_pad_extra: pad1,
                     bag2_pad_extra: pad2,
                     _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
+            } else {
+                let c = g_sql3_obj::MyCircuit::<Fp> {
+                    edges,
+                    bag1_pad_extra: pad1,
+                    bag2_pad_extra: pad2,
+                    _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
             };
-            let timed = maybe_run(mode, &label, &c, &ins, k);
             (cnt, timed)
         }
         "gq4" => {
@@ -1382,12 +1423,22 @@ fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let ins = [Fp::from(cnt)];
             // ONE bag, read in two column roles, so ONE pad knob. `graph_pads`
             // returns (pad1, pad1) for gq4 and the consumer reads .0 only.
-            let c = g_sql4_obj::MyCircuit::<Fp> {
+            let timed = if obj_variant() == "new" {
+                row.config = format!("{}+new", row.config);
+                let c = g_sql4_obj_new::MyCircuit::<Fp> {
                     edges,
                     pad_extra: pad1,
                     _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
+            } else {
+                let c = g_sql4_obj::MyCircuit::<Fp> {
+                    edges,
+                    pad_extra: pad1,
+                    _marker: PhantomData,
+                };
+                maybe_run(mode, &label, &c, &ins, k)
             };
-            let timed = maybe_run(mode, &label, &c, &ins, k);
             (cnt, timed)
         }
         other => panic!("unknown graph query {}", other),
@@ -1494,7 +1545,9 @@ fn require(name: &str, t: &[Vec<u64>]) {
 fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
     let k = degree_for(query, dataset, privacy);
     use crate::data::data_processing as dp;
-    use crate::sql::{q18_obj, q3_obj, q5_obj, q8_obj, q9_obj};
+    use crate::sql::{
+        q18_obj, q18_obj_new, q3_obj, q3_obj_new, q5_obj, q5_obj_new, q8_obj, q8_obj_new, q9_obj, q9_obj_new,
+    };
     use std::marker::PhantomData;
 
     let t_all = Instant::now();
@@ -1598,17 +1651,35 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let cols = transpose(&[&c, &o, &l]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
+                let condition = [
+                    string_to_u64("HOUSEHOLD"),
+                    date_to_timestamp("1995-03-25"),
+                ];
+                // VPJOIN_OBJ=new selects the revised One-Pass OBJ of
+                // `q3_obj_new.rs`, which certifies the split as one selector
+                // bit per committed row instead of a materialized partition.
+                // The two files prove the same statement over the same inputs,
+                // so the paired difference is the realization's cost.
+                if obj_variant() == "new" {
+                    row.config = format!("{}+new", row.config);
+                    let circuit = q3_obj_new::MyCircuit::<Fp> {
+                        customer: c,
+                        orders: o,
+                        lineitem: l,
+                        condition,
+                        _marker: PhantomData,
+                    };
+                    maybe_run(mode, &label, &circuit, &one, k)
+                } else {
                     let circuit = q3_obj::MyCircuit::<Fp> {
                         customer: c,
                         orders: o,
                         lineitem: l,
-                        condition: [
-                            string_to_u64("HOUSEHOLD"),
-                            date_to_timestamp("1995-03-25"),
-                        ],
+                        condition,
                         _marker: PhantomData,
                     };
                     maybe_run(mode, &label, &circuit, &one, k)
+                }
             })
         }
 
@@ -1643,6 +1714,28 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let cols = transpose(&[&c, &o, &l, &s, &n, &rg]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
+                // The revised gate keeps every capacity `q5_pads` returns, so
+                // the two variants prove the same statement at the same
+                // geometry and the paired difference is the realization's cost.
+                if obj_variant() == "new" {
+                    row.config = format!("{}+new", row.config);
+                    let circuit = q5_obj_new::MyCircuit::<Fp> {
+                        customer: c,
+                        orders: o,
+                        lineitem: l,
+                        supplier: s,
+                        nation: n,
+                        region: rg,
+                        europe_hash: string_to_u64("EUROPE"),
+                        start_ts: date_to_timestamp("1997-01-01"),
+                        end_ts: date_to_timestamp("1998-01-01"),
+                        nr_pad_extra: q5_pads(privacy).0,
+                        co_pad_extra: q5_pads(privacy).1,
+                        ls_pad_extra: q5_pads(privacy).2,
+                        _marker: PhantomData,
+                    };
+                    maybe_run(mode, &label, &circuit, &one, k)
+                } else {
                     let circuit = q5_obj::MyCircuit::<Fp> {
                         customer: c,
                         orders: o,
@@ -1660,6 +1753,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
                         _marker: PhantomData,
                     };
                     maybe_run(mode, &label, &circuit, &one, k)
+                }
             })
         }
 
@@ -1698,6 +1792,23 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let cols = transpose(&[&rg, &n, &c, &o, &p, &s, &l]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
+                if obj_variant() == "new" {
+                    row.config = format!("{}+new", row.config);
+                    let circuit = q8_obj_new::MyCircuit::<Fp> {
+                        region: rg,
+                        nation: n,
+                        customer: c,
+                        orders: o,
+                        part: p,
+                        supplier: s,
+                        lineitem: l,
+                        cond_nation_hash: string_to_u64_trim("EGYPT"),
+                        const_region_name_hash: string_to_u64_trim("MIDDLE EAST"),
+                        const_part_type_hash: string_to_u64_trim("PROMO BRUSHED COPPER"),
+                        _marker: PhantomData,
+                    };
+                    maybe_run(mode, &label, &circuit, &one, k)
+                } else {
                     let circuit = q8_obj::MyCircuit::<Fp> {
                         region: rg,
                         nation: n,
@@ -1712,6 +1823,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
                         _marker: PhantomData,
                     };
                     maybe_run(mode, &label, &circuit, &one, k)
+                }
             })
         }
 
@@ -1747,6 +1859,20 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let cols = transpose(&[&p, &s, &n, &o, &ps, &l]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
+                if obj_variant() == "new" {
+                    row.config = format!("{}+new", row.config);
+                    let circuit = q9_obj_new::MyCircuit::<Fp> {
+                        part: p,
+                        supplier: s,
+                        nation: n,
+                        orders: o,
+                        partsupp: ps,
+                        lineitem: l,
+                        cond_hash: string_to_u64("green"),
+                        _marker: PhantomData,
+                    };
+                    maybe_run(mode, &label, &circuit, &one, k)
+                } else {
                     let circuit = q9_obj::MyCircuit::<Fp> {
                         part: p,
                         supplier: s,
@@ -1758,6 +1884,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
                         _marker: PhantomData,
                     };
                     maybe_run(mode, &label, &circuit, &one, k)
+                }
             })
         }
 
@@ -1780,6 +1907,17 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let cols = transpose(&[&c, &o, &l]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
+                if obj_variant() == "new" {
+                    row.config = format!("{}+new", row.config);
+                    let circuit = q18_obj_new::MyCircuit::<Fp> {
+                        customer: c,
+                        orders: o,
+                        lineitem: l,
+                        threshold: 300,
+                        _marker: PhantomData,
+                    };
+                    maybe_run(mode, &label, &circuit, &one, k)
+                } else {
                     let circuit = q18_obj::MyCircuit::<Fp> {
                         customer: c,
                         orders: o,
@@ -1788,6 +1926,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
                         _marker: PhantomData,
                     };
                     maybe_run(mode, &label, &circuit, &one, k)
+                }
             })
         }
 

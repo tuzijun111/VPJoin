@@ -1,5 +1,6 @@
 pub mod add_carry_v1;
-pub mod card_preserve; // Cardinality Preservation Check: condition (4) of the One-Pass OBJ
+pub mod card_preserve; // Cardinality Preservation Check
+pub mod conserve_idx; // condition (1) of the revised One-Pass OBJ: the indexed Conservation Check
 pub mod add_carry_v2;
 pub mod add_carry_v3;
 mod equal_or_not;
