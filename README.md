@@ -22,16 +22,33 @@ materializing intermediate results.
 
 ### Oblivious Join Gate (OBJ) for Acyclic Joins
 
-OBJ verifies multi-way joins via semijoin-based structural checks along a join tree,
-achieving **worst-case O(IN + OUT) circuit complexity**. Since the circuit never creates
-intermediate results, its layout depends only on input table sizes, so **obliviousness is
-achieved entirely for free** with zero padding overhead. The gate enforces four properties:
+OBJ verifies multi-way joins via structural checks along a join tree, achieving
+**worst-case O(IN + OUT) circuit complexity**. Since the circuit never creates intermediate
+results, its layout depends only on input table sizes, so **obliviousness is achieved entirely
+for free** with zero padding overhead.
 
-- **Conservation** -- every original tuple appears in exactly one group (permutation argument)
-- **Disjointness** -- clean and residual groups share no tuples (non-membership check)
-- **Pairwise Consistency** -- clean tuples in neighboring relations agree on join keys (lookup arguments)
-- **Cardinality Preservation** -- the clean join and the input join have the same size, so no
-  valid join result hides among the residuals
+In the **One-Pass** gate the prover computes the semijoin reduction offline and supplies the
+resulting clean/residual split directly as witness; the circuit only certifies it. The split is
+stated over the *indexed* relation, in which every row carries its committed position `l` and
+the indicator `c(l)` marking the part it went to:
+
+```
+R^_i = { (l, t_l, c(l)) : l in [|R_i|] }
+```
+
+Three conditions certify it as the fully reduced instance:
+
+- **Conservation** -- `R^_i == R^_i^c U+ R^_i^r`, one permutation argument per relation between
+  the indexed relation and the concatenation of its two parts. Because the indices are distinct,
+  `R^_i` is a *set* even when `R_i` is a bag, so this single permutation already places every
+  occurrence on exactly one side: none fabricated, lost, duplicated, or counted in both. This is
+  where the gate saves against a value-level split, which needs a separate non-membership
+  argument to keep two equal tuples apart. Carrying `c` inside the conserved entry ties the
+  partition to the indicator column the other two conditions read.
+- **Pairwise Consistency** -- clean tuples in neighboring relations project to the same key set
+  on every tree edge, as two mutual membership checks gated by the indicator on both sides.
+- **Cardinality Preservation** -- the clean join and the predicate-filtered input join have the
+  same size, so no valid join result hides among the residuals.
 
 Cardinality preservation replaced an earlier residual-side condition, which asked only that a
 semijoin reduction over the residual relations empty at the root. That detects a join witness
@@ -39,8 +56,9 @@ lying entirely on the residual side but not one mixing clean and residual tuples
 wrongly moved to the residual whose join partners stay clean leaves no trace there at all. The
 current condition counts instead: the clean join is always contained in the input join, so equal
 cardinality forces the two to be the same multiset. Both cardinalities come from one traversal
-of the join tree carrying two multiplicities per tuple, one over the inputs and one over the
-clean instance, and a single equality constraint compares the two root sums.
+of the join tree carrying two multiplicities per tuple, anchored at the predicate bit on the
+input channel and at the indicator on the clean one, and a single equality constraint compares
+the two root sums.
 
 ### Aggregation Without Join Materialization
 
@@ -120,40 +138,31 @@ cargo build --release
 ## Running the Benchmarks
 
 
+`VPJOIN_OBJ=new` selects the three-condition One-Pass OBJ above
+(`src/sql/*_obj_new.rs`, `src/graph_sql/*_obj_new.rs`), which is what the
+commands below measure; rows proved with it carry `+new` in the `config` column.
+Dropping the variable falls back to the earlier four-condition realization
+(`*_obj.rs`), which is kept runnable so the two can be compared at the same `k`
+on the same inputs.
+
 **1. VPJoin proving time**, 5 TPC-H queries plus 4 graph queries on 3 datasets without
 the database-commitment layer:
 
 ```bash
-cargo vpjoin simplification
+VPJOIN_OBJ=new cargo vpjoin simplification
 ```
 
 Cyclic queries by revealing the true join results size.
 ```bash
-VPJOIN_PRIVACY=rjs cargo vpjoin simplification q5 gq3 gq4
+VPJOIN_OBJ=new VPJOIN_PRIVACY=rjs cargo vpjoin simplification q5 gq3 gq4
 ```
 
 The same harness proves the **full** system, query circuit plus the complete
 database-commitment layer:
 
 ```bash
-cargo vpjoin full
+VPJOIN_OBJ=new cargo vpjoin full
 ```
-
-Every query ships two realizations of the gate. `VPJOIN_OBJ=new` selects the
-revised One-Pass OBJ (`src/sql/*_obj_new.rs`, `src/graph_sql/*_obj_new.rs`);
-unset, the harness proves the shipped four-condition circuit. Both prove the
-same statement over the same inputs at the same `k`, so the paired difference is
-the realization's cost. Several of the revised circuits sit one gate degree
-higher (8 against 7); that costs no FFT, since halo2 sizes the extended domain
-at the next power of two above `degree - 1` and 7, 8 and 9 all land on the same
-8x domain. Rows proved with it carry `+new` in the `config` column:
-
-```bash
-VPJOIN_OBJ=new cargo vpjoin simplification q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4
-```
-
-The variable is read by `cargo vpjoin` only. `cargo commit-diff` measures the
-commitment layer against the shipped circuits and ignores it.
 
 Prefix any of these with `VPJOIN_PLAN_ONLY=1` to print the planned degrees and
 check the parameter files exist without proving anything.
@@ -169,22 +178,22 @@ cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
 VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
-**3. DP-guided padding** for the three cyclic queries:
+These two are the exception: `commit_diff` builds its own paired circuits
+(`inline_bind::tpch_paired` / `graph_paired`) rather than going through the
+shared query dispatch, so it measures the binding cost against the `*_obj.rs`
+circuits and ignores `VPJOIN_OBJ`. Moving it onto the revised gate needs a bound
+variant per query, not just the switch.
+
+**3. DP-guided padding** for the three cyclic queries. The lane geometry and every
+released capacity are the same under either realization, so the switch isolates the
+gate rather than the padding:
 
 ```bash
-VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+VPJOIN_OBJ=new VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
 
-`VPJOIN_OBJ=new` works here too, at identical lane geometry and released
-capacity, so the paired difference isolates the gate rather than the padding:
-
-```bash
-VPJOIN_OBJ=new VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3
-```
-
-GQ4 is absent from that line on purpose: `g_sql4_obj_dp.rs` never materialized a
-partition, so it already realizes the revised conditions and there is only one
-circuit to run.
+GQ4 runs the same circuit either way: `g_sql4_obj_dp.rs` never materialized a
+partition, so it already realizes the three conditions and has no `_new` sibling.
 
 
 **4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
@@ -193,29 +202,26 @@ only `lineitem` and holds the dimension tables at the base size, so the pair iso
 the dimension tables cost:
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/all_scaled/60K/data       VPJOIN_LABEL=all-60K       VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/all_scaled/60K/data       VPJOIN_LABEL=all-60K       VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/all_scaled/120K/data      VPJOIN_LABEL=all-120K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/all_scaled/120K/data      VPJOIN_LABEL=all-120K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/all_scaled/240K/data      VPJOIN_LABEL=all-240K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/all_scaled/240K/data      VPJOIN_LABEL=all-240K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/60K/data  VPJOIN_LABEL=lineitem-60K  VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/60K/data  VPJOIN_LABEL=lineitem-60K  VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-120K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-120K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
-
-These go through `cargo vpjoin`, so prefixing any of them with `VPJOIN_OBJ=new`
-repeats the sweep on the revised gate.
 
