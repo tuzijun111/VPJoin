@@ -18,63 +18,6 @@ all join work offline and supplies a witness marking which input tuples particip
 result. The circuit only *verifies* the witness through lightweight structural checks, never
 materializing intermediate results.
 
-## Key Contributions
-
-### Oblivious Join Gate (OBJ) for Acyclic Joins
-
-OBJ verifies multi-way joins via structural checks along a join tree, achieving
-**worst-case O(IN + OUT) circuit complexity**. Since the circuit never creates intermediate
-results, its layout depends only on input table sizes, so **obliviousness is achieved entirely
-for free** with zero padding overhead.
-
-In the **One-Pass** gate the prover computes the semijoin reduction offline and supplies the
-resulting clean/residual split directly as witness; the circuit only certifies it. The split is
-stated over the *indexed* relation, in which every row carries its committed position `l` and
-the indicator `c(l)` marking the part it went to:
-
-```
-R^_i = { (l, t_l, c(l)) : l in [|R_i|] }
-```
-
-Three conditions certify it as the fully reduced instance:
-
-- **Conservation** -- `R^_i == R^_i^c U+ R^_i^r`, one permutation argument per relation between
-  the indexed relation and the concatenation of its two parts. Because the indices are distinct,
-  `R^_i` is a *set* even when `R_i` is a bag, so this single permutation already places every
-  occurrence on exactly one side: none fabricated, lost, duplicated, or counted in both. This is
-  where the gate saves against a value-level split, which needs a separate non-membership
-  argument to keep two equal tuples apart. Carrying `c` inside the conserved entry ties the
-  partition to the indicator column the other two conditions read.
-- **Pairwise Consistency** -- clean tuples in neighboring relations project to the same key set
-  on every tree edge, as two mutual membership checks gated by the indicator on both sides.
-- **Cardinality Preservation** -- the clean join and the predicate-filtered input join have the
-  same size, so no valid join result hides among the residuals.
-
-Cardinality preservation replaced an earlier residual-side condition, which asked only that a
-semijoin reduction over the residual relations empty at the root. That detects a join witness
-lying entirely on the residual side but not one mixing clean and residual tuples, since a tuple
-wrongly moved to the residual whose join partners stay clean leaves no trace there at all. The
-current condition counts instead: the clean join is always contained in the input join, so equal
-cardinality forces the two to be the same multiset. Both cardinalities come from one traversal
-of the join tree carrying two multiplicities per tuple, anchored at the predicate bit on the
-input channel and at the indicator on the clean one, and a single equality constraint compares
-the two root sums.
-
-### Aggregation Without Join Materialization
-
-OBJ computes join-aggregates directly over compact clean relations via **tuple
-multiplicities**, keeping proof cost at O(IN + OUT) without ever constructing the full
-O(IN^k)-sized join result.
-
-### Tree-Decomposed Join Gate (TDJ) for Cyclic Joins
-
-TDJ extends OBJ to cyclic queries via **tree decomposition**: intra-cluster joins are
-materialized at fixed capacities and the acyclic inter-cluster structure is verified by OBJ.
-In its default mode the capacities are worst-case bounds, so cyclic queries remain **fully
-oblivious**. As an *optional* relaxation, **DP-guided padding** sets each capacity with a
-one-sided noise mechanism that always exceeds the true size (preserving correctness) while
-giving formal (epsilon, delta)-differential privacy for the intermediate cardinalities.
-
 ## Project Structure
 
 ```
