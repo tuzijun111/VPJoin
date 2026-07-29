@@ -1,68 +1,15 @@
-//! TPC-H Q3 under the revised One-Pass OBJ.
-//!
-//! `q3_obj.rs` realizes the earlier four-condition gate, in which the prover
-//! hands the circuit a *materialized* clean/residual split and the circuit
-//! re-establishes its relationship to the inputs with a Conservation Check per
-//! relation (a shuffle between the predicate-filtered rows and the
-//! `[clean | residual | pad]` column group) and a Non-Membership Check between
-//! the two sides. This file realizes the revised gate, in which the certified
-//! object is one bit per committed row:
-//!
-//!   R_i^c := { t in R_i : c(t) = 1 },   R_i^r := { t in R_i : c(t) = 0 }
-//!
-//! Selection is by position, so the split partitions the input occurrences by
-//! construction: no row can be fabricated, dropped or placed on both sides, and
-//! two copies of the same tuple value carry independent bits. Conservation and
-//! Non-Membership have nothing left to check and are gone, together with the
-//! twelve join/disjoin columns and the twenty-six shuffle-pad columns that
-//! carried them. Three conditions remain, all over the committed rows:
-//!
-//!   (1) Selector Check
-//!         c(t) (1 - c(t)) = 0   and   c(t) (1 - b(t)) = 0,  for all t in R_i
-//!   (2) Pairwise Consistency Check
-//!         pi_K(R_i^c) == pi_K(R_j^c),  for every edge (R_i, R_j) of T
-//!   (3) Cardinality Preservation Check
-//!         sum_root mu^cln == sum_root mu^all
-//!
-//! `b(t)` is the certified truth value of the relation's in-relation
-//! predicate, which this circuit already evaluates per row (`check`). The
-//! second half of (1) is what makes the input-side channel of (3) count the
-//! join of the *predicate-filtered* inputs rather than of the raw inputs:
-//! without it a prover could select a row that fails its WHERE clause, and no
-//! other condition would notice.
-//!
-//! The two multiplicity channels of (3) are anchored at `b` and at `c`
-//! respectively and are carried by `circuits::card_preserve`, unchanged from
-//! `q3_obj.rs` except that the clean channel now reads the selector column
-//! directly instead of the `keep * cflag` product that the filtered column
-//! group used to hold: with the predicate gate of (1) in force, `c <= b`, so
-//! the two are the same value.
-//!
-//! The operators above the gate read the clean instance off the same committed
-//! rows. The group-by that produces the answer sorts a key column masked by the
-//! selector, `c ? l_orderkey : PAD`, so a deselected row keeps its place in the
-//! relation, joins the trailing PAD run of the sorted view and emits nothing,
-//! while a clean orderkey still occupies exactly one contiguous group.
-//!
-//! One consequence worth recording: every selector in this file is enabled on a
-//! prefix whose length is one of |customer|, |orders|, |lineitem|. In
-//! `q3_obj.rs` the join/disjoin sections, the sorted lineitem view and the
-//! emitted result were all as long as the *clean* part, so the fixed columns of
-//! the circuit, hence its verifying key, depended on the reduction's
-//! selectivity. Here they do not.
-
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
-use crate::circuits::conserve_idx::{
-    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
-    RowIndexConfig,
-};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
 };
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -107,7 +54,7 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     orders: Vec<Column<Advice>>,   // 4: [o_orderdate, o_shippriority, o_custkey, o_orderkey]
     lineitem: Vec<Column<Advice>>, // 4: [l_orderkey, l_extendedprice, l_discount, l_shipdate]
 
-    check: Vec<Column<Advice>>,     // 3: the predicate bit b of each relation
+    check: Vec<Column<Advice>>, // 3: the predicate bit b of each relation
     condition: Vec<Column<Advice>>, // 3: the query parameters
 
     // the query parameters are advice, so they are pinned per proof rather than
@@ -121,7 +68,7 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     // single permutation per relation places every occurrence on exactly one
     // side and binds `cflag` to the split the other two conditions read.
     row_idx: RowIndexConfig,
-    cons: Vec<ConserveConfig>, // [customer, orders, lineitem]
+    cons: Vec<ConserveConfig>,  // [customer, orders, lineitem]
     cflag: Vec<Column<Advice>>, // the indicator c, one column per relation
 
     lt_compare_condition: Vec<LtConfig<F, NUM_BYTES>>,
@@ -229,7 +176,10 @@ fn build_witness(
         .iter()
         .map(|c| (c[0] == condition[0]) as u64)
         .collect();
-    let o_check: Vec<u64> = orders.iter().map(|o| (o[0] < condition[1]) as u64).collect();
+    let o_check: Vec<u64> = orders
+        .iter()
+        .map(|o| (o[0] < condition[1]) as u64)
+        .collect();
     let l_check: Vec<u64> = lineitem
         .iter()
         .map(|l| (l[3] > condition[1]) as u64)
@@ -978,13 +928,11 @@ impl<F: Field + Ord> TestChip<F> {
 
                 vec![
                     (
-                        gate.clone()
-                            * (m.query_advice(rp[0], Rotation::cur()) + one.clone()),
+                        gate.clone() * (m.query_advice(rp[0], Rotation::cur()) + one.clone()),
                         tbl.clone() * (m.query_advice(ok_col, Rotation::cur()) + one.clone()),
                     ),
                     (
-                        gate.clone()
-                            * (m.query_advice(rp[1], Rotation::cur()) + one.clone()),
+                        gate.clone() * (m.query_advice(rp[1], Rotation::cur()) + one.clone()),
                         tbl.clone() * (m.query_advice(od_col, Rotation::cur()) + one.clone()),
                     ),
                     (
@@ -1268,18 +1216,11 @@ impl<F: Field + Ord> TestChip<F> {
                 // The indexed relation against the two parts. Nothing else has
                 // to be assigned for it: the entries are the committed rows and
                 // the indicator, both already written above.
-                assign_row_index(
-                    &mut region,
-                    &self.config.row_idx,
-                    n_c.max(n_o).max(n_l),
-                )?;
-                for (idx, (rows, flags)) in [
-                    (&customer, &cln_c),
-                    (&orders, &cln_o),
-                    (&lineitem, &cln_l),
-                ]
-                .into_iter()
-                .enumerate()
+                assign_row_index(&mut region, &self.config.row_idx, n_c.max(n_o).max(n_l))?;
+                for (idx, (rows, flags)) in
+                    [(&customer, &cln_c), (&orders, &cln_o), (&lineitem, &cln_l)]
+                        .into_iter()
+                        .enumerate()
                 {
                     assign_conserve(&mut region, &self.config.cons[idx], rows, flags)?;
                 }
@@ -1549,7 +1490,11 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
         TestChip::configure(meta)
     }
 
-    fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
         let chip = TestChip::construct(config);
 
         let out_cell = chip.assign(
@@ -1686,9 +1631,9 @@ mod tests {
         let mut orders: Vec<Vec<u64>> = Vec::new();
         let mut lineitem: Vec<Vec<u64>> = Vec::new();
 
-        if let Ok(records) =
-            data_processing::customer_read_records_from_file(&crate::paths::data_file("customer.tbl"))
-        {
+        if let Ok(records) = data_processing::customer_read_records_from_file(
+            &crate::paths::data_file("customer.tbl"),
+        ) {
             customer = records
                 .iter()
                 .take(N_CUST)
@@ -1711,9 +1656,9 @@ mod tests {
                 })
                 .collect();
         }
-        if let Ok(records) =
-            data_processing::lineitem_read_records_from_file(&crate::paths::data_file("lineitem.tbl"))
-        {
+        if let Ok(records) = data_processing::lineitem_read_records_from_file(
+            &crate::paths::data_file("lineitem.tbl"),
+        ) {
             lineitem = records
                 .iter()
                 .take(N_LINE)
@@ -1751,9 +1696,9 @@ mod tests {
         let mut orders: Vec<Vec<u64>> = Vec::new();
         let mut lineitem: Vec<Vec<u64>> = Vec::new();
 
-        if let Ok(records) =
-            data_processing::customer_read_records_from_file(&crate::paths::data_file("customer.tbl"))
-        {
+        if let Ok(records) = data_processing::customer_read_records_from_file(
+            &crate::paths::data_file("customer.tbl"),
+        ) {
             customer = records
                 .iter()
                 .map(|record| vec![string_to_u64(&record.c_mktsegment), record.c_custkey])
@@ -1774,9 +1719,9 @@ mod tests {
                 })
                 .collect();
         }
-        if let Ok(records) =
-            data_processing::lineitem_read_records_from_file(&crate::paths::data_file("lineitem.tbl"))
-        {
+        if let Ok(records) = data_processing::lineitem_read_records_from_file(
+            &crate::paths::data_file("lineitem.tbl"),
+        ) {
             lineitem = records
                 .iter()
                 .map(|record| {

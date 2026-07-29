@@ -1,50 +1,15 @@
-//! TPC-H Q9 under the revised One-Pass OBJ.
-//!
-//! `q9_obj.rs` realizes the earlier four-condition gate: the prover materializes
-//! a `[clean | residual | pad]` group per relation and a Conservation Check per
-//! relation ties it back to the committed rows. This file realizes the revised
-//! gate, in which the certified object is one selector bit per committed row.
-//! The split then partitions the input occurrences by construction, so
-//! Conservation and Non-Membership have nothing left to check and the six
-//! partition groups, their six shuffles and the whole pad-section bookkeeping
-//! disappear. Three conditions remain:
-//!
-//!   (1) Selector Check          c(1-c) = 0  and  c(1-b) = 0
-//!   (2) Pairwise Consistency    pi_K(R_i^c) == pi_K(R_j^c) on all five edges
-//!   (3) Cardinality Preservation  the two root sums agree
-//!
-//! Only `part` carries an in-relation predicate, so `b = p_keep` there and
-//! `b == 1` on the other five relations.
-//!
-//! Two consequences worth recording.
-//!
-//! The KNOWN DESIGN GAP `q9_obj.rs` documents on its Pairwise Consistency
-//! selectors is closed here. There, the ten lookups were gated by selectors
-//! whose enabled range was the clean prefix of a partition group, so a
-//! malicious circuit GENERATOR could publish a vk with all six ranges empty and
-//! make the condition vacuous. Here the gating factor is the committed selector
-//! COLUMN, which the Cardinality Preservation Check reads on the same rows, and
-//! the fixed selectors only mark the relation's real rows, a function of
-//! |R_i| alone.
-//!
-//! The aggregation moves from the clean prefix of `l_join_pad` onto the
-//! committed lineitem rows. A deselected row keeps its place, its profit triple
-//! is masked to the canonical PAD triple, and it joins the trailing PAD run of
-//! the sorted view, which emits the result pad triple and is dropped by the
-//! result shuffle exactly as the old pad section was.
-
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
-use crate::circuits::conserve_idx::{
-    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
-    RowIndexConfig,
-};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
 };
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -234,10 +199,10 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     // Cardinality Preservation Check, the Pairwise Consistency lookups and the
     // partsupp attach lookup alike, which is what lets `q9_obj.rs`'s separate
     // `l_pw_pskey` / `s_pw_nkey` / `n_pw_key` and `l_ps_key` all disappear.
-    n_key_cp: Column<Advice>, // n_nationkey + NAT_SHIFT, on nation rows
-    s_nkey_cp: Column<Advice>, // s_nationkey + NAT_SHIFT, on supplier rows
+    n_key_cp: Column<Advice>,    // n_nationkey + NAT_SHIFT, on nation rows
+    s_nkey_cp: Column<Advice>,   // s_nationkey + NAT_SHIFT, on supplier rows
     l_ps_key_cp: Column<Advice>, // packed partsupp key, on base lineitem rows
-    v_all_s: Column<Advice>, // supplier is internal: its two multiplicities
+    v_all_s: Column<Advice>,     // supplier is internal: its two multiplicities
     v_cln_s: Column<Advice>,
     t_all: Column<Advice>, // the four root sigmas, folded pairwise per channel
     u_all: Column<Advice>,
@@ -261,7 +226,6 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     q_cp_nat: Selector, // nation rows: shifted key
     q_cp_sup: Selector, // supplier rows: shifted key and the two multiplicities
     q_cp_mu: Selector,  // lineitem rows: packed key and the two root products
-
 }
 
 #[derive(Clone, Debug)]
@@ -523,8 +487,10 @@ impl<F: Field + Ord> TestChip<F> {
         // Orders: (l_orderkey, l_year) in the selected orders
         meta.lookup_any("attach year from orders", |m| {
             let one = Expression::Constant(F::ONE);
-            let q_in = m.query_selector(q_lkp_orders) * m.query_advice(cflag[R_LINE], Rotation::cur());
-            let q_t = m.query_selector(q_row[R_ORD]) * m.query_advice(cflag[R_ORD], Rotation::cur());
+            let q_in =
+                m.query_selector(q_lkp_orders) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t =
+                m.query_selector(q_row[R_ORD]) * m.query_advice(cflag[R_ORD], Rotation::cur());
             vec![
                 (
                     q_in.clone() * (m.query_advice(lineitem[0], Rotation::cur()) + one.clone()),
@@ -540,8 +506,10 @@ impl<F: Field + Ord> TestChip<F> {
         // Supplier: (l_suppkey, l_nationkey) in the selected suppliers
         meta.lookup_any("attach nationkey from supplier", |m| {
             let one = Expression::Constant(F::ONE);
-            let q_in = m.query_selector(q_lkp_supplier) * m.query_advice(cflag[R_LINE], Rotation::cur());
-            let q_t = m.query_selector(q_row[R_SUPP]) * m.query_advice(cflag[R_SUPP], Rotation::cur());
+            let q_in =
+                m.query_selector(q_lkp_supplier) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t =
+                m.query_selector(q_row[R_SUPP]) * m.query_advice(cflag[R_SUPP], Rotation::cur());
             vec![
                 (
                     q_in.clone() * (m.query_advice(lineitem[2], Rotation::cur()) + one.clone()),
@@ -557,8 +525,10 @@ impl<F: Field + Ord> TestChip<F> {
         // Nation: (l_nationkey, l_nationname) in the selected nations
         meta.lookup_any("attach nation name from nation", |m| {
             let one = Expression::Constant(F::ONE);
-            let q_in = m.query_selector(q_lkp_nation) * m.query_advice(cflag[R_LINE], Rotation::cur());
-            let q_t = m.query_selector(q_row[R_NAT]) * m.query_advice(cflag[R_NAT], Rotation::cur());
+            let q_in =
+                m.query_selector(q_lkp_nation) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t =
+                m.query_selector(q_row[R_NAT]) * m.query_advice(cflag[R_NAT], Rotation::cur());
             vec![
                 (
                     q_in.clone() * (m.query_advice(l_nationkey, Rotation::cur()) + one.clone()),
@@ -629,7 +599,8 @@ impl<F: Field + Ord> TestChip<F> {
         // the same packed key column the propagation uses.
         meta.lookup_any("attach supplycost from partsupp", |m| {
             let one = Expression::Constant(F::ONE);
-            let q_in = m.query_selector(q_lkp_partsupp) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_in =
+                m.query_selector(q_lkp_partsupp) * m.query_advice(cflag[R_LINE], Rotation::cur());
             let q_t = m.query_selector(q_row[R_PS]) * m.query_advice(cflag[R_PS], Rotation::cur());
             vec![
                 (
@@ -687,46 +658,106 @@ impl<F: Field + Ord> TestChip<F> {
             };
 
             // edge lineitem - part, on l_partkey = p_partkey
-            pw_edge("pw: lineitem^c partkey in part^c",
-                q_row[R_LINE], cflag[R_LINE], lineitem[1],
-                q_row[R_PART], cflag[R_PART], part[0]);
-            pw_edge("pw: part^c partkey in lineitem^c",
-                q_row[R_PART], cflag[R_PART], part[0],
-                q_row[R_LINE], cflag[R_LINE], lineitem[1]);
+            pw_edge(
+                "pw: lineitem^c partkey in part^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[1],
+                q_row[R_PART],
+                cflag[R_PART],
+                part[0],
+            );
+            pw_edge(
+                "pw: part^c partkey in lineitem^c",
+                q_row[R_PART],
+                cflag[R_PART],
+                part[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[1],
+            );
 
             // edge lineitem - orders, on l_orderkey = o_orderkey
-            pw_edge("pw: lineitem^c orderkey in orders^c",
-                q_row[R_LINE], cflag[R_LINE], lineitem[0],
-                q_row[R_ORD], cflag[R_ORD], orders[0]);
-            pw_edge("pw: orders^c orderkey in lineitem^c",
-                q_row[R_ORD], cflag[R_ORD], orders[0],
-                q_row[R_LINE], cflag[R_LINE], lineitem[0]);
+            pw_edge(
+                "pw: lineitem^c orderkey in orders^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[0],
+                q_row[R_ORD],
+                cflag[R_ORD],
+                orders[0],
+            );
+            pw_edge(
+                "pw: orders^c orderkey in lineitem^c",
+                q_row[R_ORD],
+                cflag[R_ORD],
+                orders[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[0],
+            );
 
             // edge lineitem - partsupp, on the packed (partkey, suppkey)
-            pw_edge("pw: lineitem^c ps_key in partsupp^c",
-                q_row[R_LINE], cflag[R_LINE], l_ps_key_cp,
-                q_row[R_PS], cflag[R_PS], partsupp[0]);
-            pw_edge("pw: partsupp^c ps_key in lineitem^c",
-                q_row[R_PS], cflag[R_PS], partsupp[0],
-                q_row[R_LINE], cflag[R_LINE], l_ps_key_cp);
+            pw_edge(
+                "pw: lineitem^c ps_key in partsupp^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                l_ps_key_cp,
+                q_row[R_PS],
+                cflag[R_PS],
+                partsupp[0],
+            );
+            pw_edge(
+                "pw: partsupp^c ps_key in lineitem^c",
+                q_row[R_PS],
+                cflag[R_PS],
+                partsupp[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                l_ps_key_cp,
+            );
 
             // edge lineitem - supplier, on l_suppkey = s_suppkey
-            pw_edge("pw: lineitem^c suppkey in supplier^c",
-                q_row[R_LINE], cflag[R_LINE], lineitem[2],
-                q_row[R_SUPP], cflag[R_SUPP], supplier[0]);
-            pw_edge("pw: supplier^c suppkey in lineitem^c",
-                q_row[R_SUPP], cflag[R_SUPP], supplier[0],
-                q_row[R_LINE], cflag[R_LINE], lineitem[2]);
+            pw_edge(
+                "pw: lineitem^c suppkey in supplier^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[2],
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                supplier[0],
+            );
+            pw_edge(
+                "pw: supplier^c suppkey in lineitem^c",
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                supplier[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[2],
+            );
 
             // edge supplier - nation, on the shifted s_nationkey = n_nationkey.
             // The NAT_SHIFT of both columns cancels, so the containment is the
             // one on the raw nation keys.
-            pw_edge("pw: supplier^c nationkey in nation^c",
-                q_row[R_SUPP], cflag[R_SUPP], s_nkey_cp,
-                q_row[R_NAT], cflag[R_NAT], n_key_cp);
-            pw_edge("pw: nation^c nationkey in supplier^c",
-                q_row[R_NAT], cflag[R_NAT], n_key_cp,
-                q_row[R_SUPP], cflag[R_SUPP], s_nkey_cp);
+            pw_edge(
+                "pw: supplier^c nationkey in nation^c",
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                s_nkey_cp,
+                q_row[R_NAT],
+                cflag[R_NAT],
+                n_key_cp,
+            );
+            pw_edge(
+                "pw: nation^c nationkey in supplier^c",
+                q_row[R_NAT],
+                cflag[R_NAT],
+                n_key_cp,
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                s_nkey_cp,
+            );
         }
 
         // Leaves. Part's input channel is its predicate bit and its clean
@@ -1247,7 +1278,6 @@ impl<F: Field + Ord> TestChip<F> {
             q_lkp_nation,
             q_lkp_partsupp,
 
-
             instance,
             instance_test,
 
@@ -1281,7 +1311,6 @@ impl<F: Field + Ord> TestChip<F> {
             q_cp_nat,
             q_cp_sup,
             q_cp_mu,
-
         }
     }
 

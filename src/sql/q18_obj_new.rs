@@ -1,27 +1,3 @@
-//! TPC-H Q18 under the revised One-Pass OBJ.
-//!
-//! `q18_obj.rs` realizes the earlier four-condition gate, in which the prover
-//! hands the circuit a materialized `[clean | residual]` block per relation and
-//! a Conservation Check re-establishes its relationship to the committed rows.
-//! This file realizes the revised gate: the certified object is one selector
-//! bit per committed row, so the split partitions the input occurrences by
-//! construction and Conservation and Non-Membership have nothing left to check.
-//! Three conditions remain:
-//!
-//!   (1) Selector Check          c(1-c) = 0  and  c(1-b) = 0
-//!   (2) Pairwise Consistency    pi_K(R_i^c) == pi_K(R_j^c) per tree edge
-//!   (3) Cardinality Preservation  the two root sums agree
-//!
-//! Q18 carries no in-relation predicate, so `b == 1` on every row and the
-//! predicate half of (1) is vacuous here; the booleanity gate is the whole of
-//! the Selector Check. (3) is unchanged from `q18_obj.rs`, which already
-//! anchored the clean channel at the indicator and the input channel at 1.
-//!
-//! What moves is (2) and the two attribute lookups. Both now read the committed
-//! relations gated by the selector, `q_row * c(t) * (v + 1)`, instead of the
-//! clean prefix of a materialized block. The group-by over lineitem is
-//! untouched: it already covered every committed row.
-
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 use std::collections::HashSet;
@@ -31,13 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
-use crate::circuits::conserve_idx::{
-    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
-    RowIndexConfig,
-};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
 };
 
 const NUM_BYTES: usize = 5;
@@ -109,7 +85,7 @@ pub struct Q18Config<F: Field + Ord> {
 
     // having: threshold < group_sum (only on last row)
     lt_thresh_sum: LtConfig<F, NUM_BYTES>,
-    heavy: Column<Advice>, // boolean on last rows (else can be 0)
+    heavy: Column<Advice>,     // boolean on last rows (else can be 0)
     emit_flag: Column<Advice>, // is_last * heavy, materialized to hold the degree
 
     // result (padded, length = n_lineitem rows)
@@ -131,7 +107,7 @@ pub struct Q18Config<F: Field + Ord> {
     // ---------------- (1) Conservation Check ----------------
     // R^_i == R^_i^c U+ R^_i^r over the INDEXED relation, one permutation each
     row_idx: RowIndexConfig,
-    cons: Vec<ConserveConfig>, // [customer, orders, lineitem]
+    cons: Vec<ConserveConfig>,  // [customer, orders, lineitem]
     cflag: Vec<Column<Advice>>, // the indicator c per committed row
     // one complex selector per relation over its committed rows. It gates both
     // sides of every Pairwise Consistency lookup, the table side of the two

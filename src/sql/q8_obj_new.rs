@@ -1,65 +1,15 @@
-//! TPC-H Q8 under the revised One-Pass OBJ.
-//!
-//! `q8_obj.rs` realizes the earlier four-condition gate: eight materialized
-//! `[clean | residual | pad]` groups, one Conservation Check each, plus the
-//! pad-section pins those groups need. This file realizes the revised gate, in
-//! which the certified object is one selector bit per committed row. The split
-//! then partitions the input occurrences by construction, so Conservation and
-//! Non-Membership have nothing left to check and all eight groups, their eight
-//! shuffles and the three pad-section gates go away. Three conditions remain:
-//!
-//!   (1) Selector Check          c(1-c) = 0  and  c(1-b) = 0
-//!   (2) Pairwise Consistency    pi_K(R_i^c) == pi_K(R_j^c) on all seven edges
-//!   (3) Cardinality Preservation  the two root sums agree
-//!
-//! region, orders and part carry an in-relation predicate, so `b` is `r_keep`,
-//! `o_keep` and `p_keep` there and `b == 1` on the other five nodes. nation
-//! appears twice in the join tree, as n1 under region and as n2 under supplier,
-//! and each occurrence carries its own bit column over the shared rows.
-//!
-//! Two consequences. The fourteen Pairwise Consistency lookups now read the
-//! committed key columns gated by the bit instead of the clean prefix of a
-//! group, so no clean-section extent reaches the fixed columns and the verifying
-//! key no longer depends on the reduction's selectivity. And the aggregation
-//! moves from the clean prefix of `l_join_pad` onto the committed lineitem rows:
-//! a deselected row keeps its place and its `all_nations` triple is masked to
-//! the canonical PAD triple, which is what `q8_obj.rs` pinned its pad section to.
-//!
-//! Halo2 “object-style” circuit for TPC-H Query 8 (simplified):
-//
-// - We treat `o_year` as a preprocessed integer input (you said we may simplify/ignore extract()).
-// - Date filter is approximated by `o_year ∈ {1995, 1996}`.
-// - volume is computed in scaled integers: vol = l_extendedprice * (SCALE - l_discount)
-//   (both extprice and discount are expected pre-scaled by SCALE=1000).
-// - mkt_share is proved as a field fraction: share * den == num
-//   (no fixed-point conversion; ratio is still correct because both sums share the same scaling).
-//
-// Tables expected (as Vec<Vec<u64>>):
-// region   : [r_regionkey, r_name_hash]
-// nation   : [n_nationkey, n_regionkey, n_name_hash]
-// customer : [c_custkey, c_nationkey]
-// orders   : [o_orderkey, o_custkey, o_year]
-// part     : [p_partkey, p_type_hash]
-// supplier : [s_suppkey, s_nationkey]
-// lineitem : [l_orderkey, l_partkey, l_suppkey, l_extendedprice_scaled, l_discount_scaled]
-//
-// Parameter inputs:
-// - cond_nation_hash        (':1' in query)
-// - const_region_name_hash  (hash("MIDDLE EAST"))
-// - const_part_type_hash    (hash("PROMO BRUSHED COPPER"))
-
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
-use crate::circuits::conserve_idx::{
-    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
-    RowIndexConfig,
-};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
 };
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -1206,46 +1156,144 @@ impl<F: Field + Ord> TestChip<F> {
         };
 
         // edge lineitem -- part on l_partkey = p_partkey
-        pw_edge("pw: lineitem^c partkey in part^c",
-            q_row[7], cflag[7], lineitem[1], q_row[5], cflag[5], part[0]);
-        pw_edge("pw: part^c partkey in lineitem^c",
-            q_row[5], cflag[5], part[0], q_row[7], cflag[7], lineitem[1]);
+        pw_edge(
+            "pw: lineitem^c partkey in part^c",
+            q_row[7],
+            cflag[7],
+            lineitem[1],
+            q_row[5],
+            cflag[5],
+            part[0],
+        );
+        pw_edge(
+            "pw: part^c partkey in lineitem^c",
+            q_row[5],
+            cflag[5],
+            part[0],
+            q_row[7],
+            cflag[7],
+            lineitem[1],
+        );
 
         // edge lineitem -- orders on l_orderkey = o_orderkey
-        pw_edge("pw: lineitem^c orderkey in orders^c",
-            q_row[7], cflag[7], lineitem[0], q_row[4], cflag[4], orders[0]);
-        pw_edge("pw: orders^c orderkey in lineitem^c",
-            q_row[4], cflag[4], orders[0], q_row[7], cflag[7], lineitem[0]);
+        pw_edge(
+            "pw: lineitem^c orderkey in orders^c",
+            q_row[7],
+            cflag[7],
+            lineitem[0],
+            q_row[4],
+            cflag[4],
+            orders[0],
+        );
+        pw_edge(
+            "pw: orders^c orderkey in lineitem^c",
+            q_row[4],
+            cflag[4],
+            orders[0],
+            q_row[7],
+            cflag[7],
+            lineitem[0],
+        );
 
         // edge lineitem -- supplier on l_suppkey = s_suppkey
-        pw_edge("pw: lineitem^c suppkey in supplier^c",
-            q_row[7], cflag[7], lineitem[2], q_row[6], cflag[6], supplier[0]);
-        pw_edge("pw: supplier^c suppkey in lineitem^c",
-            q_row[6], cflag[6], supplier[0], q_row[7], cflag[7], lineitem[2]);
+        pw_edge(
+            "pw: lineitem^c suppkey in supplier^c",
+            q_row[7],
+            cflag[7],
+            lineitem[2],
+            q_row[6],
+            cflag[6],
+            supplier[0],
+        );
+        pw_edge(
+            "pw: supplier^c suppkey in lineitem^c",
+            q_row[6],
+            cflag[6],
+            supplier[0],
+            q_row[7],
+            cflag[7],
+            lineitem[2],
+        );
 
         // edge supplier -- nation as n2 on s_nationkey = n_nationkey
-        pw_edge("pw: supplier^c nationkey in nation2^c",
-            q_row[6], cflag[6], supplier[1], q_row[2], cflag[2], nation[0]);
-        pw_edge("pw: nation2^c nationkey in supplier^c",
-            q_row[2], cflag[2], nation[0], q_row[6], cflag[6], supplier[1]);
+        pw_edge(
+            "pw: supplier^c nationkey in nation2^c",
+            q_row[6],
+            cflag[6],
+            supplier[1],
+            q_row[2],
+            cflag[2],
+            nation[0],
+        );
+        pw_edge(
+            "pw: nation2^c nationkey in supplier^c",
+            q_row[2],
+            cflag[2],
+            nation[0],
+            q_row[6],
+            cflag[6],
+            supplier[1],
+        );
 
         // edge orders -- customer on o_custkey = c_custkey
-        pw_edge("pw: orders^c custkey in customer^c",
-            q_row[4], cflag[4], orders[1], q_row[3], cflag[3], customer[0]);
-        pw_edge("pw: customer^c custkey in orders^c",
-            q_row[3], cflag[3], customer[0], q_row[4], cflag[4], orders[1]);
+        pw_edge(
+            "pw: orders^c custkey in customer^c",
+            q_row[4],
+            cflag[4],
+            orders[1],
+            q_row[3],
+            cflag[3],
+            customer[0],
+        );
+        pw_edge(
+            "pw: customer^c custkey in orders^c",
+            q_row[3],
+            cflag[3],
+            customer[0],
+            q_row[4],
+            cflag[4],
+            orders[1],
+        );
 
         // edge customer -- nation as n1 on c_nationkey = n_nationkey
-        pw_edge("pw: customer^c nationkey in nation1^c",
-            q_row[3], cflag[3], customer[1], q_row[1], cflag[1], nation[0]);
-        pw_edge("pw: nation1^c nationkey in customer^c",
-            q_row[1], cflag[1], nation[0], q_row[3], cflag[3], customer[1]);
+        pw_edge(
+            "pw: customer^c nationkey in nation1^c",
+            q_row[3],
+            cflag[3],
+            customer[1],
+            q_row[1],
+            cflag[1],
+            nation[0],
+        );
+        pw_edge(
+            "pw: nation1^c nationkey in customer^c",
+            q_row[1],
+            cflag[1],
+            nation[0],
+            q_row[3],
+            cflag[3],
+            customer[1],
+        );
 
         // edge nation as n1 -- region on n_regionkey = r_regionkey
-        pw_edge("pw: nation1^c regionkey in region^c",
-            q_row[1], cflag[1], nation[1], q_row[0], cflag[0], region[0]);
-        pw_edge("pw: region^c regionkey in nation1^c",
-            q_row[0], cflag[0], region[0], q_row[1], cflag[1], nation[1]);
+        pw_edge(
+            "pw: nation1^c regionkey in region^c",
+            q_row[1],
+            cflag[1],
+            nation[1],
+            q_row[0],
+            cflag[0],
+            region[0],
+        );
+        pw_edge(
+            "pw: region^c regionkey in nation1^c",
+            q_row[0],
+            cflag[0],
+            region[0],
+            q_row[1],
+            cflag[1],
+            nation[1],
+        );
 
         // ============ Cardinality Preservation Check (condition (4)) ============
         // Two of the seven edges are keyed on a 0-based id, so both of their
@@ -1323,14 +1371,8 @@ impl<F: Field + Ord> TestChip<F> {
         // ---- the branch region <- nation as n1 <- customer <- orders ----
         // region is a leaf: the input channel is its predicate bit and the clean
         // channel is the bound keep * c column of its Conservation Check.
-        let cp_agg_region = configure_cp_agg::<F, NUM_BYTES>(
-            meta,
-            cp_u8,
-            rk_shift,
-            r_keep,
-            cflag[0],
-            MAX_SENTINEL,
-        );
+        let cp_agg_region =
+            configure_cp_agg::<F, NUM_BYTES>(meta, cp_u8, rk_shift, r_keep, cflag[0], MAX_SENTINEL);
         let cp_join_region = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, n_rk_shift);
         wire_cp_edge(meta, &cp_join_region, &cp_agg_region, n_rk_shift);
 
@@ -1454,14 +1496,8 @@ impl<F: Field + Ord> TestChip<F> {
         wire_cp_edge(meta, &cp_join_supp, &cp_agg_supp, lineitem[2]);
 
         // ---- the part leaf ----
-        let cp_agg_part = configure_cp_agg::<F, NUM_BYTES>(
-            meta,
-            cp_u8,
-            part[0],
-            p_keep,
-            cflag[5],
-            MAX_SENTINEL,
-        );
+        let cp_agg_part =
+            configure_cp_agg::<F, NUM_BYTES>(meta, cp_u8, part[0], p_keep, cflag[5], MAX_SENTINEL);
         let cp_join_part = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, lineitem[1]);
         wire_cp_edge(meta, &cp_join_part, &cp_agg_part, lineitem[1]);
 
@@ -2328,7 +2364,6 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_p[i])),
                     )?;
-
                 }
 
                 // ---- customer attach c_regionkey, c_keep ----
@@ -2408,7 +2443,6 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_o[i])),
                     )?;
-
                 }
 
                 // ---- the lineitem selector bit, on the committed rows ----
@@ -2492,8 +2526,8 @@ impl<F: Field + Ord> TestChip<F> {
                         (0, 0, 0)
                     };
                     // the volume gate runs on every row, so it always has to hold
-                    let vol = (lineitem_t[i][3] as u128)
-                        * ((SCALE as u128) - (lineitem_t[i][4] as u128));
+                    let vol =
+                        (lineitem_t[i][3] as u128) * ((SCALE as u128) - (lineitem_t[i][4] as u128));
                     let an = if selected {
                         [year, vol as u64, nname]
                     } else {
@@ -2790,13 +2824,7 @@ impl<F: Field + Ord> TestChip<F> {
 
                 // ---- region leaf: [key, pred, keep * c] ----
                 let cp_rows_r: Vec<[u64; 3]> = (0..region_t.len())
-                    .map(|i| {
-                        [
-                            region_t[i][0] + SHIFT_ID,
-                            r_keep_u64[i],
-                            cln_r[i],
-                        ]
-                    })
+                    .map(|i| [region_t[i][0] + SHIFT_ID, r_keep_u64[i], cln_r[i]])
                     .collect();
                 let cp_stage_r = build_cp_stage(&cp_rows_r, MAX_SENTINEL);
                 assign_cp_agg(
