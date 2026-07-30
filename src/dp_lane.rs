@@ -9,7 +9,10 @@ pub fn vk_released_capacity(privacy: Privacy, capacity: usize) -> Option<usize> 
     }
     match privacy {
         Privacy::Dp { .. } | Privacy::Rjs => Some(capacity.max(1)),
-        Privacy::Legacy => None,
+        // Oblivious capacities are a public function of the input length, so
+        // like Legacy's declared constants they are not a release the verifying
+        // key has to carry.
+        Privacy::Legacy | Privacy::Oblivious => None,
     }
 }
 

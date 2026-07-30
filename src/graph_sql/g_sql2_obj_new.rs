@@ -9,10 +9,6 @@ use crate::circuits::conserve_idx::{
     RowIndexConfig,
 };
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
-use crate::circuits::card_preserve::{
-    assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
-    configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
-};
 
 use crate::data::graph_data_processing::Edge;
 
@@ -39,6 +35,17 @@ const SHIFT_ID: u64 = 1;
 /// Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 
+/// Test hook, off in every benchmark path: when set, the prover writes a
+/// DIFFERENT relation into the r4 copy than into r1..r3 -- a dense out-star on
+/// one node -- while leaving every other witness column honest for that forged
+/// four-relation instance. Every argument in this circuit is per-relation, so
+/// before the self-join gate existed this passed: the aggregations, joins,
+/// ordering filters, Conservation permutations, Pairwise Consistency lookups
+/// and both channels of the Cardinality Preservation Check are all satisfied by
+/// the honest DP over (E, E, E, E4). Only the self-join gate can see it, so the
+/// negative test in this module is what shows that gate is not vacuous.
+pub static FORGE_R4_RELATION: AtomicBool = AtomicBool::new(false);
+
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and declares every real tuple clean, leaving
 /// the residual section empty. Conservation still holds and both channels of
@@ -50,15 +57,22 @@ pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
+/// Two multiplicity channels ride the same group-by: `*_cln` is the clean
+/// channel of condition (4), everything else is the input channel.  This is
+/// what letter.tex means by "the two channels share one traversal of the join
+/// tree": one sorted view, one group-by chain, one emitted table and ONE lookup
+/// per edge carry the pair, instead of a second copy of the whole pass.
 #[derive(Clone, Debug)]
 struct AggConfig<F: Field + Ord> {
-    // Input triple: (src, dst, val_in)
+    // Input tuple: (src, dst, val_in, val_in_cln)
     val_in: Column<Advice>,
+    val_in_cln: Column<Advice>,
 
-    // Sorted triple columns (src, dst, val)
+    // Sorted triple columns (src, dst, val), plus the clean channel's value
     sorted: [Column<Advice>; 3],
+    sorted_cln: Column<Advice>,
 
-    // perm: (src, dst, val_in) <-> sorted
+    // perm: (src, dst, val_in, val_in_cln) <-> (sorted, sorted_cln)
     perm_sort: PermAnyConfig,
 
     // prove sorted[0] is nondecreasing
@@ -73,14 +87,17 @@ struct AggConfig<F: Field + Ord> {
     q_accu: Selector,
     q_emit: Selector,
     run_sum: Column<Advice>,
+    run_sum_cln: Column<Advice>,
     iz_same_prev: IsZeroConfig<F>,
     iz_same_next: IsZeroConfig<F>,
 
-    // emitted padded group pairs (key,val)
+    // emitted padded group rows (key, val, val_cln)
     emit_pair: [Column<Advice>; 2],
+    emit_cln: Column<Advice>,
 
-    // padded table (key,val) permuted from emit_pair
+    // padded table (key, val, val_cln) permuted from the emitted rows
     tbl_pair: [Column<Advice>; 2],
+    tbl_cln: Column<Advice>,
     perm_tbl: PermAnyConfig,
 
     // prove tbl keys nondecreasing
@@ -90,6 +107,7 @@ struct AggConfig<F: Field + Ord> {
 
     // === map table used by joins (has dummy row 0) ===
     map_pair: [Column<Advice>; 2], // (key,val) with row0=(0,0)
+    map_cln: Column<Advice>,       // the clean channel of the same table, row0=0
     map_key_next: Column<Advice>,  // next(key)
 
     // IMPORTANT: used in lookup_any => must be complex_selector()
@@ -107,6 +125,8 @@ struct JoinConfig<F: Field + Ord> {
     low: Column<Advice>,
     high: Column<Advice>,
     val: Column<Advice>,
+    // the clean channel fetched by the SAME lookup as `val`
+    val_cln: Column<Advice>,
 
     q_lookup: Selector,
     q_lookup_complex: Selector,
@@ -121,6 +141,8 @@ pub struct GraphPath4OrderConfig<F: Field + Ord> {
 
     // r1..r4 copies: [src, dst]
     r: [[Column<Advice>; 2]; 4],
+    // r1..r4 are four occurrences of ONE table: pin them row-wise equal
+    q_self_join: Selector,
 
     // joins:
     // join[2]: r3.dst -> T4
@@ -148,11 +170,13 @@ pub struct GraphPath4OrderConfig<F: Field + Ord> {
     q_r4_val_one: Selector,
 
     contrib: Column<Advice>,
+    contrib_cln: Column<Advice>,
 
-    // sum
+    // sum, one accumulator per channel
     q_sum_first: Selector,
     q_sum_accu: Selector,
     sum: Column<Advice>,
+    sum_cln: Column<Advice>,
 
     out: Column<Advice>,
     // ties the published cell to the accumulator
@@ -184,20 +208,9 @@ pub struct GraphPath4OrderConfig<F: Field + Ord> {
     pw_src: [Column<Advice>; 3],
 
     // ---------------- Cardinality Preservation Check, condition (4) --------
-    // shifted join keys, sk[k][j] = r[k][j] + SHIFT_ID
-    sk: [[Column<Advice>; 2]; 4],
-    q_shift: Selector,
-
-    // edge index 0 = (r3 parent, r4 child), 1 = (r2, r3), 2 = (r1, r2)
-    cp_agg: [CpAggConfig<F, NUM_BYTES>; 3],
-    cp_join: [CpJoinConfig<F, NUM_BYTES>; 3],
-    cp_root: CpRootConfig,
-
-    // the leaf's input-channel multiplicity, pinned to 1
-    cp_one: Column<Advice>,
-    // (mu_all, mu_cln) of the two internal nodes r3 and r2
-    cp_mu: [[Column<Advice>; 2]; 2],
-    q_cp_mu: Selector,
+    // The check is now ONE equality between the two root sums of the fused
+    // traversal; the clean channel itself lives in `agg`/`join`/`contrib_cln`.
+    q_card_eq: Selector,
 }
 
 #[derive(Clone)]
@@ -231,6 +244,8 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
     ) -> AggConfig<F> {
         let val_in = meta.advice_column();
         meta.enable_equality(val_in);
+        let val_in_cln = meta.advice_column();
+        meta.enable_equality(val_in_cln);
 
         let sorted = [
             meta.advice_column(),
@@ -240,16 +255,25 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         for c in sorted {
             meta.enable_equality(c);
         }
+        let sorted_cln = meta.advice_column();
+        meta.enable_equality(sorted_cln);
 
         // PermAny selectors are typically selectors; not required by your rule.
+        //
+        // Both channels ride ONE shuffle, so the clean channel costs a column
+        // and nothing else here.  BOTH SIDES must widen together:
+        // `PermAnyChip::configure` zips the two vectors with no length check, so
+        // widening only one side silently drops the extra pair, leaves
+        // `sorted_cln` as free advice and makes the root equality vacuous --
+        // and MockProver reports nothing.
         let q_perm_in = meta.complex_selector();
         let q_perm_out = meta.complex_selector();
         let perm_sort = PermAnyChip::configure(
             meta,
             q_perm_in,
             q_perm_out,
-            vec![src_col, dst_col, val_in],
-            sorted.to_vec(),
+            vec![src_col, dst_col, val_in, val_in_cln],
+            vec![sorted[0], sorted[1], sorted[2], sorted_cln],
         );
 
         // sortedness of sorted[0]
@@ -304,6 +328,8 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         let q_emit = meta.selector();
         let run_sum = meta.advice_column();
         meta.enable_equality(run_sum);
+        let run_sum_cln = meta.advice_column();
+        meta.enable_equality(run_sum_cln);
 
         let aux_same_prev = meta.advice_column();
         let iz_same_prev = IsZeroChip::configure(
@@ -326,11 +352,16 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             aux_same_next,
         );
 
+        // Both channels are summed off the SAME group boundaries: one
+        // `iz_same_prev`, one `q_first`/`q_accu` pair.  That sharing is the
+        // fusion -- a second traversal would need its own boundary chips.
         meta.create_gate("run_sum_first", |m| {
             let q = m.query_selector(q_first);
             let rs = m.query_advice(run_sum, Rotation::cur());
             let v = m.query_advice(sorted[2], Rotation::cur());
-            vec![q * (rs - v)]
+            let rs_cln = m.query_advice(run_sum_cln, Rotation::cur());
+            let v_cln = m.query_advice(sorted_cln, Rotation::cur());
+            vec![q.clone() * (rs - v), q * (rs_cln - v_cln)]
         });
         meta.create_gate("run_sum_accu", |m| {
             let q = m.query_selector(q_accu);
@@ -338,13 +369,21 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             let rs_cur = m.query_advice(run_sum, Rotation::cur());
             let rs_prev = m.query_advice(run_sum, Rotation::prev());
             let v = m.query_advice(sorted[2], Rotation::cur());
-            vec![q * (rs_cur - (same * rs_prev + v))]
+            let rs_cur_cln = m.query_advice(run_sum_cln, Rotation::cur());
+            let rs_prev_cln = m.query_advice(run_sum_cln, Rotation::prev());
+            let v_cln = m.query_advice(sorted_cln, Rotation::cur());
+            vec![
+                q.clone() * (rs_cur - (same.clone() * rs_prev + v)),
+                q * (rs_cur_cln - (same * rs_prev_cln + v_cln)),
+            ]
         });
 
         let emit_pair = [meta.advice_column(), meta.advice_column()];
         for c in emit_pair {
             meta.enable_equality(c);
         }
+        let emit_cln = meta.advice_column();
+        meta.enable_equality(emit_cln);
         meta.create_gate("emit group pair or pad", |m| {
             let q = m.query_selector(q_emit);
             let one = Expression::Constant(F::ONE);
@@ -354,31 +393,38 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
 
             let cur_key = m.query_advice(sorted[0], Rotation::cur());
             let cur_sum = m.query_advice(run_sum, Rotation::cur());
+            let cur_sum_cln = m.query_advice(run_sum_cln, Rotation::cur());
             let out_k = m.query_advice(emit_pair[0], Rotation::cur());
             let out_v = m.query_advice(emit_pair[1], Rotation::cur());
+            let out_v_cln = m.query_advice(emit_cln, Rotation::cur());
 
             let pad_k = Expression::Constant(F::from(PAD_KEY));
             let pad_v = Expression::Constant(F::from(PAD_VAL));
 
+            // One emitted row carries the per-key PAIR (sigma_all, sigma_clean),
+            // which is exactly letter.tex's "one scan emits the per-key pair".
             vec![
                 q.clone() * (out_k - (is_last.clone() * cur_key + not_last.clone() * pad_k)),
-                q * (out_v - (is_last * cur_sum + not_last * pad_v)),
+                q.clone() * (out_v - (is_last.clone() * cur_sum + not_last.clone() * pad_v.clone())),
+                q * (out_v_cln - (is_last * cur_sum_cln + not_last * pad_v)),
             ]
         });
 
-        // padded table (key,val) as permutation of emit_pair
+        // padded table (key, val, val_cln) as permutation of the emitted rows
         let tbl_pair = [meta.advice_column(), meta.advice_column()];
         for c in tbl_pair {
             meta.enable_equality(c);
         }
+        let tbl_cln = meta.advice_column();
+        meta.enable_equality(tbl_cln);
         let q_tbl_in = meta.complex_selector();
         let q_tbl_out = meta.complex_selector();
         let perm_tbl = PermAnyChip::configure(
             meta,
             q_tbl_in,
             q_tbl_out,
-            emit_pair.to_vec(),
-            tbl_pair.to_vec(),
+            vec![emit_pair[0], emit_pair[1], emit_cln],
+            vec![tbl_pair[0], tbl_pair[1], tbl_cln],
         );
 
         // prove tbl keys sorted
@@ -407,10 +453,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
 
         // map table with dummy row0
         let map_pair = [meta.advice_column(), meta.advice_column()];
+        let map_cln = meta.advice_column();
         let map_key_next = meta.advice_column();
         for c in map_pair {
             meta.enable_equality(c);
         }
+        meta.enable_equality(map_cln);
         meta.enable_equality(map_key_next);
 
         // IMPORTANT: used inside lookup_any => complex_selector()
@@ -420,20 +468,31 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         let q_map_shift = meta.selector();
         let q_map_last = meta.selector();
 
+        // Row 0 is the dummy the joins hit when a parent key is absent from the
+        // child table.  It must be (0, 0, 0): the widened join gate drives both
+        // fetched channels to 0 there, so the third component has to be pinned
+        // too or the clean channel would be free advice on every absent key.
         meta.create_gate("map first row is (0,0)", |m| {
             let q = m.query_selector(q_map_first);
             let k0 = m.query_advice(map_pair[0], Rotation::cur());
             let v0 = m.query_advice(map_pair[1], Rotation::cur());
-            vec![q.clone() * k0, q * v0]
+            let v0_cln = m.query_advice(map_cln, Rotation::cur());
+            vec![q.clone() * k0, q.clone() * v0, q * v0_cln]
         });
         // map[i+1] = tbl[i]
         meta.create_gate("map links tbl (shifted)", |m| {
             let q = m.query_selector(q_map_link);
             let mk_next = m.query_advice(map_pair[0], Rotation::next());
             let mv_next = m.query_advice(map_pair[1], Rotation::next());
+            let mv_next_cln = m.query_advice(map_cln, Rotation::next());
             let tk_cur = m.query_advice(tbl_pair[0], Rotation::cur());
             let tv_cur = m.query_advice(tbl_pair[1], Rotation::cur());
-            vec![q.clone() * (mk_next - tk_cur), q * (mv_next - tv_cur)]
+            let tv_cur_cln = m.query_advice(tbl_cln, Rotation::cur());
+            vec![
+                q.clone() * (mk_next - tk_cur),
+                q.clone() * (mv_next - tv_cur),
+                q * (mv_next_cln - tv_cur_cln),
+            ]
         });
         // map_key_next = next(map_key)
         meta.create_gate("map_key_next = next(map_key)", |m| {
@@ -450,7 +509,9 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
 
         AggConfig {
             val_in,
+            val_in_cln,
             sorted,
+            sorted_cln,
             perm_sort,
             q_sort,
             q_sentinel,
@@ -460,15 +521,19 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             q_accu,
             q_emit,
             run_sum,
+            run_sum_cln,
             iz_same_prev,
             iz_same_next,
             emit_pair,
+            emit_cln,
             tbl_pair,
+            tbl_cln,
             perm_tbl,
             q_tbl_sort,
             lt_tbl_key_cur_next,
             iz_tbl_key_eq,
             map_pair,
+            map_cln,
             map_key_next,
             q_map_tbl,
             q_map_first,
@@ -483,7 +548,8 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         let low = meta.advice_column();
         let high = meta.advice_column();
         let val = meta.advice_column();
-        for c in [in_next, low, high, val] {
+        let val_cln = meta.advice_column();
+        for c in [in_next, low, high, val, val_cln] {
             meta.enable_equality(c);
         }
 
@@ -518,6 +584,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             let one = Expression::Constant(F::ONE);
             let not_in = one.clone() - inx.clone();
             let v = m.query_advice(val, Rotation::cur());
+            let v_cln = m.query_advice(val_cln, Rotation::cur());
 
             let low_ok = lt_low.is_lt(m, None);
             let high_ok = lt_high.is_lt(m, None);
@@ -526,7 +593,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                 q.clone() * inx.clone() * (one.clone() - inx.clone()), // boolean
                 q.clone() * not_in.clone() * (one.clone() - low_ok),
                 q.clone() * not_in.clone() * (one.clone() - high_ok),
-                q * not_in * v, // if not_in => v=0
+                q.clone() * not_in.clone() * v, // if not_in => v=0
+                // The clean twin.  Load-bearing twice: it makes the widened map
+                // lookup's input (0, 0, 0) hit the pinned dummy row, and it
+                // makes a key absent from the child table contribute 0 to the
+                // CLEAN channel rather than being free advice there.
+                q * not_in * v_cln,
             ]
         });
 
@@ -535,6 +607,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             low,
             high,
             val,
+            val_cln,
             q_lookup,
             q_lookup_complex,
             lt_low,
@@ -556,6 +629,48 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             meta.enable_equality(r[i][0]);
             meta.enable_equality(r[i][1]);
         }
+
+        // Every argument below this point is PER-RELATION: the aggregations,
+        // the joins, the ordering filters, the Conservation permutations, the
+        // Pairwise Consistency lookups and both channels of the Cardinality
+        // Preservation Check each read one r[k] and never compare r[j] to
+        // r[k].  Without the gate below, the four copies are independent free
+        // advice, and the certificate says only "there exist four edge tables
+        // whose layered 4-path count is `out`" -- a prover keeping r1..r3
+        // honest and writing an arbitrary r4 gets an arbitrary out-degree at
+        // the leaf, which scales T3, T2, contrib and the answer.
+        //
+        // Because this circuit is a self-join of a single Edge table, and the
+        // assignment writes the same (src, dst) into all four copies on every
+        // row, the tie is a row-wise equality, not a shuffle: six degree-2
+        // constraints under one selector, no advice column and no lookup.  It
+        // does NOT bind the relation to a commitment; that needs an instance /
+        // wrapper change outside this file.  What it does buy is that binding
+        // ONE copy (which is all `edge_columns` in bench_queries.rs offers,
+        // being a single 2-column table) now pins all four.
+        //
+        // Same gate as `g_sql1_obj_new::configure`, extended from three copies
+        // to four.
+        let q_self_join = meta.selector();
+        meta.create_gate("self-join: r1, r2, r3, r4 are the same Edge row", |m| {
+            let q = m.query_selector(q_self_join);
+            let s0 = m.query_advice(r[0][0], Rotation::cur());
+            let d0 = m.query_advice(r[0][1], Rotation::cur());
+            let s1 = m.query_advice(r[1][0], Rotation::cur());
+            let d1 = m.query_advice(r[1][1], Rotation::cur());
+            let s2 = m.query_advice(r[2][0], Rotation::cur());
+            let d2 = m.query_advice(r[2][1], Rotation::cur());
+            let s3 = m.query_advice(r[3][0], Rotation::cur());
+            let d3 = m.query_advice(r[3][1], Rotation::cur());
+            vec![
+                q.clone() * (s0 - s1.clone()),
+                q.clone() * (d0 - d1.clone()),
+                q.clone() * (s1 - s2.clone()),
+                q.clone() * (d1 - d2.clone()),
+                q.clone() * (s2 - s3),
+                q * (d2 - d3),
+            ]
+        });
 
         // joins (configured against each dst column)
         let join = [
@@ -631,6 +746,8 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         // r1 contrib: contrib = join[0].val * [a<b]
         let contrib = meta.advice_column();
         meta.enable_equality(contrib);
+        let contrib_cln = meta.advice_column();
+        meta.enable_equality(contrib_cln);
 
         let q_r1_contrib = meta.selector();
         let lt_ab = LtChip::<F, NUM_BYTES>::configure(
@@ -652,19 +769,50 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         let q_sum_accu = meta.selector();
         let sum = meta.advice_column();
         meta.enable_equality(sum);
+        let sum_cln = meta.advice_column();
+        meta.enable_equality(sum_cln);
 
         meta.create_gate("sum_first", |m| {
             let q = m.query_selector(q_sum_first);
             let s = m.query_advice(sum, Rotation::cur());
             let v = m.query_advice(contrib, Rotation::cur());
-            vec![q * (s - v)]
+            let s_cln = m.query_advice(sum_cln, Rotation::cur());
+            let v_cln = m.query_advice(contrib_cln, Rotation::cur());
+            vec![q.clone() * (s - v), q * (s_cln - v_cln)]
         });
         meta.create_gate("sum_accu", |m| {
             let q = m.query_selector(q_sum_accu);
             let s_cur = m.query_advice(sum, Rotation::cur());
             let s_prev = m.query_advice(sum, Rotation::prev());
             let v = m.query_advice(contrib, Rotation::cur());
-            vec![q * (s_cur - (s_prev + v))]
+            let s_cur_cln = m.query_advice(sum_cln, Rotation::cur());
+            let s_prev_cln = m.query_advice(sum_cln, Rotation::prev());
+            let v_cln = m.query_advice(contrib_cln, Rotation::cur());
+            vec![
+                q.clone() * (s_cur - (s_prev + v)),
+                q * (s_cur_cln - (s_prev_cln + v_cln)),
+            ]
+        });
+
+        // ============ condition (4): Cardinality Preservation Check ============
+        //
+        // The whole check, now that both channels ride the query's own traversal:
+        // ONE equality between the two root sums, at the last base row.  This is
+        // what letter.tex specifies ("One equality constraint compares the two
+        // root sums"), and it replaces the standalone `card_preserve` gadget that
+        // used to re-derive the entire four-stage propagation a second time.
+        //
+        // The fused form is also strictly stronger than the gadget was here.
+        // Previously nothing polynomially tied the gadget's input-channel root
+        // sum to `sum`/`out`; only a host-side `debug_assert_eq!` did, so a
+        // prover could certify one number and publish another.  Now the input
+        // channel IS `sum`, and `out equals sum` ties the published cell.
+        let q_card_eq = meta.selector();
+        meta.create_gate("cp: cardinality preservation", |m| {
+            let q = m.query_selector(q_card_eq);
+            let s = m.query_advice(sum, Rotation::cur());
+            let s_cln = m.query_advice(sum_cln, Rotation::cur());
+            vec![q * (s - s_cln)]
         });
 
         // The published answer. `out` is the only cell of this circuit copied to
@@ -692,9 +840,6 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                 meta.advice_column(),
                 meta.advice_column(),
             ]
-        }
-        fn cols2<FF: PrimeField>(meta: &mut ConstraintSystem<FF>) -> [Column<Advice>; 2] {
-            [meta.advice_column(), meta.advice_column()]
         }
 
         let cflag: [Column<Advice>; 4] = [
@@ -753,6 +898,49 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                 cs
             });
         }
+
+        // ---- the clean channel's anchors, one per stage ----
+        //
+        // These are the clean twins of "r4 val_in is 1", "r3 val_in = ...",
+        // "r2 val_in = ..." and "contrib = ..." above.  They live here rather
+        // than beside their all-channel counterparts only because they need
+        // `cflag`, which is allocated with condition (1); they reuse the very
+        // same selectors, so both channels are driven on exactly the same rows.
+        //
+        // The shape follows letter.tex: a^all = b (the in-relation predicate,
+        // here the ordering filter) and a^clean = c * b, so the ordering factor
+        // appears in BOTH channels and the clean indicator only in the clean one.
+        // Note the leaf is r4 and carries no predicate, hence cflag[3] alone.
+        meta.create_gate("r4 val_in_cln is the clean indicator", |m| {
+            let q = m.query_selector(q_r4_val_one);
+            let vc = m.query_advice(agg[0].val_in_cln, Rotation::cur());
+            let c = m.query_advice(cflag[3], Rotation::cur());
+            vec![q * (vc - c)]
+        });
+        meta.create_gate("r3 val_in_cln = c * join_val_cln * [c<d]", |m| {
+            let q = m.query_selector(q_r3_filt);
+            let v = m.query_advice(join[2].val_cln, Rotation::cur());
+            let outv = m.query_advice(agg[1].val_in_cln, Rotation::cur());
+            let c = m.query_advice(cflag[2], Rotation::cur());
+            let cd = lt_cd.is_lt(m, None);
+            vec![q * (outv - c * v * cd)]
+        });
+        meta.create_gate("r2 val_in_cln = c * join_val_cln * [b<c]", |m| {
+            let q = m.query_selector(q_r2_filt);
+            let v = m.query_advice(join[1].val_cln, Rotation::cur());
+            let outv = m.query_advice(agg[2].val_in_cln, Rotation::cur());
+            let c = m.query_advice(cflag[1], Rotation::cur());
+            let bc = lt_bc.is_lt(m, None);
+            vec![q * (outv - c * v * bc)]
+        });
+        meta.create_gate("contrib_cln = c * join_val_cln * [a<b]", |m| {
+            let q = m.query_selector(q_r1_contrib);
+            let v = m.query_advice(join[0].val_cln, Rotation::cur());
+            let outc = m.query_advice(contrib_cln, Rotation::cur());
+            let c = m.query_advice(cflag[0], Rotation::cur());
+            let ab = lt_ab.is_lt(m, None);
+            vec![q * (outc - c * v * ab)]
+        });
 
         // ============= condition (3): Pairwise Consistency =============
         // Two mutual Membership Checks per join-tree edge, each looking one
@@ -868,120 +1056,10 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             pw_edge(pw_names[e][1], q_pw_in[e + 1], chi_key, q_pw_in[e], par_key);
         }
 
-        // =========== condition (4): Cardinality Preservation Check ===========
-        // Shifted keys first: key 0 is reserved for the gadget's dummy row.
-        let sk: [[Column<Advice>; 2]; 4] = [cols2(meta), cols2(meta), cols2(meta), cols2(meta)];
-        let q_shift = meta.selector();
-        meta.create_gate("shifted keys for the cardinality check", move |m| {
-            let q = m.query_selector(q_shift);
-            let sh = Expression::Constant(F::from(SHIFT_ID));
-            let mut cs = Vec::with_capacity(8);
-            for k in 0..4 {
-                for j in 0..2 {
-                    cs.push(
-                        q.clone()
-                            * (m.query_advice(sk[k][j], Rotation::cur())
-                                - m.query_advice(r[k][j], Rotation::cur())
-                                - sh.clone()),
-                    );
-                }
-            }
-            cs
-        });
-
-        // One fixed column serves every Lt chip of the check, so the whole
-        // check costs a single u8 range table.
-        let cp_u8 = meta.fixed_column();
-
-        let cp_one = meta.advice_column();
-        let cp_mu: [[Column<Advice>; 2]; 2] = [cols2(meta), cols2(meta)];
-
-        // Child side of each edge, over the child relation's own rows. The leaf
-        // r4 carries (1, c_4); the internal nodes r3 and r2 carry the fresh mu
-        // columns the recurrence gate below ties to their own child edge.
-        let cp_agg = [
-            configure_cp_agg::<F, NUM_BYTES>(
-                meta,
-                cp_u8,
-                sk[3][0], // r4.src
-                cp_one,
-                cflag[3],
-                PAD_KEY,
-            ),
-            configure_cp_agg::<F, NUM_BYTES>(
-                meta,
-                cp_u8,
-                sk[2][0], // r3.src
-                cp_mu[0][0],
-                cp_mu[0][1],
-                PAD_KEY,
-            ),
-            configure_cp_agg::<F, NUM_BYTES>(
-                meta,
-                cp_u8,
-                sk[1][0], // r2.src
-                cp_mu[1][0],
-                cp_mu[1][1],
-                PAD_KEY,
-            ),
-        ];
-
-        // Parent side of each edge, over the parent relation's own rows.
-        let parent_key = [sk[2][1], sk[1][1], sk[0][1]]; // r3.dst, r2.dst, r1.dst
-        let cp_join = [
-            configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, parent_key[0]),
-            configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, parent_key[1]),
-            configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, parent_key[2]),
-        ];
-        for e in 0..3 {
-            wire_cp_edge(meta, &cp_join[e], &cp_agg[e], parent_key[e]);
-        }
-
-        let cp_root = configure_cp_root::<F>(meta);
-
-        // The recurrences of both channels, one selector for all of them since
-        // every relation occupies the same rows. Degree 3 each.
-        let q_cp_mu = meta.selector();
-        {
-            let s_all = [cp_join[0].s_all, cp_join[1].s_all, cp_join[2].s_all];
-            let s_cln = [cp_join[0].s_cln, cp_join[1].s_cln, cp_join[2].s_cln];
-            // the bound keep * c of r3, r2, r1
-            let cf = [cflag[2], cflag[1], cflag[0]];
-            let mu_all = [cp_mu[0][0], cp_mu[1][0], cp_root.mu_all];
-            let mu_cln = [cp_mu[0][1], cp_mu[1][1], cp_root.mu_cln];
-            let pred = [lt_cd, lt_bc, lt_ab];
-            meta.create_gate("cp: multiplicity recurrences along the path", move |m| {
-                let q = m.query_selector(q_cp_mu);
-                let mut cs = Vec::with_capacity(7);
-
-                // leaf r4: one input-channel extension per tuple
-                cs.push(
-                    q.clone()
-                        * (m.query_advice(cp_one, Rotation::cur()) - Expression::Constant(F::ONE)),
-                );
-
-                // r3, then r2, then the root r1
-                for i in 0..3 {
-                    let p = pred[i].is_lt(m, None);
-                    cs.push(
-                        q.clone()
-                            * (m.query_advice(mu_all[i], Rotation::cur())
-                                - p * m.query_advice(s_all[i], Rotation::cur())),
-                    );
-                    cs.push(
-                        q.clone()
-                            * (m.query_advice(mu_cln[i], Rotation::cur())
-                                - m.query_advice(cf[i], Rotation::cur())
-                                    * m.query_advice(s_cln[i], Rotation::cur())),
-                    );
-                }
-                cs
-            });
-        }
-
         GraphPath4OrderConfig {
             instance,
             r,
+            q_self_join,
             join,
             agg,
             q_r3_filt,
@@ -992,9 +1070,11 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             lt_ab,
             q_r4_val_one,
             contrib,
+            contrib_cln,
             q_sum_first,
             q_sum_accu,
             sum,
+            sum_cln,
             out,
             q_out,
 
@@ -1007,14 +1087,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             pw_dst,
             pw_src,
 
-            sk,
-            q_shift,
-            cp_agg,
-            cp_join,
-            cp_root,
-            cp_one,
-            cp_mu,
-            q_cp_mu,
+            q_card_eq,
         }
     }
 
@@ -1028,60 +1101,76 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
     }
 
     // ---------------- host helpers ----------------
-    fn sort_by_src(mut rows: Vec<[u64; 3]>) -> Vec<[u64; 3]> {
+    // The host mirrors of the fused traversal.  Every row is a 4-tuple
+    // (src, dst, val_all, val_cln) and every emitted/table/map entry carries the
+    // per-key PAIR, so the clean channel is computed by the SAME scan as the
+    // input channel rather than by a second one.
+
+    fn sort_by_src(mut rows: Vec<[u64; 4]>) -> Vec<[u64; 4]> {
         rows.sort_by_key(|r| r[0]);
         rows
     }
 
-    fn run_sum_by_src(sorted: &[[u64; 3]]) -> Vec<u64> {
-        let mut out = vec![0u64; sorted.len()];
+    /// Both running sums off one pass over the same group boundaries.
+    fn run_sum_by_src(sorted: &[[u64; 4]]) -> (Vec<u64>, Vec<u64>) {
+        let n = sorted.len();
+        let mut out = vec![0u64; n];
+        let mut out_cln = vec![0u64; n];
         let mut acc: u128 = 0;
+        let mut acc_cln: u128 = 0;
         let mut prev: Option<u64> = None;
         for (i, r) in sorted.iter().enumerate() {
             let src = r[0];
             let v = r[2] as u128;
+            let v_cln = r[3] as u128;
             if prev == Some(src) {
                 acc += v;
+                acc_cln += v_cln;
             } else {
                 acc = v;
+                acc_cln = v_cln;
             }
             out[i] = acc as u64;
+            out_cln[i] = acc_cln as u64;
             prev = Some(src);
         }
-        out
+        (out, out_cln)
     }
 
-    fn emit_pairs(sorted: &[[u64; 3]], run: &[u64]) -> Vec<[u64; 2]> {
+    fn emit_pairs(sorted: &[[u64; 4]], run: &[u64], run_cln: &[u64]) -> Vec<[u64; 3]> {
         let n = sorted.len();
-        let mut out = vec![[PAD_KEY, PAD_VAL]; n];
+        let mut out = vec![[PAD_KEY, PAD_VAL, PAD_VAL]; n];
         for i in 0..n {
             let cur = sorted[i][0];
             let next = if i + 1 < n { sorted[i + 1][0] } else { PAD_KEY };
             let is_last = next != cur;
             if is_last {
-                out[i] = [cur, run[i]];
+                out[i] = [cur, run[i], run_cln[i]];
             }
         }
         out
     }
 
-    fn build_tbl_from_emit(emit: &[[u64; 2]], n: usize) -> Vec<[u64; 2]> {
-        let mut pairs: Vec<[u64; 2]> = emit.iter().copied().filter(|p| p[0] != PAD_KEY).collect();
-        pairs.sort_by_key(|p| p[0]);
-        while pairs.len() < n {
-            pairs.push([PAD_KEY, PAD_VAL]);
+    /// Filters on the KEY, not the value, so a real group whose clean sum is 0
+    /// stays in the table. That is deliberate: the parent must be able to fetch
+    /// (sigma_all, 0) for such a key rather than fall through to the gap path.
+    fn build_tbl_from_emit(emit: &[[u64; 3]], n: usize) -> Vec<[u64; 3]> {
+        let mut rows: Vec<[u64; 3]> = emit.iter().copied().filter(|p| p[0] != PAD_KEY).collect();
+        rows.sort_by_key(|p| p[0]);
+        while rows.len() < n {
+            rows.push([PAD_KEY, PAD_VAL, PAD_VAL]);
         }
-        pairs.truncate(n);
-        pairs
+        rows.truncate(n);
+        rows
     }
 
-    fn map_from_tbl(tbl: &[[u64; 2]]) -> HashMap<u64, u64> {
+    fn map_from_tbl(tbl: &[[u64; 3]]) -> HashMap<u64, (u64, u64)> {
         let mut m = HashMap::new();
-        for [k, v] in tbl.iter().copied() {
+        for [k, v, v_cln] in tbl.iter().copied() {
             if k == PAD_KEY {
                 continue;
             }
-            m.insert(k, v);
+            m.insert(k, (v, v_cln));
         }
         m
     }
@@ -1173,9 +1262,6 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_bc.clone()).load(layouter)?;
         LtChip::<F, NUM_BYTES>::construct(cfg.lt_cd.clone()).load(layouter)?;
 
-        // Every Lt chip of the Cardinality Preservation Check shares one u8
-        // fixed column, so a single load covers all twelve of them.
-        LtChip::<F, NUM_BYTES>::construct(cfg.cp_agg[0].lt_key_cur_next).load(layouter)?;
 
         // The empty-input layout enables no selector at all, so under a
         // verifying key generated for n == 0 nothing is constrained and the
@@ -1194,153 +1280,6 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             )?;
             return Ok(cell);
         }
-
-        // -------- host witnesses (DP) --------
-        // Stage4: T4[d] = outdeg(d) from r4
-        let r4_rows: Vec<[u64; 3]> = edges.iter().map(|e| [e.src, e.dst, 1u64]).collect();
-        let r4_sorted = Self::sort_by_src(r4_rows.clone());
-        let r4_run = Self::run_sum_by_src(&r4_sorted);
-        let r4_emit = Self::emit_pairs(&r4_sorted, &r4_run);
-        let t4_tbl = Self::build_tbl_from_emit(&r4_emit, n);
-        let t4_map = Self::map_from_tbl(&t4_tbl);
-
-        let mut t4_keys: Vec<u64> = t4_tbl
-            .iter()
-            .map(|p| p[0])
-            .filter(|&k| k != PAD_KEY)
-            .collect();
-        t4_keys.push(0);
-        t4_keys.push(PAD_KEY);
-        t4_keys.sort();
-        t4_keys.dedup();
-
-        // Stage3: join r3.dst=d into T4[d], filter c<d, agg by c => T3
-        let mut r3_in = vec![0u64; n];
-        let mut r3_low = vec![0u64; n];
-        let mut r3_high = vec![PAD_KEY; n];
-        let mut r3_join_val = vec![0u64; n];
-        let mut r3_val_filt = vec![0u64; n];
-        let mut r3_rows: Vec<[u64; 3]> = Vec::with_capacity(n);
-
-        for (i, e) in edges.iter().enumerate() {
-            let c = e.src;
-            let d = e.dst;
-
-            let (inx, lo, hi) = Self::gap_witness(&t4_keys, d);
-            r3_in[i] = inx;
-            r3_low[i] = lo;
-            r3_high[i] = hi;
-
-            let v = if inx == 1 {
-                *t4_map.get(&d).unwrap_or(&0)
-            } else {
-                0
-            };
-            r3_join_val[i] = v;
-
-            let cd = if c < d { 1u64 } else { 0u64 };
-            r3_val_filt[i] = v * cd;
-
-            r3_rows.push([c, d, r3_val_filt[i]]);
-        }
-
-        let r3_sorted = Self::sort_by_src(r3_rows.clone());
-        let r3_run = Self::run_sum_by_src(&r3_sorted);
-        let r3_emit = Self::emit_pairs(&r3_sorted, &r3_run);
-        let t3_tbl = Self::build_tbl_from_emit(&r3_emit, n);
-        let t3_map = Self::map_from_tbl(&t3_tbl);
-
-        let mut t3_keys: Vec<u64> = t3_tbl
-            .iter()
-            .map(|p| p[0])
-            .filter(|&k| k != PAD_KEY)
-            .collect();
-        t3_keys.push(0);
-        t3_keys.push(PAD_KEY);
-        t3_keys.sort();
-        t3_keys.dedup();
-
-        // Stage2: join r2.dst=c into T3[c], filter b<c, agg by b => T2
-        let mut r2_in = vec![0u64; n];
-        let mut r2_low = vec![0u64; n];
-        let mut r2_high = vec![PAD_KEY; n];
-        let mut r2_join_val = vec![0u64; n];
-        let mut r2_val_filt = vec![0u64; n];
-        let mut r2_rows: Vec<[u64; 3]> = Vec::with_capacity(n);
-
-        for (i, e) in edges.iter().enumerate() {
-            let b = e.src;
-            let c = e.dst;
-
-            let (inx, lo, hi) = Self::gap_witness(&t3_keys, c);
-            r2_in[i] = inx;
-            r2_low[i] = lo;
-            r2_high[i] = hi;
-
-            let v = if inx == 1 {
-                *t3_map.get(&c).unwrap_or(&0)
-            } else {
-                0
-            };
-            r2_join_val[i] = v;
-
-            let bc = if b < c { 1u64 } else { 0u64 };
-            r2_val_filt[i] = v * bc;
-
-            r2_rows.push([b, c, r2_val_filt[i]]);
-        }
-
-        let r2_sorted = Self::sort_by_src(r2_rows.clone());
-        let r2_run = Self::run_sum_by_src(&r2_sorted);
-        let r2_emit = Self::emit_pairs(&r2_sorted, &r2_run);
-        let t2_tbl = Self::build_tbl_from_emit(&r2_emit, n);
-        let t2_map = Self::map_from_tbl(&t2_tbl);
-
-        let mut t2_keys: Vec<u64> = t2_tbl
-            .iter()
-            .map(|p| p[0])
-            .filter(|&k| k != PAD_KEY)
-            .collect();
-        t2_keys.push(0);
-        t2_keys.push(PAD_KEY);
-        t2_keys.sort();
-        t2_keys.dedup();
-
-        // Stage1: join r1.dst=b into T2[b], filter a<b, sum
-        let mut r1_in = vec![0u64; n];
-        let mut r1_low = vec![0u64; n];
-        let mut r1_high = vec![PAD_KEY; n];
-        let mut r1_join_val = vec![0u64; n];
-        let mut contrib = vec![0u64; n];
-
-        let mut answer_u128: u128 = 0;
-        for (i, e) in edges.iter().enumerate() {
-            let a = e.src;
-            let b = e.dst;
-
-            let (inx, lo, hi) = Self::gap_witness(&t2_keys, b);
-            r1_in[i] = inx;
-            r1_low[i] = lo;
-            r1_high[i] = hi;
-
-            let v = if inx == 1 {
-                *t2_map.get(&b).unwrap_or(&0)
-            } else {
-                0
-            };
-            r1_join_val[i] = v;
-
-            let ab = if a < b { 1u64 } else { 0u64 };
-            contrib[i] = v * ab;
-            answer_u128 += contrib[i] as u128;
-        }
-        // Host-side truncation: the answer and the running sum are both carried
-        // as u64, so a count past 2^64 would wrap. The in-circuit accumulator
-        // adds in F and does not wrap, so the honest prover simply cannot satisfy
-        // "sum_accu" past that point: this is a completeness limit at
-        // astronomically large counts, not a soundness hole, and contorting the
-        // circuit into u128 limbs would cost far more than it is worth.
-        let answer = answer_u128 as u64;
 
         // -------- the partition, condition (1) --------
         // keep bits per relation: the ordering predicate of r1/r2/r3, and the
@@ -1370,6 +1309,175 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         } else {
             Self::reduce_clean(edges, drop_r1)
         };
+
+        // -------- host witnesses (DP) --------
+        // Stage4: T4[d] = outdeg(d) from r4.  The leaf's anchors are a_all = 1
+        // (it carries no ordering predicate) and a_clean = c_4.
+        let r4_rows: Vec<[u64; 4]> = edges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| [e.src, e.dst, 1u64, cln[3][i]])
+            .collect();
+        let r4_sorted = Self::sort_by_src(r4_rows.clone());
+        let (r4_run, r4_run_cln) = Self::run_sum_by_src(&r4_sorted);
+        let r4_emit = Self::emit_pairs(&r4_sorted, &r4_run, &r4_run_cln);
+        let t4_tbl = Self::build_tbl_from_emit(&r4_emit, n);
+        let t4_map = Self::map_from_tbl(&t4_tbl);
+
+        let mut t4_keys: Vec<u64> = t4_tbl
+            .iter()
+            .map(|p| p[0])
+            .filter(|&k| k != PAD_KEY)
+            .collect();
+        t4_keys.push(0);
+        t4_keys.push(PAD_KEY);
+        t4_keys.sort();
+        t4_keys.dedup();
+
+        // Stage3: join r3.dst=d into T4[d], filter c<d, agg by c => T3
+        let mut r3_in = vec![0u64; n];
+        let mut r3_low = vec![0u64; n];
+        let mut r3_high = vec![PAD_KEY; n];
+        let mut r3_join_val = vec![0u64; n];
+        let mut r3_join_val_cln = vec![0u64; n];
+        let mut r3_val_filt = vec![0u64; n];
+        let mut r3_val_filt_cln = vec![0u64; n];
+        let mut r3_rows: Vec<[u64; 4]> = Vec::with_capacity(n);
+
+        for (i, e) in edges.iter().enumerate() {
+            let c = e.src;
+            let d = e.dst;
+
+            let (inx, lo, hi) = Self::gap_witness(&t4_keys, d);
+            r3_in[i] = inx;
+            r3_low[i] = lo;
+            r3_high[i] = hi;
+
+            // ONE fetch returns the pair; there is no second traversal to
+            // fetch the clean channel from.
+            let (v, v_cln) = if inx == 1 {
+                *t4_map.get(&d).unwrap_or(&(0, 0))
+            } else {
+                (0, 0)
+            };
+            r3_join_val[i] = v;
+            r3_join_val_cln[i] = v_cln;
+
+            let cd = if c < d { 1u64 } else { 0u64 };
+            r3_val_filt[i] = v * cd;
+            r3_val_filt_cln[i] = cln[2][i].saturating_mul(v_cln).saturating_mul(cd);
+
+            r3_rows.push([c, d, r3_val_filt[i], r3_val_filt_cln[i]]);
+        }
+
+        let r3_sorted = Self::sort_by_src(r3_rows.clone());
+        let (r3_run, r3_run_cln) = Self::run_sum_by_src(&r3_sorted);
+        let r3_emit = Self::emit_pairs(&r3_sorted, &r3_run, &r3_run_cln);
+        let t3_tbl = Self::build_tbl_from_emit(&r3_emit, n);
+        let t3_map = Self::map_from_tbl(&t3_tbl);
+
+        let mut t3_keys: Vec<u64> = t3_tbl
+            .iter()
+            .map(|p| p[0])
+            .filter(|&k| k != PAD_KEY)
+            .collect();
+        t3_keys.push(0);
+        t3_keys.push(PAD_KEY);
+        t3_keys.sort();
+        t3_keys.dedup();
+
+        // Stage2: join r2.dst=c into T3[c], filter b<c, agg by b => T2
+        let mut r2_in = vec![0u64; n];
+        let mut r2_low = vec![0u64; n];
+        let mut r2_high = vec![PAD_KEY; n];
+        let mut r2_join_val = vec![0u64; n];
+        let mut r2_join_val_cln = vec![0u64; n];
+        let mut r2_val_filt = vec![0u64; n];
+        let mut r2_val_filt_cln = vec![0u64; n];
+        let mut r2_rows: Vec<[u64; 4]> = Vec::with_capacity(n);
+
+        for (i, e) in edges.iter().enumerate() {
+            let b = e.src;
+            let c = e.dst;
+
+            let (inx, lo, hi) = Self::gap_witness(&t3_keys, c);
+            r2_in[i] = inx;
+            r2_low[i] = lo;
+            r2_high[i] = hi;
+
+            let (v, v_cln) = if inx == 1 {
+                *t3_map.get(&c).unwrap_or(&(0, 0))
+            } else {
+                (0, 0)
+            };
+            r2_join_val[i] = v;
+            r2_join_val_cln[i] = v_cln;
+
+            let bc = if b < c { 1u64 } else { 0u64 };
+            r2_val_filt[i] = v * bc;
+            r2_val_filt_cln[i] = cln[1][i].saturating_mul(v_cln).saturating_mul(bc);
+
+            r2_rows.push([b, c, r2_val_filt[i], r2_val_filt_cln[i]]);
+        }
+
+        let r2_sorted = Self::sort_by_src(r2_rows.clone());
+        let (r2_run, r2_run_cln) = Self::run_sum_by_src(&r2_sorted);
+        let r2_emit = Self::emit_pairs(&r2_sorted, &r2_run, &r2_run_cln);
+        let t2_tbl = Self::build_tbl_from_emit(&r2_emit, n);
+        let t2_map = Self::map_from_tbl(&t2_tbl);
+
+        let mut t2_keys: Vec<u64> = t2_tbl
+            .iter()
+            .map(|p| p[0])
+            .filter(|&k| k != PAD_KEY)
+            .collect();
+        t2_keys.push(0);
+        t2_keys.push(PAD_KEY);
+        t2_keys.sort();
+        t2_keys.dedup();
+
+        // Stage1: join r1.dst=b into T2[b], filter a<b, sum
+        let mut r1_in = vec![0u64; n];
+        let mut r1_low = vec![0u64; n];
+        let mut r1_high = vec![PAD_KEY; n];
+        let mut r1_join_val = vec![0u64; n];
+        let mut r1_join_val_cln = vec![0u64; n];
+        let mut contrib = vec![0u64; n];
+        let mut contrib_cln = vec![0u64; n];
+
+        let mut answer_u128: u128 = 0;
+        let mut answer_cln_u128: u128 = 0;
+        for (i, e) in edges.iter().enumerate() {
+            let a = e.src;
+            let b = e.dst;
+
+            let (inx, lo, hi) = Self::gap_witness(&t2_keys, b);
+            r1_in[i] = inx;
+            r1_low[i] = lo;
+            r1_high[i] = hi;
+
+            let (v, v_cln) = if inx == 1 {
+                *t2_map.get(&b).unwrap_or(&(0, 0))
+            } else {
+                (0, 0)
+            };
+            r1_join_val[i] = v;
+            r1_join_val_cln[i] = v_cln;
+
+            let ab = if a < b { 1u64 } else { 0u64 };
+            contrib[i] = v * ab;
+            contrib_cln[i] = cln[0][i].saturating_mul(v_cln).saturating_mul(ab);
+            answer_u128 += contrib[i] as u128;
+            answer_cln_u128 += contrib_cln[i] as u128;
+        }
+        // Host-side truncation: the answer and the running sum are both carried
+        // as u64, so a count past 2^64 would wrap. The in-circuit accumulator
+        // adds in F and does not wrap, so the honest prover simply cannot satisfy
+        // "sum_accu" past that point: this is a completeness limit at
+        // astronomically large counts, not a soundness hole, and contorting the
+        // circuit into u128 limbs would cost far more than it is worth.
+        let answer = answer_u128 as u64;
+        let answer_cln = answer_cln_u128 as u64;
 
         // the two sides of each Conservation Check: the filtered base rows, and
         // the partition laid out as [R^c rows | R^r rows | PAD rows]
@@ -1409,19 +1517,36 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
             || "path4_order_witness",
             |mut region| {
                 // assign base edges into r1..r4 copies
+                //
+                // The self-join gate is enabled on exactly the rows that carry
+                // a base edge, i.e. 0..n-1.  The sorted views own row n (the
+                // PAD sentinel) and the r columns are never written there, so
+                // enabling it past n-1 would constrain unassigned cells.
+                for (i, _) in edges.iter().enumerate() {
+                    cfg.q_self_join.enable(&mut region, i)?;
+                }
+                let forge_r4 = FORGE_R4_RELATION.load(Ordering::Relaxed);
                 for k in 0..4 {
                     for (i, e) in edges.iter().enumerate() {
+                        // Test hook only: r4 gets a dense out-star instead of
+                        // the Edge table, which is the forgery the self-join
+                        // gate exists to reject.
+                        let (src, dst) = if forge_r4 && k == 3 {
+                            (0u64, 1u64)
+                        } else {
+                            (e.src, e.dst)
+                        };
                         region.assign_advice(
                             || "src",
                             cfg.r[k][0],
                             i,
-                            || Value::known(F::from(e.src)),
+                            || Value::known(F::from(src)),
                         )?;
                         region.assign_advice(
                             || "dst",
                             cfg.r[k][1],
                             i,
-                            || Value::known(F::from(e.dst)),
+                            || Value::known(F::from(dst)),
                         )?;
                     }
                 }
@@ -1432,6 +1557,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                                        low_vec: &Vec<u64>,
                                        high_vec: &Vec<u64>,
                                        val_vec: &Vec<u64>,
+                                       val_cln_vec: &Vec<u64>,
                                        dst_vec: &Vec<u64>|
                  -> Result<(), Error> {
                     let lt_low_chip = LtChip::<F, NUM_BYTES>::construct(jc.lt_low.clone());
@@ -1464,6 +1590,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             i,
                             || Value::known(F::from(val_vec[i])),
                         )?;
+                        region.assign_advice(
+                            || "val_cln",
+                            jc.val_cln,
+                            i,
+                            || Value::known(F::from(val_cln_vec[i])),
+                        )?;
 
                         lt_low_chip.assign(
                             &mut region,
@@ -1488,6 +1620,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     &r3_low,
                     &r3_high,
                     &r3_join_val,
+                    &r3_join_val_cln,
                     &edges.iter().map(|e| e.dst).collect(),
                 )?;
 
@@ -1498,6 +1631,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     &r2_low,
                     &r2_high,
                     &r2_join_val,
+                    &r2_join_val_cln,
                     &edges.iter().map(|e| e.dst).collect(),
                 )?;
 
@@ -1508,25 +1642,34 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     &r1_low,
                     &r1_high,
                     &r1_join_val,
+                    &r1_join_val_cln,
                     &edges.iter().map(|e| e.dst).collect(),
                 )?;
 
                 // assign agg helper
                 let mut assign_agg_stage = |a: &AggConfig<F>,
                                             base_len: usize,
-                                            sorted_rows: &Vec<[u64; 3]>,
+                                            sorted_rows: &Vec<[u64; 4]>,
                                             run: &Vec<u64>,
-                                            emit: &Vec<[u64; 2]>,
-                                            tbl: &Vec<[u64; 2]>,
-                                            val_in_vec: &Vec<u64>|
+                                            run_cln: &Vec<u64>,
+                                            emit: &Vec<[u64; 3]>,
+                                            tbl: &Vec<[u64; 3]>,
+                                            val_in_vec: &Vec<u64>,
+                                            val_in_cln_vec: &Vec<u64>|
                  -> Result<(), Error> {
-                    // val_in
+                    // val_in, both channels
                     for i in 0..base_len {
                         region.assign_advice(
                             || "val_in",
                             a.val_in,
                             i,
                             || Value::known(F::from(val_in_vec[i])),
+                        )?;
+                        region.assign_advice(
+                            || "val_in_cln",
+                            a.val_in_cln,
+                            i,
+                            || Value::known(F::from(val_in_cln_vec[i])),
                         )?;
                     }
 
@@ -1550,6 +1693,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             i,
                             || Value::known(F::from(sorted_rows[i][2])),
                         )?;
+                        region.assign_advice(
+                            || "sorted_val_cln",
+                            a.sorted_cln,
+                            i,
+                            || Value::known(F::from(sorted_rows[i][3])),
+                        )?;
                     }
                     region.assign_advice(
                         || "sorted_src_s",
@@ -1569,6 +1718,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                         base_len,
                         || Value::known(F::from(0u64)),
                     )?;
+                    region.assign_advice(
+                        || "sorted_val_cln_s",
+                        a.sorted_cln,
+                        base_len,
+                        || Value::known(F::from(0u64)),
+                    )?;
 
                     // run_sum
                     for i in 0..base_len {
@@ -1578,9 +1733,15 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             i,
                             || Value::known(F::from(run[i])),
                         )?;
+                        region.assign_advice(
+                            || "run_sum_cln",
+                            a.run_sum_cln,
+                            i,
+                            || Value::known(F::from(run_cln[i])),
+                        )?;
                     }
 
-                    // emit pairs
+                    // emit rows
                     for i in 0..base_len {
                         region.assign_advice(
                             || "emit_k",
@@ -1593,6 +1754,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             a.emit_pair[1],
                             i,
                             || Value::known(F::from(emit[i][1])),
+                        )?;
+                        region.assign_advice(
+                            || "emit_v_cln",
+                            a.emit_cln,
+                            i,
+                            || Value::known(F::from(emit[i][2])),
                         )?;
                     }
 
@@ -1610,6 +1777,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             i,
                             || Value::known(F::from(tbl[i][1])),
                         )?;
+                        region.assign_advice(
+                            || "tbl_v_cln",
+                            a.tbl_cln,
+                            i,
+                            || Value::known(F::from(tbl[i][2])),
+                        )?;
                     }
 
                     // map_pair: row0=(0,0), rows 1..=n copy tbl[0..n-1]
@@ -1625,6 +1798,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                         0,
                         || Value::known(F::from(0u64)),
                     )?;
+                    region.assign_advice(
+                        || "map_v0_cln",
+                        a.map_cln,
+                        0,
+                        || Value::known(F::from(0u64)),
+                    )?;
                     for i in 0..base_len {
                         region.assign_advice(
                             || "map_k",
@@ -1637,6 +1816,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             a.map_pair[1],
                             i + 1,
                             || Value::known(F::from(tbl[i][1])),
+                        )?;
+                        region.assign_advice(
+                            || "map_v_cln",
+                            a.map_cln,
+                            i + 1,
+                            || Value::known(F::from(tbl[i][2])),
                         )?;
                     }
 
@@ -1769,16 +1954,19 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     Ok(())
                 };
 
-                // agg[0] r4 -> T4 with val_in=1, pinned below by "r4 val_in is 1"
+                // agg[0] r4 -> T4 with val_in=1, pinned below by "r4 val_in is 1";
+                // the clean channel's anchor is the r4 indicator cflag[3]
                 let r4_vals = vec![1u64; n];
                 assign_agg_stage(
                     &cfg.agg[0],
                     n,
                     &r4_sorted,
                     &r4_run,
+                    &r4_run_cln,
                     &r4_emit,
                     &t4_tbl,
                     &r4_vals,
+                    &cln[3],
                 )?;
 
                 // agg[1] r3 -> T3 with val_in=r3_val_filt
@@ -1787,9 +1975,11 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     n,
                     &r3_sorted,
                     &r3_run,
+                    &r3_run_cln,
                     &r3_emit,
                     &t3_tbl,
                     &r3_val_filt,
+                    &r3_val_filt_cln,
                 )?;
 
                 // agg[2] r2 -> T2 with val_in=r2_val_filt
@@ -1798,9 +1988,11 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     n,
                     &r2_sorted,
                     &r2_run,
+                    &r2_run_cln,
                     &r2_emit,
                     &t2_tbl,
                     &r2_val_filt,
+                    &r2_val_filt_cln,
                 )?;
 
                 // the leaf stage's input multiplicity is one per r4 tuple
@@ -1847,6 +2039,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             i,
                             || Value::known(F::from(contrib[i])),
                         )?;
+                        region.assign_advice(
+                            || "contrib_cln",
+                            cfg.contrib_cln,
+                            i,
+                            || Value::known(F::from(contrib_cln[i])),
+                        )?;
                         lt_ab_chip.assign(
                             &mut region,
                             i,
@@ -1857,7 +2055,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                 }
 
                 // ================= condition (1): the partition =================
-                // clean indicator and shifted keys on the base rows
+                // clean indicator on the base rows
                 for k in 0..4 {
                     for i in 0..n {
                         region.assign_advice(
@@ -1866,22 +2064,7 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                             i,
                             || Value::known(F::from(cln[k][i])),
                         )?;
-                        region.assign_advice(
-                            || "sk_src",
-                            cfg.sk[k][0],
-                            i,
-                            || Value::known(F::from(edges[i].src + SHIFT_ID)),
-                        )?;
-                        region.assign_advice(
-                            || "sk_dst",
-                            cfg.sk[k][1],
-                            i,
-                            || Value::known(F::from(edges[i].dst + SHIFT_ID)),
-                        )?;
                     }
-                }
-                for i in 0..n {
-                    cfg.q_shift.enable(&mut region, i)?;
                 }
 
                 // ---- (1) Conservation Check, one permutation per node ----
@@ -1928,89 +2111,33 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     }
                 }
 
-                // ============= CARDINALITY PRESERVATION CHECK =============
-                // condition (4): one traversal of the chain r4 -> r3 -> r2 -> r1
-                // carrying two multiplicities per tuple, then one equality
-                // between the two root sums.
-                for i in 0..n {
-                    region.assign_advice(|| "cp_one", cfg.cp_one, i, || Value::known(F::ONE))?;
-                    cfg.q_cp_mu.enable(&mut region, i)?;
-                }
-
-                let shifted_src: Vec<u64> = edges.iter().map(|e| e.src + SHIFT_ID).collect();
-                let shifted_dst: Vec<u64> = edges.iter().map(|e| e.dst + SHIFT_ID).collect();
-
-                // the leaf carries (key, v_all, v_cln) = (r4.src, 1, c_4)
-                let mut rows: Vec<[u64; 3]> =
-                    (0..n).map(|i| [shifted_src[i], 1, cln[3][i]]).collect();
-                let mut cp_sums = (0u64, 0u64);
-
-                for e in 0..3 {
-                    let stage = build_cp_stage(&rows, PAD_KEY);
-                    assign_cp_agg(&mut region, &cfg.cp_agg[e], &rows, &stage)?;
-                    let fetched = assign_cp_join(
-                        &mut region,
-                        &cfg.cp_join[e],
-                        &shifted_dst,
-                        &stage,
-                        PAD_KEY,
-                    )?;
-
-                    // parent of edge e: r3, then r2, then the root r1
-                    let par = 2 - e;
-                    let mu: Vec<(u64, u64)> = (0..n)
-                        .map(|i| (keep[par][i] * fetched[i].0, cln[par][i] * fetched[i].1))
-                        .collect();
-
-                    if e < 2 {
-                        for i in 0..n {
-                            region.assign_advice(
-                                || "cp mu_all",
-                                cfg.cp_mu[e][0],
-                                i,
-                                || Value::known(F::from(mu[i].0)),
-                            )?;
-                            region.assign_advice(
-                                || "cp mu_cln",
-                                cfg.cp_mu[e][1],
-                                i,
-                                || Value::known(F::from(mu[i].1)),
-                            )?;
-                        }
-                        // the parent becomes the child of the next edge, keyed
-                        // by its own src
-                        rows = (0..n).map(|i| [shifted_src[i], mu[i].0, mu[i].1]).collect();
-                    } else {
-                        cp_sums = assign_cp_root(&mut region, &cfg.cp_root, &mu)?;
-                    }
-                }
-
-                if !tamper && !mark_all {
-                    debug_assert_eq!(
-                        cp_sums.0, cp_sums.1,
-                        "cardinality preservation: |R^c join| != |R join|"
-                    );
-                    debug_assert_eq!(
-                        cp_sums.0, answer,
-                        "the input channel of condition (4) must count the query answer"
-                    );
-                }
-
-                // sum
+                // both root accumulators, off the same scan
                 let mut running: u128 = 0;
+                let mut running_cln: u128 = 0;
                 for i in 0..n {
                     running += contrib[i] as u128;
+                    running_cln += contrib_cln[i] as u128;
                     region.assign_advice(
                         || "sum",
                         cfg.sum,
                         i,
                         || Value::known(F::from(running as u64)),
                     )?;
+                    region.assign_advice(
+                        || "sum_cln",
+                        cfg.sum_cln,
+                        i,
+                        || Value::known(F::from(running_cln as u64)),
+                    )?;
                 }
                 cfg.q_sum_first.enable(&mut region, 0)?;
                 for i in 1..n {
                     cfg.q_sum_accu.enable(&mut region, i)?;
                 }
+
+                // condition (4): the two root sums agree. One gate, at the last
+                // base row, over the accumulators the query already built.
+                cfg.q_card_eq.enable(&mut region, n - 1)?;
 
                 // output at the last row, tied to the accumulator by "out equals
                 // sum" so the published cell is the count the circuit computed
@@ -2076,14 +2203,30 @@ pub fn configure_path4order_full<F: Field + Ord>(
 
             let dst = m.query_advice(rel_dst, Rotation::cur());
             let v = m.query_advice(j.val, Rotation::cur());
+            let v_cln = m.query_advice(j.val_cln, Rotation::cur());
 
             let q_tbl = m.query_selector(t.q_map_tbl); // complex
             let tk = m.query_advice(t.map_pair[0], Rotation::cur());
             let tv = m.query_advice(t.map_pair[1], Rotation::cur());
+            let tv_cln = m.query_advice(t.map_cln, Rotation::cur());
 
+            // ONE lookup carries BOTH channels: this is the "one lookup per tree
+            // edge" of letter.tex's fused traversal, and it is why the clean
+            // channel costs no lookup argument at all.
+            //
+            // Degree is unchanged. required_degree = 2 + input + table, and the
+            // maximum was already set by `q_in * inx * dst` (3) against a degree-2
+            // table, i.e. 7. The new pair is degree 2 against degree 2, so it
+            // rides under the existing maximum and `test_max_gate_degree`'s
+            // `degree <= 7` still holds.
+            //
+            // Soundness of the in_next = 0 case: the join gate forces both
+            // v and v_cln to 0 there, so the input tuple is (0, 0, 0), which
+            // matches map row 0 -- pinned to (0, 0, 0) by "map first row is (0,0)".
             vec![
                 (q_in.clone() * inx.clone() * dst, q_tbl.clone() * tk),
-                (q_in * v, q_tbl * tv),
+                (q_in.clone() * v, q_tbl.clone() * tv),
+                (q_in * v_cln, q_tbl * tv_cln),
             ]
         });
     };
@@ -2148,7 +2291,22 @@ mod tests {
     use halo2curves::pasta::{vesta, EqAffine, Fp};
     use rand::rngs::OsRng;
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    /// The witness tamper hooks (`HIDE_ONE_CLEAN_TUPLE`, `ALL_CLEAN_PARTITION`,
+    /// `FORGE_R4_RELATION`) are process-global, so two tests that set them must
+    /// not run concurrently -- cargo's default runner is threaded, and one
+    /// test's forgery leaking into another's MockProver run shows up as a
+    /// baffling failure in the innocent test. Every test that touches a hook
+    /// holds this for its duration.
+    static TAMPER_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquires `TAMPER_LOCK`, ignoring poisoning: a prior test panicking while
+    /// holding it says nothing about this test, and the hooks are reset below.
+    fn tamper_guard() -> std::sync::MutexGuard<'static, ()> {
+        TAMPER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
     use std::{fs::File, io::Write, path::Path};
 
     fn generate_and_verify_proof<C: Circuit<Fp>>(
@@ -2323,8 +2481,57 @@ mod tests {
     /// every gate, shuffle and lookup of the circuit without paying for a real
     /// proof, then the negative direction of condition (4), then the all-clean
     /// escape that condition (3) closes.
+    /// The self-join gate is not vacuous: a witness whose r4 copy holds a
+    /// different relation than r1..r3 is rejected, and rejected BY THAT GATE.
+    ///
+    /// Every other argument in this circuit is per-relation -- each reads one
+    /// r[k] and never compares r[j] to r[k] -- so before this gate existed the
+    /// four copies were independent free advice and the certificate proved only
+    /// that SOME four edge tables had the published layered 4-path count.  The
+    /// assertion below is on the gate by name, so a future refactor that drops
+    /// the gate fails here rather than silently widening the statement.
+    #[test]
+    fn test_self_join_gate_binds_the_four_copies() {
+        let _tamper = tamper_guard();
+        const N_EDGES: usize = 400;
+        let k = 12;
+
+        let base_path = &crate::paths::graph_dir();
+        let mut edges = read_edges(&format!("{}/wiki/wiki_Vote.txt", base_path)).unwrap();
+        assert!(!edges.is_empty(), "dataset not found under {}", base_path);
+        edges.truncate(N_EDGES);
+
+        let cnt = dp_count_path4_order(&edges);
+        let circuit = GraphPath4OrderCircuit::<Fp> {
+            edges,
+            _marker: PhantomData,
+        };
+        let public_input = vec![Fp::from(cnt)];
+
+        // Honest direction first, so a failure below cannot be blamed on the
+        // slice or the degree.
+        MockProver::run(k, &circuit, vec![public_input.clone()])
+            .unwrap()
+            .assert_satisfied();
+
+        super::FORGE_R4_RELATION.store(true, Ordering::Relaxed);
+        let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
+        let verdict = tampered.verify();
+        super::FORGE_R4_RELATION.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("r4 held a different relation and the circuit accepted");
+        assert!(
+            failures
+                .iter()
+                .any(|f| format!("{:?}", f).contains("self-join")),
+            "the circuit rejected, but not through the self-join gate: {:?}",
+            failures
+        );
+    }
+
     #[test]
     fn test_cardinality_preservation() {
+        let _tamper = tamper_guard();
         // small enough for MockProver, large enough that the reduction really
         // drops tuples on every relation of the chain
         const N_EDGES: usize = 4000;

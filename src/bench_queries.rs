@@ -241,8 +241,34 @@ pub enum Mode {
 /// proofs load.  All of these are confirmed by completed runs in
 /// `results/vpjoin_baseline_debug.csv`.  GQ3/GQ4 on the two larger graphs
 /// overflow `k=21` (also measured) and are tabulated separately.
+/// A degree pinned with `VPJOIN_K`, overriding the one derived from the data.
+///
+/// The derived degree is the right one for a measurement, so this is an
+/// experiment knob, not a tuning parameter.  Pinning a LARGER `k` proves the
+/// same circuit in a bigger domain (that prices the domain itself).  Pinning a
+/// SMALLER one is not a way to make a circuit cheaper: `run_at` rejects it the
+/// moment the layout overflows, naming the degree the data actually needs.  To
+/// make a query genuinely fit a smaller `k`, cap the input with
+/// `VPJOIN_MAX_EDGES` and let the derived degree fall on its own.
+fn forced_k(derived: u32) -> u32 {
+    let Ok(v) = std::env::var("VPJOIN_K") else {
+        return derived;
+    };
+    let k: u32 = v
+        .parse()
+        .unwrap_or_else(|_| panic!("VPJOIN_K=`{}` is not a degree", v));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "  [k] VPJOIN_K={} overrides every derived degree (first one derived here: {})",
+            k, derived
+        );
+    });
+    k
+}
+
 pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
-    match (query, dataset) {
+    let derived = match (query, dataset) {
         // TPC-H: every query includes lineitem (60,175 rows at the base
         // scale), so k = 16 there.
         //
@@ -310,7 +336,8 @@ pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
         ("gq3" | "gq4", _) => graph_degree(query, dataset, privacy),
 
         (q, d) => panic!("no degree tabulated for ({}, {})", q, d),
-    }
+    };
+    forced_k(derived)
 }
 
 // ---------------------------------------------------------------------------
@@ -628,11 +655,49 @@ fn graph_cache() -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<Vec
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Applies the `VPJOIN_MAX_EDGES` cap, the knob that shrinks a graph query into
+/// a smaller domain.
+///
+/// The degree cannot be chosen directly, because it is not a free parameter:
+/// the circuit height is the MATERIALIZED BAG, and the bag is a superlinear
+/// function of the edge list.  GQ3 on the full 27,806-edge lastfm graph has a
+/// 232,943-row wedge, so it needs k = 18 and no value of `k` alone changes that
+/// -- asking for 17 only makes the layout overflow.  Capping the edge list is
+/// what actually moves the degree: the first 21,403 lastfm edges give a
+/// 131,001-row wedge, which is the largest prefix that fits k = 17.
+///
+/// Everything downstream -- bag sizes, DP capacities, the public count, the
+/// degree -- is recomputed from the capped list, so a capped run is internally
+/// consistent.  It simply measures a smaller instance than the paper's, which
+/// is why the cap is echoed on stderr rather than applied silently.
+fn cap_edges(mut edges: Vec<Edge>, dataset: &str) -> Vec<Edge> {
+    let Ok(v) = std::env::var("VPJOIN_MAX_EDGES") else {
+        return edges;
+    };
+    let cap: usize = v
+        .parse()
+        .unwrap_or_else(|_| panic!("VPJOIN_MAX_EDGES=`{}` is not an edge count", v));
+    if edges.len() > cap {
+        eprintln!(
+            "  [graph] VPJOIN_MAX_EDGES={} truncates {} from {} edges -- this is a SMALLER \
+             instance than the paper's, not the published one",
+            cap,
+            dataset,
+            edges.len()
+        );
+        edges.truncate(cap);
+    }
+    edges
+}
+
 pub fn load_graph(dataset: &str) -> Vec<Edge> {
     let mut cache = graph_cache().lock().expect("graph cache poisoned");
     let edges = cache
         .entry(dataset.to_string())
-        .or_insert_with(|| std::sync::Arc::new(read_graph_file(dataset)));
+        // The cap is deterministic, so caching the capped list is
+        // indistinguishable from capping every clone -- and it keeps the
+        // stderr note to one line per dataset.
+        .or_insert_with(|| std::sync::Arc::new(cap_edges(read_graph_file(dataset), dataset)));
     (**edges).clone()
 }
 
@@ -826,14 +891,82 @@ pub enum Privacy {
     /// The hand-picked constants used for the submitted results
     /// (`dp/legacy_capacities.md`).  GQ3 and GQ4 share them.
     Legacy,
-  
+
+    /// Capacity = the WORST-CASE intra-cluster bound, i.e. TDJ's fully
+    /// oblivious default: the capacity is a function of the public input
+    /// cardinality alone, so it reveals nothing about the data and no DP budget
+    /// is spent.  `letter.tex` (Section TDJ) calls this the default for cyclic
+    /// queries; `Rjs` and `Legacy` do NOT provide it, and `Rjs` explicitly
+    /// leaks the true bag size.
+    ///
+    /// This regime is almost always too large to PROVE -- see
+    /// `oblivious_wedge_bound` for the numbers -- so its practical use is
+    /// `VPJOIN_PLAN_ONLY=1`, which reports the degree the fully oblivious
+    /// configuration would need without running anything.
+    Oblivious,
+
     Dp { epsilon: f64, delta: f64 },
+}
+
+/// The worst-case size of the wedge relation GQ3/GQ4 materialize, as a function
+/// of the PUBLIC edge count alone.  This is the capacity `Privacy::Oblivious`
+/// pads to, and the one number the fully oblivious claim rests on, so the
+/// derivation is written out here rather than left implicit.
+///
+/// DERIVATION.  Both cyclic queries materialize
+/// `wedge = sum_v indeg_lt(v) * outdeg(v)` over one Edge relation joined to
+/// itself on the middle vertex (see `bag_stats`).  Write `a_v` for the incoming
+/// count at `v` and `b_v` for the outgoing count.  Every edge is counted in at
+/// most one `a_v` and exactly one `b_v`, so `sum_v a_v <= m` and
+/// `sum_v b_v = m` with `m = |E|`.  Maximising `sum_v a_v * b_v` under those
+/// constraints concentrates everything on a single hub: splitting a hub's `m`
+/// incident edges as `a + b = m` gives the product `a*b <= floor(m/2)*ceil(m/2)`,
+/// and spreading over `h` hubs gives only `m^2 / (4h)`, so one hub is optimal.
+/// A star centred on a high-id vertex attains it, and the `src < dst` filter
+/// costs nothing there, so the bound is TIGHT:
+///
+///   worst-case wedge = floor(m/2) * ceil(m/2)   (~ m^2 / 4)
+///
+/// PUBLIC FREQUENCY BOUND.  If the deployment declares a public degree bound
+/// `tau` via `VPJOIN_TAU_PUB` (the same knob the DP path uses to skip its
+/// degree release), then `a_v, b_v <= tau` gives
+/// `sum_v a_v * b_v <= tau * sum_v a_v <= tau * m`, and the bound tightens to
+/// `min(tau * m, floor(m/2) * ceil(m/2))`.  Without such a declaration the max
+/// degree is PRIVATE (see the note in `graph_pads`), so the quadratic bound is
+/// the only sound choice.
+///
+/// SCALE.  On the shipped graphs, with no public `tau`:
+///   lastfm    m = 27,806  ->    193,293,409 rows -> k = 28
+///   facebook  m = 88,234  ->  1,946,309,689 rows -> k = 31
+///   wiki      m = 103,689 ->  2,687,842,180 rows -> k = 32
+/// against k = 18/22/22 for the true sizes, i.e. 10-13 further doublings.  A
+/// k = 32 domain at degree 7 needs a 2^35 extended domain, so these are
+/// planning numbers, not runnable ones.
+pub fn oblivious_wedge_bound(_dataset: &str, n_edges: usize) -> u64 {
+    let m = n_edges as u64;
+    let quadratic = (m / 2) * (m - m / 2);
+    // UNLIKE the DP path, this regime does NOT fall back to
+    // `declared_degree_cap`: the paper charges PoneglyphDB from public
+    // cardinalities alone (letter.tex, "no schema constraint"), so symmetry
+    // demands VPJoin's fully oblivious bound rest on the same information.
+    // The caps are also not declared anywhere in the paper (lastfm's 384 is a
+    // lane boundary, facebook/wiki's 2048 derive from realized max degrees).
+    // Only an EXPLICIT deployment declaration via VPJOIN_TAU_PUB tightens it.
+    let tau_pub: Option<u64> = std::env::var("VPJOIN_TAU_PUB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&t| t > 0);
+    match tau_pub {
+        Some(tau) => quadratic.min(tau.saturating_mul(m)),
+        None => quadratic,
+    }
 }
 
 impl Privacy {
     pub fn label(&self) -> String {
         match self {
             Privacy::Rjs => "rjs".to_string(),
+            Privacy::Oblivious => "oblivious".to_string(),
             Privacy::Legacy => "legacy-dp".to_string(),
             Privacy::Dp { epsilon, delta } => format!("dp(eps={} del={})", epsilon, delta),
         }
@@ -861,6 +994,26 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
         // Values used for the DP results reported in the paper; see
         // `dp/legacy_capacities.md` and the note in `q5_obj.rs`.
         Privacy::Legacy => (0, 2848, 59452),
+        // Fully oblivious: each materialized bag padded to the product of the
+        // public cardinalities of the relations feeding it, which is the same
+        // worst-case rule `letter.tex` applies to the PoneglyphDB estimate.
+        // The NR bag is the fixed TPC-H nation/region catalogue (25 x 5),
+        // public dimension data, so it needs no pad.
+        Privacy::Oblivious => {
+            let TpchInput::Q5 {
+                customer, orders, lineitem, supplier, ..
+            } = q5_raw_cached()
+            else {
+                unreachable!("q5_raw_cached() returns Q5")
+            };
+            let co_bound = (customer.len() as u64).saturating_mul(orders.len() as u64);
+            let ls_bound = (lineitem.len() as u64).saturating_mul(supplier.len() as u64);
+            (
+                0,
+                co_bound.saturating_sub(orders.len() as u64) as usize,
+                ls_bound.saturating_sub(q5_ls_true() as u64) as usize,
+            )
+        }
         Privacy::Dp { epsilon, delta } => {
             let (nr, co, ls) = match q5_raw_cached() {
                 TpchInput::Q5 {
@@ -1137,6 +1290,29 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
             let p = cyclic_pad_extra(dataset);
             (p, p)
         }
+        // TDJ's fully oblivious default: pad each materialized bag up to the
+        // worst-case intra-cluster bound, which depends only on the public edge
+        // count.  Nothing about the data reaches the capacity, so no DP budget
+        // is spent -- and unlike `Legacy`, whose constants were picked to sit
+        // just above the observed sizes, this actually hides the bag size.
+        //
+        // Only bag 1 is data dependent for GQ3: `bag_stats` marks bag 2 public
+        // (it is the raw Edge relation, whose size is the committed input
+        // length), so padding it would hide nothing and cost rows.  GQ4
+        // materializes ONE relation read in two roles and its consumers read
+        // `.0`, so both entries carry the same pad.
+        Privacy::Oblivious => {
+            let s = bag_stats(query, edges);
+            let bound = oblivious_wedge_bound(dataset, edges.len());
+            let pad_of = |true_size: u64| bound.saturating_sub(true_size) as usize;
+            let p1 = pad_of(s.bag1_size);
+            let p2 = if s.bag2_is_public {
+                0
+            } else {
+                pad_of(s.bag2_size)
+            };
+            (p1, p2)
+        }
         Privacy::Dp { epsilon, delta } => {
             let s = bag_stats(query, edges);
             let mut rng = dp_rng(query, dataset);
@@ -1347,7 +1523,10 @@ fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         (0, 0)
     };
     let k = match query {
-        "gq3" | "gq4" => ceil_log2(graph_rows(&edges, query, pad1, pad2) + 64),
+        // Computed here rather than via `degree_for` so the pads are not
+        // derived twice; `forced_k` is applied on this branch only, since
+        // `degree_for` already applies it on the other.
+        "gq3" | "gq4" => forced_k(ceil_log2(graph_rows(&edges, query, pad1, pad2) + 64)),
         _ => degree_for(query, dataset, privacy),
     };
     row.config = if matches!(query, "gq3" | "gq4") {
@@ -2399,3 +2578,48 @@ impl TpchInput {
     }
 }
 
+
+#[cfg(test)]
+mod oblivious_bound_tests {
+    use super::*;
+
+    /// One test, not two: both directions mutate the process-global
+    /// VPJOIN_TAU_PUB and cargo's default runner is threaded, so as separate
+    /// tests they could observe each other's env window and fail spuriously.
+    ///
+    /// Direction 1: the bound is the exact maximum of
+    /// `sum_v indeg_lt(v)*outdeg(v)` over all graphs with `m` edges, so a
+    /// brute-force search over hub splits must not beat it.
+    /// Direction 2: an EXPLICIT public degree bound tightens the capacity;
+    /// without one the quadratic bound stands (the max degree is private, and
+    /// the declared_degree_cap fallback deliberately does NOT apply here).
+    #[test]
+    fn oblivious_wedge_bound_is_tight_and_tau_gated() {
+        std::env::remove_var("VPJOIN_TAU_PUB");
+        for m in [2u64, 3, 7, 8, 100, 27_806] {
+            // one hub: split m incident edges into a incoming, b = m - a outgoing
+            let one_hub = (0..=m).map(|a| a * (m - a)).max().unwrap();
+            // h hubs, each with m/h edges split evenly, is the spread-out case
+            let spread = (2..=8u64)
+                .map(|h| {
+                    let per = m / h;
+                    h * (per / 2) * (per - per / 2)
+                })
+                .max()
+                .unwrap_or(0);
+            let bound = oblivious_wedge_bound("facebook", m as usize);
+            assert_eq!(bound, one_hub, "m = {}", m);
+            assert!(bound >= spread, "spreading beat the bound at m = {}", m);
+        }
+        // no fallback to declared_degree_cap: "facebook" above must have used
+        // the quadratic bound even though a cap is tabulated for it
+        let m = 88_234usize;
+        let quadratic = oblivious_wedge_bound("facebook", m);
+        assert_eq!(quadratic, 44_117 * 44_117);
+        std::env::set_var("VPJOIN_TAU_PUB", "1043");
+        let with_tau = oblivious_wedge_bound("facebook", m);
+        std::env::remove_var("VPJOIN_TAU_PUB");
+        assert_eq!(with_tau, 1043 * m as u64);
+        assert!(with_tau < quadratic);
+    }
+}

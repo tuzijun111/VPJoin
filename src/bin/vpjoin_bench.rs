@@ -44,7 +44,19 @@
 //!                           <out.csv> argument; ignored without one.
 //!             VPJOIN_PRIVACY  how the queries that MATERIALIZE intermediates
 //!                           (Q5, GQ3, GQ4) size their bags:
-//!                             dp (default) | rjs | legacy
+//!                             dp (default) | rjs | oblivious | legacy
+//!                           `oblivious` is TDJ's fully oblivious default: each
+//!                           materialized bag is padded to its WORST-CASE bound,
+//!                           a function of the public input length alone, so no
+//!                           DP budget is spent and the bag size is genuinely
+//!                           hidden (`rjs` reveals it exactly, and `legacy`'s
+//!                           hand-picked constants sit just above the observed
+//!                           sizes).  It is normally far too large to prove --
+//!                           GQ3/GQ4 land at k=28/31/32 -- so pair it with
+//!                           VPJOIN_PLAN_ONLY=1 to read off the degree the fully
+//!                           oblivious configuration needs.  See
+//!                           `bench_queries::oblivious_wedge_bound` for the
+//!                           derivation.
 //!                           Q5 supports all three; under dp BOTH bags get a
 //!                           release and k grows with the capacities (k=20
 //!                           at eps=0.1, k=16 at eps>=1; see q5_pads).
@@ -54,6 +66,22 @@
 //!                           re-run reproduces the same circuit sizes
 //!             VPJOIN_PLAN_ONLY =1 to print the planned degrees and exit
 //!                           without proving anything
+//!             VPJOIN_MAX_EDGES  cap the edge list of every graph dataset, so a
+//!                           graph query runs at a smaller degree.  `k` is NOT
+//!                           a free parameter -- it is the height of the
+//!                           materialized bag -- so this, not VPJOIN_K, is how
+//!                           to move it: GQ3 on all 27,806 lastfm edges has a
+//!                           232,943-row wedge (k=18), while the first 21,403
+//!                           edges give 131,001 rows, the largest prefix that
+//!                           fits k=17.  Bag sizes, DP capacities, the public
+//!                           count and the degree are all recomputed from the
+//!                           capped list, so the run is self-consistent; it
+//!                           just measures a smaller instance than the paper's.
+//!             VPJOIN_K      prove at this degree instead of the derived one.
+//!                           A LARGER k proves the same circuit in a bigger
+//!                           domain; a SMALLER one is rejected by keygen as
+//!                           soon as the layout overflows, so it cannot be used
+//!                           to shrink a circuit -- use VPJOIN_MAX_EDGES.
 //!
 //! Drop `--release` to measure under the unoptimized profile, which is the
 //! same profile `cargo test` uses.
@@ -270,6 +298,7 @@ fn main() {
     let privacy = match std::env::var("VPJOIN_PRIVACY").as_deref().unwrap_or("dp") {
         "rjs" => Privacy::Rjs,
         "legacy" => Privacy::Legacy,
+        "oblivious" => Privacy::Oblivious,
         "dp" => {
             let epsilon: f64 = std::env::var("VPJOIN_EPS")
                 .ok()
@@ -282,7 +311,10 @@ fn main() {
             Privacy::Dp { epsilon, delta }
         }
         other => {
-            eprintln!("unknown VPJOIN_PRIVACY `{}` (expected rjs, legacy or dp)", other);
+            eprintln!(
+                "unknown VPJOIN_PRIVACY `{}` (expected rjs, oblivious, legacy or dp)",
+                other
+            );
             std::process::exit(2);
         }
     };

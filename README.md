@@ -168,3 +168,38 @@ VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_
 VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
+
+**5. Estimation anchors.** The PoneglyphDB times and VPJoin's fully oblivious
+cyclic times cannot be run to completion, so both are extrapolated from a measured
+anchor: each is that anchor's per-domain-row rate, `T_0 / 2^k`, charged for every
+row of the padded domain. These two commands produce the four graph anchors.
+
+The edge caps are what make the anchors usable. Each one sizes the circuit to
+*fill* its domain (99.95-99.98%), and that matters because a row the layout never
+assigns is identically zero and is skipped by the commitment MSM, whereas an
+obliviousness padding dummy carries field values and costs full price. An anchor
+that left much of its domain empty would under-measure the rate a padded circuit
+actually pays. One anchor per query serves all three datasets, since the
+constraint system depends only on the query shape and the dataset only sets the
+row count.
+
+`VPJOIN_K=16` is needed only for the path queries: `degree_for` pins GQ1/GQ2 to
+`k=17` for every graph, and no dataset has enough edges to fill `2^17` (wiki, the
+largest, reaches 79%). GQ3/GQ4 derive `k=17` from the capped data on their own.
+
+```bash
+VPJOIN_OBJ=new VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=65520 VPJOIN_K=16 cargo vpjoin simplification anchors_gq12.csv gq1:wiki gq2:wiki
+```
+
+```bash
+VPJOIN_OBJ=new VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=21403 cargo vpjoin simplification anchors_gq34.csv gq3:lastfm gq4:lastfm
+```
+
+Transcribe `wall_s` and `k` from the two CSVs into `dp/time_combined.py`
+(`r_gq1`..`r_gq4`) and into `dp/dp_para_gq3.py` / `dp/dp_para_gq4.py` (`rate`).
+`wall_s` rather than `prove_s`: key generation is 21-32% of the total here, and
+its commitment work also tracks the assigned rows, so it scales with a padded
+domain like the rest.
+
+Drop the `.csv` argument to print the rows without writing a file. Prefix with
+`VPJOIN_PLAN_ONLY=1` to confirm the degrees before spending the ~8 minutes.
