@@ -6,6 +6,10 @@ use crate::chips::lessthan_or_equal_generic::{
     LtEqGenericChip, LtEqGenericConfig, LtEqGenericInstruction,
 };
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
@@ -203,11 +207,18 @@ pub struct Q5DpConfig<F: Field + Ord> {
     q_nr_pad: Selector,     // rows [nation.len(), nr_total): keep == 0
     nr_rname: Column<Advice>,
     nr_keep: Column<Advice>,
-    cflag_nr: Column<Advice>, // clean indicator per nation row
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED cluster relation, one
+    // permutation each, laid out ONCE and never per lane. A relation at a DP
+    // capacity has its padding rows in the residual part, indicator zero.
+    row_idx: RowIndexConfig,
+    cons_nr: ConserveConfig,
+    cons_co: ConserveConfig,
+    cons_ls: ConserveConfig,
+
+    cflag_nr: Column<Advice>, // the selector bit c per NR row
     nr_pair: Vec<Column<Advice>>,
-    nr_filt_pad: Vec<Column<Advice>>,
-    nr_out_pad: Vec<Column<Advice>>, // [clean rows | residual rows | pad rows]
-    perm_nr: PermAnyConfig,
+    q_row_nr: Selector, // rows [0, nr_total): the NR relation's whole capacity
     iz_nr: IsZeroConfig<F>,
 
     // ---------------- bag materialization: CO ----------------
@@ -224,9 +235,7 @@ pub struct Q5DpConfig<F: Field + Ord> {
     co_nk: Column<Advice>,
     co_pair: Vec<Column<Advice>>,
     co_pkey: Column<Advice>, // co_pair[0]*SHIFT_NATION + co_pair[1]
-    co_filt_pad: Vec<Column<Advice>>,
-    co_out_pad: Vec<Column<Advice>>, // [clean rows | residual rows | pad rows]
-    perm_co: PermAnyConfig,
+    q_row_co: Selector, // rows [0, co_total): the CO relation's whole capacity
     lteq_start_le_odate: LtEqGenericConfig<F, NUM_BYTES>,
     lt_odate_lt_end: LtConfig<F, NUM_BYTES>,
 
@@ -245,12 +254,10 @@ pub struct Q5DpConfig<F: Field + Ord> {
     ls_part_pad: Vec<Column<Advice>>,
     perm_ls: PermAnyConfig,
 
-    // -------- condition (9), Pairwise Consistency --------
-    // One complex selector per relation of the cluster tree, enabled over
-    // exactly the clean section of that relation's partition group.
-    q_pw_ls: Selector, // rows [0, |LS^c|) of ls_part_pad (union of the lanes)
-    q_pw_co: Selector, // rows [0, |CO^c|) of co_out_pad
-    q_pw_nr: Selector, // rows [0, |NR^c|) of nr_out_pad
+    // -------- (2) Pairwise Consistency --------
+    // Both sides of every lookup read a COMMITTED key column gated by that
+    // relation's selector bit, so no clean-prefix extent reaches the fixed
+    // columns. `q_row_nr` / `q_row_co` above and `q_ls_join` are the ranges.
 
     // -------- condition (10), Cardinality Preservation --------
     // |R^c join| == |R join| over the cluster tree rooted at LS, accumulated
@@ -262,9 +269,11 @@ pub struct Q5DpConfig<F: Field + Ord> {
     cp_root: CpRootConfig,
     q_cp_mu: Selector,
 
-    // clean/residual flag on the partition side of each Conservation Check
-    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1   [NR, CO, LS]
-    q_res_flag: Vec<Selector>, // rows of R^r: flag == 0   [NR, CO, LS]
+    // The LS union-of-lanes compaction, which is NOT an OBJ condition: it is
+    // the padding layer that tethers the lanes' clean `ls_join` cells to one
+    // column group in global pipeline order. See the note in `configure`.
+    q_cln_flag: Vec<Selector>, // rows of LS^c inside ls_part_pad: flag == 1
+    q_res_flag: Vec<Selector>, // rows of LS^r: flag == 0
     q_pad_flag: Vec<Selector>, // pad tail: the whole row is the PAD tuple
 
     // ---------------- lanes (shared selectors, per-lane columns) ----------
@@ -417,14 +426,12 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let nr_pair = vec![meta.advice_column(), meta.advice_column()];
         // One column wider than before: the last column of each side carries the
         // clean indicator, so the Conservation Check binds it.
-        let (nr_filt_pad, nr_out_pad, perm_nr) = {
-            let q1 = meta.complex_selector();
-            let q2 = meta.complex_selector();
-            let a = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-            let b = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-            let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
-            (a, b, perm)
-        };
+        // The NR relation occupies its whole capacity, rows [0, nr_total): the
+        // real nations first, then padding rows whose predicate bit `q_nr_pad`
+        // pins to 0. That capacity is the DP padding layer and is unchanged
+        // here; what is gone is the `[clean | residual | pad]` group and the
+        // Conservation shuffle that used to bind the indicator to it.
+        let q_row_nr = meta.complex_selector();
 
         meta.lookup_any("nation_region_join", |m| {
             let q = m.query_selector(q_nr_join);
@@ -477,10 +484,21 @@ impl<F: Field + Ord> Q5DpChip<F> {
         // such as 1 + 1/k parked in that tail inflates the clean channel of
         // condition (10) by a fraction, which is exactly the compensation the
         // check exists to forbid.
-        meta.create_gate("cflag_nr is a bit", |m| {
-            let q = m.query_selector(q_nr_pred);
+        // ---------- (1) Selector Check on NR ----------
+        // Under `q_row_nr`, so it covers the capacity tail as well as the real
+        // nations. The predicate half is what the link gate used to give
+        // structurally; on a capacity row `nr_keep` is pinned to 0, so it also
+        // confines the selection to the real rows, which is the paper's cluster
+        // adjustment.
+        meta.create_gate("NR selector is a bit and implies its predicate", |m| {
+            let q = m.query_selector(q_row_nr);
             let c = m.query_advice(cflag_nr, Rotation::cur());
-            vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+            let b = m.query_advice(nr_keep, Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+            vec![
+                q.clone() * c.clone() * (one.clone() - c.clone()),
+                q * c * (one - b),
+            ]
         });
 
         // NR padding rows carry no nation, so their predicate bit is 0 and the
@@ -488,27 +506,6 @@ impl<F: Field + Ord> Q5DpChip<F> {
         meta.create_gate("NR pad row keeps nothing", |m| {
             let q = m.query_selector(q_nr_pad);
             vec![q * m.query_advice(nr_keep, Rotation::cur())]
-        });
-
-        // link nr_filt_pad = keep? [nr_pair, cflag_nr] : [PAD, PAD, 0]
-        // The indicator column pads with 0, so a nation dropped by the EUROPE
-        // predicate is never clean and contributes to neither channel of the
-        // Cardinality Preservation Check.
-        let nr_base = [nr_pair[0], nr_pair[1], cflag_nr];
-        let nr_base_pad = [PAD_U64, PAD_U64, 0u64];
-        meta.create_gate("link nr_filt_pad", |m| {
-            let q = m.query_selector(perm_nr.q_perm1);
-            let keep = m.query_advice(nr_keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let drop = one.clone() - keep.clone();
-            let mut cs = vec![q.clone() * keep.clone() * (one.clone() - keep.clone())];
-            for j in 0..3 {
-                let b = m.query_advice(nr_base[j], Rotation::cur());
-                let f = m.query_advice(nr_filt_pad[j], Rotation::cur());
-                let p = Expression::Constant(F::from(nr_base_pad[j]));
-                cs.push(q.clone() * (f - (keep.clone() * b + drop.clone() * p)));
-            }
-            cs
         });
 
         // ---------------- CO materialization (as q5_obj) ----------------
@@ -527,14 +524,9 @@ impl<F: Field + Ord> Q5DpChip<F> {
         let co_nk = meta.advice_column();
         let co_pair = vec![meta.advice_column(), meta.advice_column()];
         let co_pkey = meta.advice_column();
-        let (co_filt_pad, co_out_pad, perm_co) = {
-            let q1 = meta.complex_selector();
-            let q2 = meta.complex_selector();
-            let a = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-            let b = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-            let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
-            (a, b, perm)
-        };
+        // As on the NR side: the CO relation occupies its whole capacity, rows
+        // [0, co_total), and that capacity is the DP padding layer, untouched.
+        let q_row_co = meta.complex_selector();
 
         meta.lookup_any("orders_customer_join", |m| {
             let q = m.query_selector(q_oc_join);
@@ -619,32 +611,20 @@ impl<F: Field + Ord> Q5DpChip<F> {
         // same two patches as on the NR side: the clean indicator is a bit, and
         // a CO padding row (one past orders.len(), still inside the Conservation
         // permutation) keeps nothing, so its co_filt_pad row is the PAD tuple.
-        meta.create_gate("cflag_co is a bit", |m| {
-            let q = m.query_selector(q_co_and);
+        // ---------- (1) Selector Check on CO ----------
+        meta.create_gate("CO selector is a bit and implies its predicate", |m| {
+            let q = m.query_selector(q_row_co);
             let c = m.query_advice(cflag_co, Rotation::cur());
-            vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+            let b = m.query_advice(co_keep, Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+            vec![
+                q.clone() * c.clone() * (one.clone() - c.clone()),
+                q * c * (one - b),
+            ]
         });
         meta.create_gate("CO pad row keeps nothing", |m| {
             let q = m.query_selector(q_co_pad);
             vec![q * m.query_advice(co_keep, Rotation::cur())]
-        });
-
-        // link co_filt_pad = keep? [co_pair, cflag_co] : [PAD, PAD, 0]
-        let co_base = [co_pair[0], co_pair[1], cflag_co];
-        let co_base_pad = [PAD_U64, PAD_U64, 0u64];
-        meta.create_gate("link co_filt_pad", |m| {
-            let q = m.query_selector(perm_co.q_perm1);
-            let keep = m.query_advice(co_keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let drop = one.clone() - keep.clone();
-            let mut cs = vec![q.clone() * keep.clone() * (one.clone() - keep.clone())];
-            for j in 0..3 {
-                let b = m.query_advice(co_base[j], Rotation::cur());
-                let f = m.query_advice(co_filt_pad[j], Rotation::cur());
-                let p = Expression::Constant(F::from(co_base_pad[j]));
-                cs.push(q.clone() * (f - (keep.clone() * b + drop.clone() * p)));
-            }
-            cs
         });
 
         // ---------------- LS materialization (as q5_obj) ----------------
@@ -737,34 +717,32 @@ impl<F: Field + Ord> Q5DpChip<F> {
             PermAnyChip::configure(meta, q1, q2, ls_in, ls_part_pad.clone())
         };
 
-        // -------- partition side of the clean indicator: 1 on R^c, 0 on R^r ----
-        // Each partition column group is laid out as [clean rows | residual rows
-        // | pad rows], so one selector per section pins the indicator. Without
-        // these the prover could mark a residual row clean and inflate the clean
-        // channel of condition (10).
-        let q_cln_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-        // ... and one for the third section. Without it the pad tail of
-        // nr_out_pad / co_out_pad is the one place a flag = 1 row can sit while
-        // being outside the clean section: the Conservation shuffle only fixes the
-        // MULTISET, so the count of flag = 1 rows on the input side could exceed
-        // |R^c| with the surplus parked in the tail, and each surplus row still
-        // feeds the clean channel of condition (10) through `*_filt_pad[2]`. Those
-        // rows are also inside the table of the name-attachment lookup, so pinning
-        // the whole row (not just the flag) to the canonical PAD tuple is what
-        // stops a fabricated (nationkey, name) pair from living there.
-        let q_pad_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
+        // -------- the LS union-of-lanes compaction, NOT an OBJ condition ------
+        // `ls_part_pad` is laid out as [clean rows | residual rows | pad rows]
+        // and its clean prefix is copy-constrained, in GLOBAL pipeline order,
+        // to the lanes' clean `ls_join` cells. That is the multi-lane design
+        // rule this file rests on: every condition attaches to a column group
+        // laid out ONCE, and the lane rows are tethered to it at both ends.
+        //
+        // This group is not part of the OBJ itself. All three conditions read
+        // the committed rows through `cflag_ls`, which
+        // has its own booleanity gate. What the shuffle and these pins still
+        // buy is the PADDING LAYER: they certify that the clean prefix holds
+        // exactly the selected LS tuples, which is what lets the lanes cover
+        // |LS^c| + ls_pad_extra rows rather than every committed lineitem row,
+        // and it is what the released capacity is spent on. NR and CO have no
+        // lane pipeline, so their groups are gone entirely.
+        let q_cln_flag = (0..1).map(|_| meta.selector()).collect::<Vec<_>>();
+        let q_res_flag = (0..1).map(|_| meta.selector()).collect::<Vec<_>>();
+        let q_pad_flag = (0..1).map(|_| meta.selector()).collect::<Vec<_>>();
 
-        for (idx, part) in [nr_out_pad.clone(), co_out_pad.clone(), ls_part_pad.clone()]
-            .iter()
-            .enumerate()
         {
-            let cols = part.clone();
-            let flag_col = *part.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            let q_p = q_pad_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
+            let cols = ls_part_pad.clone();
+            let flag_col = *ls_part_pad.last().unwrap();
+            let q_c = q_cln_flag[0];
+            let q_r = q_res_flag[0];
+            let q_p = q_pad_flag[0];
+            meta.create_gate("LS compaction: flag on each section", move |m| {
                 let qc = m.query_selector(q_c);
                 let qr = m.query_selector(q_r);
                 let qp = m.query_selector(q_p);
@@ -784,72 +762,73 @@ impl<F: Field + Ord> Q5DpChip<F> {
             });
         }
 
-        // ---------------- condition (9), Pairwise Consistency ----------------
-        // Two mutual Membership Checks per edge of the cluster tree, each looking
-        // one clean relation's key column up DIRECTLY in the adjacent clean
-        // relation's key column. The previous version of this file had, per lane,
-        // only the LS -> child direction, and it looked into plain advice columns
-        // (`co_key` / `nr_key`) filled from the FULL filtered bags. Three holes:
+        // ---------------- (1) Conservation Check ----------------
+        // One permutation per cluster relation, over column groups laid out
+        // ONCE rather than per lane, which is the design rule this file rests
+        // on. The indices are distinct, so the indexed relation is a set even
+        // though the relation is a bag, and the single permutation rules out an
+        // occurrence being fabricated, lost, duplicated or counted on both
+        // sides: no Non-Membership Check.
         //
-        //  * nothing bound those tables to the relation they claimed to
-        //    enumerate, so a prover could fill them with pi_K(LS^c) and pass;
-        //  * the mirror direction was missing, so a CO^c or NR^c tuple whose key
-        //    matched no clean LS tuple contributed to neither channel of
-        //    condition (10) and was invisible;
-        //  * being per lane, the LS side spoke about a lane, not about LS^c.
-        //
-        // All three go away by running both directions of both edges between the
-        // clean key columns themselves, with the LS side taken on `ls_part_pad`,
-        // which is the union of the lanes (see the module header).
-        //
-        // A lookup input is 0 on every row where its selector is off, and the
-        // table side is 0 on those rows too, so 0 is always in the table and the
-        // gated-off rows cost nothing. Real orderkeys are at least 1 in TPC-H and
-        // every nationkey is stored shifted by +1, so both keys are nonzero on the
-        // rows that matter and the containment is over the real keys.
-        let q_pw_ls = meta.complex_selector();
-        let q_pw_co = meta.complex_selector();
-        let q_pw_nr = meta.complex_selector();
+        // LS carries a second permutation, `perm_ls`, which is NOT this
+        // condition: it is the union-of-lanes compaction that tethers the lanes
+        // to one group in global pipeline order and lets them cover
+        // |LS^c| + ls_pad_extra rows.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons_nr = configure_conserve::<F>(meta, &row_idx, &nr_pair, cflag_nr);
+        let cons_co = configure_conserve::<F>(meta, &row_idx, &co_pair, cflag_co);
+        let cons_ls = configure_conserve::<F>(meta, &row_idx, &ls_mat, cflag_ls);
 
-        let ls_ok = ls_part_pad[0];
-        let ls_nk = ls_part_pad[1];
-        let co_ok = co_out_pad[0];
-        let co_nk_p = co_out_pad[1];
-        let nr_nk = nr_out_pad[0];
+        // ---------------- (2) Pairwise Consistency ----------------
+        // Two mutual Membership Checks per edge of the cluster tree, each
+        // looking one relation's key column up directly in the adjacent
+        // relation's. Both sides read the COMMITTED columns gated by that
+        // relation's selector bit:
+        //
+        //     q_row * c(t) * (key + 1),
+        //
+        // so a deselected row, a capacity padding row and a row past the
+        // relation all read 0, 0 is in every table, and the containment is over
+        // the selected keys only. The shift by one stops a real key of 0 from
+        // colliding with that gated-off 0.
+        //
+        // This is also what makes the condition lane-agnostic. Reading it off
+        // the clean prefix of `ls_part_pad` worked only because that group is
+        // the union of the lanes in global pipeline order, and the gating
+        // selector's extent was |LS^c|, a private length baked into a fixed
+        // column. Here the LS side is the committed lineitem row, which no lane
+        // touches, and the three extents are |lineitem|, nr_total and co_total,
+        // all public.
+        let mut pw_edge = |name: &'static str,
+                           q_in: Selector,
+                           c_in: Column<Advice>,
+                           k_in: Column<Advice>,
+                           q_tb: Selector,
+                           c_tb: Column<Advice>,
+                           k_tb: Column<Advice>| {
+            meta.lookup_any(name, move |m| {
+                let one = Expression::Constant(F::ONE);
+                let lhs = m.query_selector(q_in)
+                    * m.query_advice(c_in, Rotation::cur())
+                    * (m.query_advice(k_in, Rotation::cur()) + one.clone());
+                let rhs = m.query_selector(q_tb)
+                    * m.query_advice(c_tb, Rotation::cur())
+                    * (m.query_advice(k_tb, Rotation::cur()) + one);
+                vec![(lhs, rhs)]
+            });
+        };
 
         // edge (LS, CO) on the packed (o_orderkey, nationkey_shift) key
-        meta.lookup_any("pw: LS^c pkey in CO^c pkey", move |m| {
-            let s = Expression::Constant(F::from(SHIFT_NATION));
-            let lhs = m.query_selector(q_pw_ls)
-                * (m.query_advice(ls_ok, Rotation::cur()) * s.clone()
-                    + m.query_advice(ls_nk, Rotation::cur()));
-            let rhs = m.query_selector(q_pw_co)
-                * (m.query_advice(co_ok, Rotation::cur()) * s
-                    + m.query_advice(co_nk_p, Rotation::cur()));
-            vec![(lhs, rhs)]
-        });
-        meta.lookup_any("pw: CO^c pkey in LS^c pkey", move |m| {
-            let s = Expression::Constant(F::from(SHIFT_NATION));
-            let lhs = m.query_selector(q_pw_co)
-                * (m.query_advice(co_ok, Rotation::cur()) * s.clone()
-                    + m.query_advice(co_nk_p, Rotation::cur()));
-            let rhs = m.query_selector(q_pw_ls)
-                * (m.query_advice(ls_ok, Rotation::cur()) * s
-                    + m.query_advice(ls_nk, Rotation::cur()));
-            vec![(lhs, rhs)]
-        });
+        pw_edge("pw: LS^c pkey in CO^c pkey",
+            q_ls_join, cflag_ls, ls_pkey, q_row_co, cflag_co, co_pkey);
+        pw_edge("pw: CO^c pkey in LS^c pkey",
+            q_row_co, cflag_co, co_pkey, q_ls_join, cflag_ls, ls_pkey);
 
         // edge (LS, NR) on nationkey_shift
-        meta.lookup_any("pw: LS^c nationkey in NR^c nationkey", move |m| {
-            let lhs = m.query_selector(q_pw_ls) * m.query_advice(ls_nk, Rotation::cur());
-            let rhs = m.query_selector(q_pw_nr) * m.query_advice(nr_nk, Rotation::cur());
-            vec![(lhs, rhs)]
-        });
-        meta.lookup_any("pw: NR^c nationkey in LS^c nationkey", move |m| {
-            let lhs = m.query_selector(q_pw_nr) * m.query_advice(nr_nk, Rotation::cur());
-            let rhs = m.query_selector(q_pw_ls) * m.query_advice(ls_nk, Rotation::cur());
-            vec![(lhs, rhs)]
-        });
+        pw_edge("pw: LS^c nationkey in NR^c nationkey",
+            q_ls_join, cflag_ls, ls_mat[1], q_row_nr, cflag_nr, nr_pair[0]);
+        pw_edge("pw: NR^c nationkey in LS^c nationkey",
+            q_row_nr, cflag_nr, nr_pair[0], q_ls_join, cflag_ls, ls_mat[1]);
 
         // ------------- condition (10), Cardinality Preservation -------------
         // One fixed column serves every Lt chip of the check (and the merge
@@ -865,7 +844,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
             cp_u8,
             co_pkey,
             co_keep,
-            co_filt_pad[2],
+            cflag_co,
             PAD_U64,
         );
         let cp_agg_nr = configure_cp_agg::<F, NUM_BYTES>(
@@ -873,7 +852,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
             cp_u8,
             nr_pair[0],
             nr_keep,
-            nr_filt_pad[2],
+            cflag_nr,
             PAD_U64,
         );
 
@@ -1189,10 +1168,21 @@ impl<F: Field + Ord> Q5DpChip<F> {
         // it equal to the last nationkey in msort makes the final emit gate write
         // PAD instead of that group's revenue and the corresponding nation
         // vanishes from the answer, with the name lookup going vacuous with it.
+        //
+        // The pinned value is PAD_U64 rather than 0, which follows from the
+        // name-attachment lookup below: its table is the committed NR pair
+        // gated by `cflag_nr`, and a capacity row
+        // contributes the all-zero tuple rather than (PAD, PAD), so a trailing
+        // run of PAD-keyed merge sentinels has nothing to attach to and must
+        // never close. Every real nationkey is stored shifted by +1, so a real
+        // group still ends the moment the next row carries a different key.
         let q_m_sentinel = meta.selector();
-        meta.create_gate("msort group-by sentinel is 0", |m| {
+        meta.create_gate("msort group-by sentinel is PAD", |m| {
             let q = m.query_selector(q_m_sentinel);
-            vec![q * m.query_advice(msort[0], Rotation::cur())]
+            vec![
+                q * (m.query_advice(msort[0], Rotation::cur())
+                    - Expression::Constant(F::from(PAD_U64))),
+            ]
         });
 
         let q_m_line = meta.selector();
@@ -1285,33 +1275,34 @@ impl<F: Field + Ord> Q5DpChip<F> {
             vec![q * (m.query_advice(m_res_is_last, Rotation::cur()) - is_last)]
         });
 
-        // attach (nk,name) via lookup into nr_out_pad, ONCE for all lanes
+        // attach (nk, name) by looking the merged group up in the SELECTED NR
+        // rows, ONCE for all lanes. The table side is the committed pair gated
+        // by `cflag_nr`, so a deselected nation, a capacity padding row and a
+        // row past nr_total all contribute the all-zero tuple, which is what a
+        // gated-off input row reads; the shift by one keeps that dummy away
+        // from any real pair.
         //
-        // The table side is gated by `perm_nr.q_perm2`, the selector of the
-        // nr_out_pad side of the NR Conservation Check, which is enabled over
-        // exactly rows [0, nr_total) -- the assigned rows of that table. Ungated,
-        // the table was the whole column, so rows past nr_total were
-        // prover-chosen entries and ANY group could be labelled with a fabricated
-        // nation name; the emit gate constrains m_res_pad[1] only through
-        // `not_last * (out_nm - PAD)`, which vanishes on exactly the rows that
-        // carry a real group, so on those rows this lookup is the name's only
-        // tether.
-        let q_nr_tbl = perm_nr.q_perm2;
+        // Gating by the bit is what makes this tight. Gating instead by a
+        // permutation selector over the assigned rows of an `nr_out_pad` group
+        // would put every RESIDUAL nation in the table too, and a merged group
+        // could then be labelled with the name of a nation the reduction had
+        // dropped.
         let (m_res_nk, m_res_nm) = (m_res_pad[0], m_res_pad[1]);
-        let (out_nk_col, out_nm_col) = (nr_out_pad[0], nr_out_pad[1]);
-        meta.lookup_any("attach name from NR_out (merge)", move |m| {
-            let q_in = m.query_selector(q_m_res_lookup);
-            let gate = q_in * m.query_advice(m_res_is_last, Rotation::cur());
-            let q_tbl = m.query_selector(q_nr_tbl);
+        let nr_pair_l = nr_pair.clone();
+        meta.lookup_any("attach name from NR (merge)", move |m| {
+            let one = Expression::Constant(F::ONE);
+            let gate = m.query_selector(q_m_res_lookup)
+                * m.query_advice(m_res_is_last, Rotation::cur());
+            let q_tbl = m.query_selector(q_row_nr) * m.query_advice(cflag_nr, Rotation::cur());
 
             vec![
                 (
-                    gate.clone() * m.query_advice(m_res_nk, Rotation::cur()),
-                    q_tbl.clone() * m.query_advice(out_nk_col, Rotation::cur()),
+                    gate.clone() * (m.query_advice(m_res_nk, Rotation::cur()) + one.clone()),
+                    q_tbl.clone() * (m.query_advice(nr_pair_l[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    gate * m.query_advice(m_res_nm, Rotation::cur()),
-                    q_tbl * m.query_advice(out_nm_col, Rotation::cur()),
+                    gate * (m.query_advice(m_res_nm, Rotation::cur()) + one.clone()),
+                    q_tbl * (m.query_advice(nr_pair_l[1], Rotation::cur()) + one),
                 ),
             ]
         });
@@ -1360,11 +1351,13 @@ impl<F: Field + Ord> Q5DpChip<F> {
             q_nr_pad,
             nr_rname,
             nr_keep,
+            row_idx,
+            cons_nr,
+            cons_co,
+            cons_ls,
             cflag_nr,
             nr_pair,
-            nr_filt_pad,
-            nr_out_pad,
-            perm_nr,
+            q_row_nr,
             iz_nr,
 
             q_oc_join,
@@ -1380,9 +1373,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
             co_nk,
             co_pair,
             co_pkey,
-            co_filt_pad,
-            co_out_pad,
-            perm_co,
+            q_row_co,
             lteq_start_le_odate,
             lt_odate_lt_end,
 
@@ -1396,9 +1387,6 @@ impl<F: Field + Ord> Q5DpChip<F> {
             ls_part_pad,
             perm_ls,
 
-            q_pw_ls,
-            q_pw_co,
-            q_pw_nr,
 
             cp_agg_co,
             cp_agg_nr,
@@ -1884,10 +1872,13 @@ impl<F: Field + Ord> Q5DpChip<F> {
             }
             m_run_sum_u64[i] = acc as u64;
 
+            // the pinned sentinel at row m_total carries PAD_U64, so a
+            // trailing run of PAD-keyed merge sentinels never closes and never
+            // emits
             let next_nk = if i + 1 < m_total {
                 msort_u64[i + 1][0]
             } else {
-                0
+                PAD_U64
             };
             if next_nk != nk && nk != PAD_U64 {
                 let nm = *nk_to_name.get(&nk).unwrap_or(&0);
@@ -2125,32 +2116,13 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     )?;
                 }
 
+                // The NR relation spans its whole capacity. The selector marks
+                // those rows and nothing else, so the Selector Check covers the
+                // padding tail too and the two lookups that read NR are gated
+                // by the bit rather than by a clean-prefix extent.
                 for i in 0..nr_total {
-                    self.config.perm_nr.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_nr.q_perm2.enable(&mut region, i)?;
+                    self.config.q_row_nr.enable(&mut region, i)?;
                 }
-                // partition side: 1 on the clean NR rows, 0 on the residual ones
-                for i in 0..nr_cln_len {
-                    self.config.q_cln_flag[0].enable(&mut region, i)?;
-                }
-                for i in nr_cln_len..(nr_cln_len + nr_res_len) {
-                    self.config.q_res_flag[0].enable(&mut region, i)?;
-                }
-                for i in (nr_cln_len + nr_res_len)..nr_total {
-                    self.config.q_pad_flag[0].enable(&mut region, i)?;
-                }
-                Q5Chip::assign_table_f(
-                    &mut region,
-                    "nr_filt_pad",
-                    &self.config.nr_filt_pad,
-                    &to_field_rows::<F>(&nr_filt_pad_u64_ext),
-                )?;
-                Q5Chip::assign_table_f(
-                    &mut region,
-                    "nr_out_pad",
-                    &self.config.nr_out_pad,
-                    &to_field_rows::<F>(&nr_out_pad_u64),
-                )?;
 
                 // ---------- CO materialization (as q5_obj) ----------
                 for i in 0..orders.len() {
@@ -2277,31 +2249,8 @@ impl<F: Field + Ord> Q5DpChip<F> {
                 }
 
                 for i in 0..co_total {
-                    self.config.perm_co.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_co.q_perm2.enable(&mut region, i)?;
+                    self.config.q_row_co.enable(&mut region, i)?;
                 }
-                // partition side: 1 on the clean CO rows, 0 on the residual ones
-                for i in 0..co_cln_len {
-                    self.config.q_cln_flag[1].enable(&mut region, i)?;
-                }
-                for i in co_cln_len..(co_cln_len + co_res_len) {
-                    self.config.q_res_flag[1].enable(&mut region, i)?;
-                }
-                for i in (co_cln_len + co_res_len)..co_total {
-                    self.config.q_pad_flag[1].enable(&mut region, i)?;
-                }
-                Q5Chip::assign_table_f(
-                    &mut region,
-                    "co_filt_pad",
-                    &self.config.co_filt_pad,
-                    &to_field_rows::<F>(&co_filt_pad_u64_ext),
-                )?;
-                Q5Chip::assign_table_f(
-                    &mut region,
-                    "co_out_pad",
-                    &self.config.co_out_pad,
-                    &to_field_rows::<F>(&co_out_pad_u64),
-                )?;
 
                 // ---------- LS materialization (as q5_obj) ----------
                 for i in 0..lineitem.len() {
@@ -2386,37 +2335,51 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     &ls_dis_cells,
                 )?;
 
-                // partition side of the LS Conservation Check: 1 on the clean LS
-                // rows, 0 on the residual ones. These are rows of ls_part_pad,
-                // the ONE global group, so the flag count is a count over the
-                // union of the lanes.
+                // The LS compaction's three sections. These are rows of
+                // ls_part_pad, the ONE global group, so the flag count is a
+                // count over the union of the lanes. This is the padding layer,
+                // not an OBJ condition: it is what tethers the lanes to a
+                // column group laid out once and lets them cover |LS^c| +
+                // ls_pad_extra rows.
                 for i in 0..ls_join_u64.len() {
-                    self.config.q_cln_flag[2].enable(&mut region, i)?;
+                    self.config.q_cln_flag[0].enable(&mut region, i)?;
                 }
                 for i in ls_join_u64.len()..(ls_join_u64.len() + ls_dis_u64.len()) {
-                    self.config.q_res_flag[2].enable(&mut region, i)?;
+                    self.config.q_res_flag[0].enable(&mut region, i)?;
                 }
-                // the LS partition is padded only to lineitem.len(), which the
-                // clean and residual sections already fill exactly, so this range
-                // is empty. Enabled for uniformity with the two child bags.
                 for i in (ls_join_u64.len() + ls_dis_u64.len())..lineitem.len() {
-                    self.config.q_pad_flag[2].enable(&mut region, i)?;
+                    self.config.q_pad_flag[0].enable(&mut region, i)?;
                 }
 
-                // ---------- condition (9), Pairwise Consistency ----------
-                // One selector per relation, enabled over exactly the clean
-                // section of its partition group. The LS one runs over
-                // ls_part_pad, NOT over a lane, so a single enabling covers the
-                // union of the lanes and there is nothing to split across them.
-                for i in 0..ls_join_u64.len() {
-                    self.config.q_pw_ls.enable(&mut region, i)?;
-                }
-                for i in 0..co_cln_len {
-                    self.config.q_pw_co.enable(&mut region, i)?;
-                }
-                for i in 0..nr_cln_len {
-                    self.config.q_pw_nr.enable(&mut region, i)?;
-                }
+                // Pairwise Consistency needs no assignment of its own: its four
+                // lookups read the committed key columns over the ranges
+                // `q_ls_join`, `q_row_co` and `q_row_nr` already cover, gated by
+                // the three selector bits.
+
+                // ===================== (1) CONSERVATION CHECK =====================
+                assign_row_index(
+                    &mut region,
+                    &self.config.row_idx,
+                    nr_total.max(co_total).max(lineitem.len()),
+                )?;
+                assign_conserve(
+                    &mut region,
+                    &self.config.cons_nr,
+                    &nr_pair_u64[..nr_total],
+                    &cln_nr[..nr_total],
+                )?;
+                assign_conserve(
+                    &mut region,
+                    &self.config.cons_co,
+                    &co_pair_u64[..co_total],
+                    &cln_co[..co_total],
+                )?;
+                assign_conserve(
+                    &mut region,
+                    &self.config.cons_ls,
+                    &ls_mat_u64[..lineitem.len()],
+                    &ls_cln_b[..lineitem.len()],
+                )?;
 
                 // ============ CARDINALITY PRESERVATION CHECK, condition (10) ===
                 // Over the cluster tree rooted at LS: both multiplicity channels
@@ -2657,13 +2620,14 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     }
                 }
                 // sentinel row for merge same_next, pinned by
-                // "msort group-by sentinel is 0"
+                // "msort group-by sentinel is PAD"
                 for j in 0..2 {
+                    let v = if j == 0 { PAD_U64 } else { 0u64 };
                     region.assign_advice(
                         || "msort_sentinel",
                         self.config.msort[j],
                         m_total,
-                        || Value::known(F::ZERO),
+                        || Value::known(F::from(v)),
                     )?;
                 }
                 self.config.q_m_sentinel.enable(&mut region, m_total)?;
@@ -2676,7 +2640,7 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     let next_nk = if i + 1 < m_total {
                         msort_u64[i + 1][0]
                     } else {
-                        0u64
+                        PAD_U64
                     };
                     let diff = F::from(next_nk) - F::from(msort_u64[i][0]);
                     iz_m_same_next_chip.assign(&mut region, i, Value::known(diff))?;
@@ -3256,10 +3220,17 @@ mod tests {
                 cs.lookups().len(),
                 cs.shuffles().len(),
             );
+            // 8, one above the 7 of `q5_obj_dp.rs`: gating both sides of a
+            // Pairwise Consistency lookup by the selector COLUMN rather than
+            // by a selector RANGE costs one degree on each side. It buys no
+            // FFT, which is the number that matters here, since the lane count
+            // is chosen against a PINNED domain: halo2 sizes the extended
+            // domain at the next power of two above degree - 1, so 7, 8 and 9
+            // all run on an 8x domain and only 10 doubles it.
             assert!(
-                degree <= 7,
-                "the maximum gate degree rose to {} at {} lanes, so a soundness \
-                 patch is costing more than it is worth",
+                degree <= 9,
+                "the maximum gate degree rose to {} at {} lanes, which would \
+                 double every FFT the prover runs",
                 degree,
                 c
             );
@@ -3590,7 +3561,7 @@ mod tests {
             _ => crate::bench_queries::Privacy::Legacy,
         };
 
-        let proof_path = crate::paths::proof_file("proof_q5_dp_lanes");
+        let proof_path = crate::paths::proof_file("proof_q5_dp_lanes_new");
         let t_total = Instant::now();
         let run = super::run_dp_lanes(privacy, 1, Some(&proof_path));
         let p = &run.plan;

@@ -7,6 +7,10 @@ use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
 };
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use std::collections::{HashMap, HashSet};
@@ -102,7 +106,6 @@ impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 pub struct TestCircuitConfig<F: Field + Ord> {
     // selectors
     q_part_pred: Selector, // p_name_hash == :1
-    q_part_perm: PermAnyConfig,
 
     // base tables
     part: Vec<Column<Advice>>,     // 2
@@ -116,35 +119,23 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     cond: Column<Advice>,
     q_cond_eq: Selector, // :1 is the same on every part row
 
-    // clean indicator per base row, in the order
-    // [part, supplier, nation, orders, partsupp, lineitem]
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED relation, one permutation each
+    row_idx: RowIndexConfig,
+    cons: Vec<ConserveConfig>, // 6, in the order R_PART .. R_LINE
+    // the indicator c per committed row, same order
     cflag: Vec<Column<Advice>>, // 6
+    // one complex selector per relation over its committed rows. It gates both
+    // sides of every lookup this circuit runs and the booleanity gate; a simple
+    // selector may appear on neither side of a lookup, which is why it is
+    // complex. Its enabled range is |R_i|, so it is a function of the public
+    // sizes and of nothing the prover chooses.
+    q_row: Vec<Selector>, // 6
 
-    // part predicate outputs + padded filtered view
-    p_keep: Column<Advice>,          // boolean
-    p_filt_pad: Vec<Column<Advice>>, // 3 (keep? part : PAD) + keep*c
+    // part predicate output, the bit b of the Selector Check
+    p_keep: Column<Advice>, // boolean
 
-    // filtered-part subset table (p_join) padded to part.len()
-    p_join_pad: Vec<Column<Advice>>, // 3
-    perm_part: PermAnyConfig,
-
-    // join subsets (all padded to their base lengths)
-    // orders_join_pad, supplier_join_pad, nation_join_pad, partsupp_join_pad, lineitem_join_pad
-    // one column wider than in q9_obj.rs: the last one is the clean indicator
-    o_join_pad: Vec<Column<Advice>>,  // 3
-    s_join_pad: Vec<Column<Advice>>,  // 3
-    n_join_pad: Vec<Column<Advice>>,  // 3
-    ps_join_pad: Vec<Column<Advice>>, // 3
-    l_join_pad: Vec<Column<Advice>>,  // 7
-
-    perm_orders: PermAnyConfig,
-    perm_supplier: PermAnyConfig,
-    perm_nation: PermAnyConfig,
-    perm_partsupp: PermAnyConfig,
-    perm_lineitem: PermAnyConfig,
-
-    // ---------- attach columns on l_join_pad rows ----------
-    l_ps_key: Column<Advice>,     // packed (part,supp)
+    // ---------- attach columns on the committed lineitem rows ----------
     l_supplycost: Column<Advice>, // from partsupp
     l_year: Column<Advice>,       // from orders
     l_nationkey: Column<Advice>,  // from supplier
@@ -153,9 +144,6 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     // amount = ext*(SCALE-disc) - supplycost*qty*SCALE
     q_amount: Selector,
     amount: Column<Advice>,
-
-    // rows of the profit table past the join segment: pinned to the PAD triple
-    q_prof_pad: Selector,
 
     // profit table (unsorted + sorted) length = l_join_pad.len()
     profit: Vec<Column<Advice>>,        // 3 [nation_hash, year, amount]
@@ -193,18 +181,11 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     iz_res_nation_eq: IsZeroConfig<F>,
     iz_res_year_eq: IsZeroConfig<F>,
 
-    // ---------- tuple lookups (using join pads as tables) ----------
-    q_lkp_part: Selector,
+    // ---------- tuple lookups (over the committed relations) ----------
     q_lkp_orders: Selector,
     q_lkp_supplier: Selector,
     q_lkp_nation: Selector,
     q_lkp_partsupp: Selector,
-
-    q_tbl_p: Selector,
-    q_tbl_o: Selector,
-    q_tbl_s: Selector,
-    q_tbl_n: Selector,
-    q_tbl_ps: Selector,
 
     instance: Column<Instance>,
     instance_test: Column<Advice>,
@@ -214,10 +195,14 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     // ---------------- Cardinality Preservation Check ----------------
     // condition (4): |R^c join| == |R join|, over the tree rooted at lineitem
     cp_one: Column<Advice>, // constant 1, the input channel of an unfiltered leaf
-    n_key_cp: Column<Advice>, // n_nationkey + NAT_SHIFT, on nation rows
-    s_nkey_cp: Column<Advice>, // s_nationkey + NAT_SHIFT, on supplier rows
+    // Three derived key columns on the committed rows. They serve the
+    // Cardinality Preservation Check, the Pairwise Consistency lookups and the
+    // partsupp attach lookup alike, which is what lets `q9_obj.rs`'s separate
+    // `l_pw_pskey` / `s_pw_nkey` / `n_pw_key` and `l_ps_key` all disappear.
+    n_key_cp: Column<Advice>,    // n_nationkey + NAT_SHIFT, on nation rows
+    s_nkey_cp: Column<Advice>,   // s_nationkey + NAT_SHIFT, on supplier rows
     l_ps_key_cp: Column<Advice>, // packed partsupp key, on base lineitem rows
-    v_all_s: Column<Advice>, // supplier is internal: its two multiplicities
+    v_all_s: Column<Advice>,     // supplier is internal: its two multiplicities
     v_cln_s: Column<Advice>,
     t_all: Column<Advice>, // the four root sigmas, folded pairwise per channel
     u_all: Column<Advice>,
@@ -241,22 +226,6 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     q_cp_nat: Selector, // nation rows: shifted key
     q_cp_sup: Selector, // supplier rows: shifted key and the two multiplicities
     q_cp_mu: Selector,  // lineitem rows: packed key and the two root products
-
-    // clean/residual flag on the partition side of each Conservation Check
-    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1
-    q_res_flag: Vec<Selector>, // rows of R^r: flag == 0
-    q_pad_flag: Selector,      // pad rows of the part group: flag == 0
-
-    // ---------------- Pairwise Consistency Check ----------------
-    // condition (3): pi_K(R_i^c) == pi_K(R_j^c) on every join tree edge
-    l_pw_pskey: Column<Advice>, // packed partsupp key on the lineitem partition rows
-    s_pw_nkey: Column<Advice>,  // s_nationkey + NAT_SHIFT on the supplier partition rows
-    n_pw_key: Column<Advice>,   // n_nationkey + NAT_SHIFT on the nation partition rows
-
-    // one selector per relation over its clean rows, shared by every edge
-    // incident to it; it gates that relation's key columns on both the input and
-    // the table side of the ten lookups. Indices are R_PART .. R_LINE.
-    q_pw_in: Vec<Selector>, // 6
 }
 
 #[derive(Clone, Debug)]
@@ -406,341 +375,59 @@ impl<F: Field + Ord> TestChip<F> {
             ]
         });
 
-        // filtered padded view. One column wider than in q9_obj.rs: the last
-        // column carries the clean indicator, so the Conservation Check binds it.
-        let p_filt_pad = vec![
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
+        // ---------- (1) Conservation Check ----------
+        // One permutation argument per relation, between the indexed relation
+        // R^_i and the concatenation of its two parts. The indices are
+        // distinct, so R^_i is a set even though the relation is a bag, and
+        // that single permutation rules out an occurrence being fabricated,
+        // lost, duplicated or counted on both sides: no Non-Membership Check.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons: Vec<ConserveConfig> = vec![
+            configure_conserve::<F>(meta, &row_idx, &part, cflag[R_PART]),
+            configure_conserve::<F>(meta, &row_idx, &supplier, cflag[R_SUPP]),
+            configure_conserve::<F>(meta, &row_idx, &nation, cflag[R_NAT]),
+            configure_conserve::<F>(meta, &row_idx, &orders, cflag[R_ORD]),
+            configure_conserve::<F>(meta, &row_idx, &partsupp, cflag[R_PS]),
+            configure_conserve::<F>(meta, &row_idx, &lineitem, cflag[R_LINE]),
         ];
 
-        // filtered part table padded to part.len()
-        let p_join_pad = vec![
-            meta.advice_column(),
-            meta.advice_column(),
-            meta.advice_column(),
-        ];
-
-        // permutation (configure once)
-        let q_perm_part_in = meta.complex_selector();
-        let q_perm_part_out = meta.complex_selector();
-        let perm_part = PermAnyChip::configure(
-            meta,
-            q_perm_part_in,
-            q_perm_part_out,
-            p_filt_pad.clone(),
-            p_join_pad.clone(),
-        );
-
-        // NOTE: we must build p_join_pad columns first to pass to perm; workaround:
-        // we will overwrite perm_part at end; so create dummy now.
-        // (halo2 requires config-time wiring; easiest is to build all columns then configure)
-
-        meta.create_gate("link p_filt_pad = keep? part : PAD", |m| {
-            let q = m.query_selector(perm_part.q_perm1); // reuse perm selector as gate enable
-            let keep = m.query_advice(p_keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let dropv = one.clone() - keep.clone();
-
-            let p0 = Expression::Constant(F::from(PAD_PKEY));
-            let p1 = Expression::Constant(F::from(PAD_PNAME));
-
-            let b0 = m.query_advice(part[0], Rotation::cur());
-            let b1 = m.query_advice(part[1], Rotation::cur());
-            // the clean indicator pads with 0, so a part row dropped by the
-            // predicate is never clean and contributes to neither channel of
-            // the Cardinality Preservation Check
-            let b2 = m.query_advice(cflag[0], Rotation::cur());
-
-            let f0 = m.query_advice(p_filt_pad[0], Rotation::cur());
-            let f1 = m.query_advice(p_filt_pad[1], Rotation::cur());
-            let f2 = m.query_advice(p_filt_pad[2], Rotation::cur());
-
-            vec![
-                q.clone() * (f0 - (keep.clone() * b0 + dropv.clone() * p0)),
-                q.clone() * (f1 - (keep.clone() * b1 + dropv * p1)),
-                q * (f2 - keep * b2),
-            ]
-        });
-
-        // ---------- join pads for other tables + perms ----------
-        fn mk_perm<FF: PrimeField>(
-            meta: &mut ConstraintSystem<FF>,
-            width: usize,
-            lhs: Vec<Column<Advice>>,
-        ) -> (Vec<Column<Advice>>, PermAnyConfig) {
-            let q1 = meta.complex_selector();
-            let q2 = meta.complex_selector();
-            let rhs = (0..width).map(|_| meta.advice_column()).collect::<Vec<_>>();
-            let perm = PermAnyChip::configure(meta, q1, q2, lhs, rhs.clone());
-            (rhs, perm)
-        }
-
-        // base -> join_pad perms (join_pad rows are join||disjoin||pad in witness; perm ensures it's a permutation of base)
-        // One column wider than in q9_obj.rs: the base side carries the clean
-        // indicator, so each of these Conservation Checks binds it. These five
-        // relations have no in-relation predicate, so the base column holds the
-        // indicator itself rather than keep * indicator.
-        let mut o_base = orders.clone();
-        o_base.push(cflag[3]);
-        let mut s_base = supplier.clone();
-        s_base.push(cflag[1]);
-        let mut n_base = nation.clone();
-        n_base.push(cflag[2]);
-        let mut ps_base = partsupp.clone();
-        ps_base.push(cflag[4]);
-        let mut l_base = lineitem.clone();
-        l_base.push(cflag[5]);
-
-        let (o_join_pad, perm_orders) = mk_perm::<F>(meta, 3, o_base);
-        let (s_join_pad, perm_supplier) = mk_perm::<F>(meta, 3, s_base);
-        let (n_join_pad, perm_nation) = mk_perm::<F>(meta, 3, n_base);
-        let (ps_join_pad, perm_partsupp) = mk_perm::<F>(meta, 3, ps_base);
-        let (l_join_pad, perm_lineitem) = mk_perm::<F>(meta, 7, l_base);
-
-        // -------- partition side of the indicator: 1 on R^c rows, 0 on R^r --------
-        // Every partition column group is laid out as [clean rows | residual
-        // rows | pad rows], so one selector per section pins the indicator.
-        // Without these the prover could mark a residual row clean and inflate
-        // the clean channel of the check below. Only part can have pad rows here,
-        // since the other five partitions cover their base relation exactly.
+        // ---------- Selector Check, the predicate half ----------
+        // The prover supplies one bit per committed row. Selection is by
+        // position, so no row can be fabricated, dropped or placed on both
+        // sides and there is nothing for a Conservation or Non-Membership Check
+        // to compare against: `q9_obj.rs`'s six partition groups, six shuffles
+        // and pad-section gates all go away with the materialization.
         //
-        // Those pad rows do need a gate. The argument that the shuffle already
-        // pins them holds only as long as no kept part row carries the PAD tuple:
-        // a part row with p_partkey == PAD_PKEY and p_name_hash == PAD_PNAME
-        // passes the predicate when the prover also sets `cond` to PAD_PNAME, and
-        // its `p_filt_pad` triple is then (PAD, PAD, v) for a v of the prover's
-        // choosing, which the shuffle can match against an unconstrained pad row
-        // of `p_join_pad`. `cp_agg_p` reads that same v as the clean channel of
-        // part, so v is not even forced to be boolean. Pinning the pad rows to
-        // flag 0 closes it: every (PAD, PAD, v) with v != 0 then has to match a
-        // clean or a residual row, both of which are pinned, so v is boolean
-        // whatever keys the prover supplies.
-        let q_cln_flag = (0..6).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..6).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_pad_flag = meta.selector();
-
-        for (idx, group) in [
-            p_join_pad.clone(),
-            s_join_pad.clone(),
-            n_join_pad.clone(),
-            o_join_pad.clone(),
-            ps_join_pad.clone(),
-            l_join_pad.clone(),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let flag_col = *group.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
+        // Two gates per relation. The booleanity gate keeps the bit from
+        // scaling a multiplicity channel, and the predicate gate confines the
+        // selection to the rows the WHERE clause keeps, which is what makes the
+        // input channel of (3) count the join of the PREDICATE-FILTERED inputs.
+        // Only `part` carries a predicate here, so the second gate is written
+        // once; on the other five relations b == 1 and it would be vacuous.
+        let q_row = (0..6).map(|_| meta.complex_selector()).collect::<Vec<_>>();
+        for (idx, &c) in cflag.iter().enumerate() {
+            let q = q_row[idx];
+            meta.create_gate("selector is a bit", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
             });
         }
-
-        // the pad section of the part partition group, the only one that has one
         {
-            let flag_col = *p_join_pad.last().unwrap();
-            meta.create_gate("clean indicator on the part pad rows", move |m| {
-                let q = m.query_selector(q_pad_flag);
-                vec![q * m.query_advice(flag_col, Rotation::cur())]
+            let q = q_row[R_PART];
+            let c = cflag[R_PART];
+            meta.create_gate("selected part row satisfies its predicate", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                let b = m.query_advice(p_keep, Rotation::cur());
+                vec![q * c * (Expression::Constant(F::ONE) - b)]
             });
-        }
-
-        // -------- condition (3): Pairwise Consistency on every tree edge --------
-        // pi_K(R_i^c) == pi_K(R_j^c), as two mutual membership lookups per edge,
-        // each looking one endpoint's clean key column up directly in the other
-        // endpoint's clean key column. Both sides of every lookup are columns of
-        // a *partition* group, restricted to the clean rows [0, n_cln), and the
-        // Conservation Check ties those groups to the base relations, so the
-        // statement really is about R^c. A lookup over the base rows would only
-        // certify membership in R_i, which is the weaker statement q9_obj.rs
-        // already makes.
-        //
-        // An earlier version routed each direction through an intermediate
-        // advice column holding [0] ++ uniq(key) over the clean rows of the other
-        // endpoint. Nothing in the circuit bound those ten columns to the
-        // relations they claimed to enumerate, so a prover could set each table
-        // to the key set of the relation looking into it and every lookup would
-        // pass for an arbitrary partition, leaving condition (3) vacuous. Looking
-        // the two clean key columns up in each other removes the free advice, and
-        // with it the escape, at one fewer column and one fewer selector per
-        // direction.
-        //
-        // One selector per relation, enabled over that relation's clean rows and
-        // shared by every edge incident to it. The same selector gates that
-        // relation's key column on the input side of its own lookups and on the
-        // table side of the reverse lookups, so both sides of every lookup
-        // evaluate to 0 on a row where the selector is off: 0 is then in each
-        // table for free and the gated-off rows cost nothing. Real partkeys,
-        // orderkeys and suppkeys are at least 1 in TPC-H, the two composite
-        // partsupp keys are at least PS_SHIFT, and the two nation keys carry
-        // NAT_SHIFT, so no key is ever 0 and the containment is over the real
-        // keys. The selectors are complex both because a simple selector may
-        // not appear in a lookup expression and because the three derived key
-        // columns below are pinned by the same selector.
-        //
-        // KNOWN DESIGN GAP, not a witness attack. Nothing in-circuit relates the
-        // enabled range of `q_pw_in[R]` to that of `q_cln_flag[R]` or to
-        // `join_len`; they coincide by honest assignment. Under a fixed vk that
-        // is harmless, because all three are Selectors and their rows are baked
-        // into fixed columns at keygen, so no prover can move them: a proof
-        // either satisfies the ten lookups over the ranges the vk fixes or it
-        // does not. What is left is that keygen here is run on the same
-        // data-carrying circuit as the proof, so a malicious circuit GENERATOR
-        // could publish a vk whose six ranges are all empty and make condition
-        // (9) vacuous while (7) and (10) still accept the all-clean partition.
-        // Closing that means keygen on a data-independent shape, or replacing the
-        // selector gating of these lookups by the bound clean indicator column
-        // itself; both are changes above this file (the harness, and the shared
-        // partition layout every OBJ circuit uses).
-        let q_pw_in = (0..6).map(|_| meta.complex_selector()).collect::<Vec<_>>();
-
-        // The partsupp edge key is a composite and the nation edge key can be 0,
-        // which every gated-off lookup expression also evaluates to, so three key
-        // columns are derived on the partition rows. Each is pinned by the clean
-        // selector of its own relation, which is what keeps them as unforgeable as
-        // the raw key columns. The lineitem group already carries a packed key in
-        // l_ps_key, but that one is pinned by q_amount, which also drives the
-        // attach lookups and the amount formula, so it is only available on the
-        // rows those need.
-        let l_pw_pskey = meta.advice_column();
-        meta.create_gate("pw: ps_key packing on the lineitem partition rows", |m| {
-            let q = m.query_selector(q_pw_in[R_LINE]);
-            let lp = m.query_advice(l_join_pad[1], Rotation::cur());
-            let ls = m.query_advice(l_join_pad[2], Rotation::cur());
-            let key = m.query_advice(l_pw_pskey, Rotation::cur());
-            let shift = Expression::Constant(F::from(PS_SHIFT));
-            vec![q * (key - (lp * shift + ls))]
-        });
-        let s_pw_nkey = meta.advice_column();
-        meta.create_gate(
-            "pw: shifted nation key on the supplier partition rows",
-            |m| {
-                let q = m.query_selector(q_pw_in[R_SUPP]);
-                let k = m.query_advice(s_pw_nkey, Rotation::cur());
-                let b = m.query_advice(s_join_pad[1], Rotation::cur());
-                vec![q * (k - (b + Expression::Constant(F::from(NAT_SHIFT))))]
-            },
-        );
-        let n_pw_key = meta.advice_column();
-        meta.create_gate("pw: shifted nation key on the nation partition rows", |m| {
-            let q = m.query_selector(q_pw_in[R_NAT]);
-            let k = m.query_advice(n_pw_key, Rotation::cur());
-            let b = m.query_advice(n_join_pad[0], Rotation::cur());
-            vec![q * (k - (b + Expression::Constant(F::from(NAT_SHIFT))))]
-        });
-
-        // The ten lookups, two per join tree edge. `q_in`/`in_col` is the clean
-        // key column being contained, `q_t`/`tbl_col` the clean key column of the
-        // other endpoint that has to contain it. The two directions of an edge are
-        // the same pair with the roles swapped, and together they give the set
-        // equality condition (3) asks for.
-        {
-            let mut pw_edge = |name: &'static str,
-                               q_in: Selector,
-                               in_col: Column<Advice>,
-                               q_t: Selector,
-                               tbl_col: Column<Advice>| {
-                meta.lookup_any(name, move |m| {
-                    let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
-                    let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
-                    vec![(lhs, rhs)]
-                });
-            };
-
-            // edge lineitem - part, on l_partkey = p_partkey
-            pw_edge(
-                "pw: lineitem^c partkey in part^c",
-                q_pw_in[R_LINE],
-                l_join_pad[1],
-                q_pw_in[R_PART],
-                p_join_pad[0],
-            );
-            pw_edge(
-                "pw: part^c partkey in lineitem^c",
-                q_pw_in[R_PART],
-                p_join_pad[0],
-                q_pw_in[R_LINE],
-                l_join_pad[1],
-            );
-
-            // edge lineitem - orders, on l_orderkey = o_orderkey
-            pw_edge(
-                "pw: lineitem^c orderkey in orders^c",
-                q_pw_in[R_LINE],
-                l_join_pad[0],
-                q_pw_in[R_ORD],
-                o_join_pad[0],
-            );
-            pw_edge(
-                "pw: orders^c orderkey in lineitem^c",
-                q_pw_in[R_ORD],
-                o_join_pad[0],
-                q_pw_in[R_LINE],
-                l_join_pad[0],
-            );
-
-            // edge lineitem - partsupp, on the packed (partkey, suppkey)
-            pw_edge(
-                "pw: lineitem^c ps_key in partsupp^c",
-                q_pw_in[R_LINE],
-                l_pw_pskey,
-                q_pw_in[R_PS],
-                ps_join_pad[0],
-            );
-            pw_edge(
-                "pw: partsupp^c ps_key in lineitem^c",
-                q_pw_in[R_PS],
-                ps_join_pad[0],
-                q_pw_in[R_LINE],
-                l_pw_pskey,
-            );
-
-            // edge lineitem - supplier, on l_suppkey = s_suppkey
-            pw_edge(
-                "pw: lineitem^c suppkey in supplier^c",
-                q_pw_in[R_LINE],
-                l_join_pad[2],
-                q_pw_in[R_SUPP],
-                s_join_pad[0],
-            );
-            pw_edge(
-                "pw: supplier^c suppkey in lineitem^c",
-                q_pw_in[R_SUPP],
-                s_join_pad[0],
-                q_pw_in[R_LINE],
-                l_join_pad[2],
-            );
-
-            // edge supplier - nation, on the shifted s_nationkey = n_nationkey.
-            // This is the edge q9_obj.rs collapses into a 2-hop lookup off the
-            // lineitem row; condition (3) follows the real tree edge instead, so
-            // it runs between the supplier and nation partition groups. The
-            // NAT_SHIFT of both derived columns cancels, so the containment is
-            // still the one on the raw nation keys.
-            pw_edge(
-                "pw: supplier^c nationkey in nation^c",
-                q_pw_in[R_SUPP],
-                s_pw_nkey,
-                q_pw_in[R_NAT],
-                n_pw_key,
-            );
-            pw_edge(
-                "pw: nation^c nationkey in supplier^c",
-                q_pw_in[R_NAT],
-                n_pw_key,
-                q_pw_in[R_SUPP],
-                s_pw_nkey,
-            );
         }
 
         // ---------- attach cols ----------
-        let l_ps_key = meta.advice_column();
+        // The packed partsupp key lives in `l_ps_key_cp` below, on the same
+        // committed rows, so this file has one packed-key column where
+        // `q9_obj.rs` had three.
         let l_supplycost = meta.advice_column();
         let l_year = meta.advice_column();
         let l_nationkey = meta.advice_column();
@@ -748,16 +435,6 @@ impl<F: Field + Ord> TestChip<F> {
 
         let q_amount = meta.selector();
         let amount = meta.advice_column();
-
-        // ps_key = l_partkey*PS_SHIFT + l_suppkey (only meaningful on join rows; we’ll still define everywhere)
-        meta.create_gate("ps_key packing", |m| {
-            let q = m.query_selector(q_amount);
-            let lp = m.query_advice(l_join_pad[1], Rotation::cur());
-            let ls = m.query_advice(l_join_pad[2], Rotation::cur());
-            let key = m.query_advice(l_ps_key, Rotation::cur());
-            let shift = Expression::Constant(F::from(PS_SHIFT));
-            vec![q * (key - (lp * shift + ls))]
-        });
 
         // amount formula.
         //
@@ -779,9 +456,9 @@ impl<F: Field + Ord> TestChip<F> {
         // these OBJ circuits all use.
         meta.create_gate("amount = ext*(SCALE-disc) - cost*qty*SCALE", |m| {
             let q = m.query_selector(q_amount);
-            let qty = m.query_advice(l_join_pad[3], Rotation::cur());
-            let ext = m.query_advice(l_join_pad[4], Rotation::cur());
-            let disc = m.query_advice(l_join_pad[5], Rotation::cur());
+            let qty = m.query_advice(lineitem[3], Rotation::cur());
+            let ext = m.query_advice(lineitem[4], Rotation::cur());
+            let disc = m.query_advice(lineitem[5], Rotation::cur());
             let cost = m.query_advice(l_supplycost, Rotation::cur());
             let a = m.query_advice(amount, Rotation::cur());
 
@@ -791,87 +468,75 @@ impl<F: Field + Ord> TestChip<F> {
         });
 
         // ---------- tuple lookups ----------
-        let q_lkp_part = meta.complex_selector();
+        // Every one of these now runs between the COMMITTED relations, with
+        // both sides gated by the selector: a deselected row and a row past the
+        // relation both contribute the all-zero tuple, which is what a
+        // gated-off input row reads, and the shift by one keeps that dummy away
+        // from any real tuple. `q9_obj.rs` read them off the `*_join_pad`
+        // groups, which needed a Conservation Check each to mean anything.
+        //
+        // The part membership lookup `q9_obj.rs` runs here is gone: with both
+        // sides on the committed relations it is character for character the
+        // `pw: lineitem^c partkey in part^c` lookup below, so it was a
+        // duplicate rather than a second check.
         let q_lkp_orders = meta.complex_selector();
         let q_lkp_supplier = meta.complex_selector();
         let q_lkp_nation = meta.complex_selector();
         let q_lkp_partsupp = meta.complex_selector();
 
-        let q_tbl_p = meta.complex_selector();
-        let q_tbl_o = meta.complex_selector();
-        let q_tbl_s = meta.complex_selector();
-        let q_tbl_n = meta.complex_selector();
-        let q_tbl_ps = meta.complex_selector();
-
-        // Part membership: l_partkey in filtered parts (p_join_pad has filtered rows + PAD)
-        meta.lookup_any("l.partkey in filtered partkeys", |m| {
-            let q_in = m.query_selector(q_lkp_part);
-            let q_t = m.query_selector(q_tbl_p);
-            let lhs = q_in * m.query_advice(l_join_pad[1], Rotation::cur());
-            let rhs = q_t * m.query_advice(p_join_pad[0], Rotation::cur());
-            vec![(lhs, rhs)]
-        });
-
-        // Orders: (l_orderkey, l_year) in o_join_pad
+        // Orders: (l_orderkey, l_year) in the selected orders
         meta.lookup_any("attach year from orders", |m| {
-            let q_in = m.query_selector(q_lkp_orders);
-            let q_t = m.query_selector(q_tbl_o);
+            let one = Expression::Constant(F::ONE);
+            let q_in =
+                m.query_selector(q_lkp_orders) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t =
+                m.query_selector(q_row[R_ORD]) * m.query_advice(cflag[R_ORD], Rotation::cur());
             vec![
                 (
-                    q_in.clone() * m.query_advice(l_join_pad[0], Rotation::cur()),
-                    q_t.clone() * m.query_advice(o_join_pad[0], Rotation::cur()),
+                    q_in.clone() * (m.query_advice(lineitem[0], Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(orders[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    q_in * m.query_advice(l_year, Rotation::cur()),
-                    q_t * m.query_advice(o_join_pad[1], Rotation::cur()),
+                    q_in * (m.query_advice(l_year, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(orders[1], Rotation::cur()) + one),
                 ),
             ]
         });
 
-        // Supplier: (l_suppkey, l_nationkey) in s_join_pad
+        // Supplier: (l_suppkey, l_nationkey) in the selected suppliers
         meta.lookup_any("attach nationkey from supplier", |m| {
-            let q_in = m.query_selector(q_lkp_supplier);
-            let q_t = m.query_selector(q_tbl_s);
+            let one = Expression::Constant(F::ONE);
+            let q_in =
+                m.query_selector(q_lkp_supplier) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t =
+                m.query_selector(q_row[R_SUPP]) * m.query_advice(cflag[R_SUPP], Rotation::cur());
             vec![
                 (
-                    q_in.clone() * m.query_advice(l_join_pad[2], Rotation::cur()),
-                    q_t.clone() * m.query_advice(s_join_pad[0], Rotation::cur()),
+                    q_in.clone() * (m.query_advice(lineitem[2], Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(supplier[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    q_in * m.query_advice(l_nationkey, Rotation::cur()),
-                    q_t * m.query_advice(s_join_pad[1], Rotation::cur()),
+                    q_in * (m.query_advice(l_nationkey, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(supplier[1], Rotation::cur()) + one),
                 ),
             ]
         });
 
-        // Nation: (l_nationkey, l_nationname) in n_join_pad
+        // Nation: (l_nationkey, l_nationname) in the selected nations
         meta.lookup_any("attach nation name from nation", |m| {
-            let q_in = m.query_selector(q_lkp_nation);
-            let q_t = m.query_selector(q_tbl_n);
+            let one = Expression::Constant(F::ONE);
+            let q_in =
+                m.query_selector(q_lkp_nation) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t =
+                m.query_selector(q_row[R_NAT]) * m.query_advice(cflag[R_NAT], Rotation::cur());
             vec![
                 (
-                    q_in.clone() * m.query_advice(l_nationkey, Rotation::cur()),
-                    q_t.clone() * m.query_advice(n_join_pad[0], Rotation::cur()),
+                    q_in.clone() * (m.query_advice(l_nationkey, Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(nation[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    q_in * m.query_advice(l_nationname, Rotation::cur()),
-                    q_t * m.query_advice(n_join_pad[1], Rotation::cur()),
-                ),
-            ]
-        });
-
-        // Partsupp: (ps_key, supplycost) in ps_join_pad
-        meta.lookup_any("attach supplycost from partsupp", |m| {
-            let q_in = m.query_selector(q_lkp_partsupp);
-            let q_t = m.query_selector(q_tbl_ps);
-            vec![
-                (
-                    q_in.clone() * m.query_advice(l_ps_key, Rotation::cur()),
-                    q_t.clone() * m.query_advice(ps_join_pad[0], Rotation::cur()),
-                ),
-                (
-                    q_in * m.query_advice(l_supplycost, Rotation::cur()),
-                    q_t * m.query_advice(ps_join_pad[1], Rotation::cur()),
+                    q_in * (m.query_advice(l_nationname, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(nation[1], Rotation::cur()) + one),
                 ),
             ]
         });
@@ -930,6 +595,171 @@ impl<F: Field + Ord> TestChip<F> {
             vec![q * (key - (lp * shift + ls))]
         });
 
+        // Partsupp: (ps_key, supplycost) in the selected partsupps. It reads
+        // the same packed key column the propagation uses.
+        meta.lookup_any("attach supplycost from partsupp", |m| {
+            let one = Expression::Constant(F::ONE);
+            let q_in =
+                m.query_selector(q_lkp_partsupp) * m.query_advice(cflag[R_LINE], Rotation::cur());
+            let q_t = m.query_selector(q_row[R_PS]) * m.query_advice(cflag[R_PS], Rotation::cur());
+            vec![
+                (
+                    q_in.clone() * (m.query_advice(l_ps_key_cp, Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(partsupp[0], Rotation::cur()) + one.clone()),
+                ),
+                (
+                    q_in * (m.query_advice(l_supplycost, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(partsupp[1], Rotation::cur()) + one),
+                ),
+            ]
+        });
+
+        // -------- (2) Pairwise Consistency on every tree edge --------
+        // pi_K(R_i^c) == pi_K(R_j^c), as two mutual Membership Checks per edge,
+        // each looking one endpoint's key column up directly in the other
+        // endpoint's. Both sides read
+        //
+        //     q_row * c(t) * (t[K] + 1),
+        //
+        // so a deselected row and a row past the relation both read 0, 0 is in
+        // every table, and the containment is over the selected keys only.
+        //
+        // This is where the realization differs most from `q9_obj.rs`. There the
+        // gating factor was a Selector whose enabled range was the clean prefix
+        // of a partition group, which the file documents as a KNOWN DESIGN GAP:
+        // the ranges were related to the partition only by honest assignment, so
+        // a malicious circuit GENERATOR could publish a vk with all six ranges
+        // empty and make the condition vacuous while (1) and (3) still accepted
+        // the all-clean selection. Here the gating factor is the committed
+        // selector COLUMN, the same one the Cardinality Preservation Check reads
+        // on the same rows, and the fixed selectors mark nothing but the
+        // relation's real rows, a function of |R_i| alone. The gap is closed.
+        //
+        // The three derived key columns are the ones the propagation already
+        // needs, so no column is added for this condition at all.
+        {
+            let mut pw_edge = |name: &'static str,
+                               q_in: Selector,
+                               c_in: Column<Advice>,
+                               k_in: Column<Advice>,
+                               q_tb: Selector,
+                               c_tb: Column<Advice>,
+                               k_tb: Column<Advice>| {
+                meta.lookup_any(name, move |m| {
+                    let one = Expression::Constant(F::ONE);
+                    let lhs = m.query_selector(q_in)
+                        * m.query_advice(c_in, Rotation::cur())
+                        * (m.query_advice(k_in, Rotation::cur()) + one.clone());
+                    let rhs = m.query_selector(q_tb)
+                        * m.query_advice(c_tb, Rotation::cur())
+                        * (m.query_advice(k_tb, Rotation::cur()) + one);
+                    vec![(lhs, rhs)]
+                });
+            };
+
+            // edge lineitem - part, on l_partkey = p_partkey
+            pw_edge(
+                "pw: lineitem^c partkey in part^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[1],
+                q_row[R_PART],
+                cflag[R_PART],
+                part[0],
+            );
+            pw_edge(
+                "pw: part^c partkey in lineitem^c",
+                q_row[R_PART],
+                cflag[R_PART],
+                part[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[1],
+            );
+
+            // edge lineitem - orders, on l_orderkey = o_orderkey
+            pw_edge(
+                "pw: lineitem^c orderkey in orders^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[0],
+                q_row[R_ORD],
+                cflag[R_ORD],
+                orders[0],
+            );
+            pw_edge(
+                "pw: orders^c orderkey in lineitem^c",
+                q_row[R_ORD],
+                cflag[R_ORD],
+                orders[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[0],
+            );
+
+            // edge lineitem - partsupp, on the packed (partkey, suppkey)
+            pw_edge(
+                "pw: lineitem^c ps_key in partsupp^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                l_ps_key_cp,
+                q_row[R_PS],
+                cflag[R_PS],
+                partsupp[0],
+            );
+            pw_edge(
+                "pw: partsupp^c ps_key in lineitem^c",
+                q_row[R_PS],
+                cflag[R_PS],
+                partsupp[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                l_ps_key_cp,
+            );
+
+            // edge lineitem - supplier, on l_suppkey = s_suppkey
+            pw_edge(
+                "pw: lineitem^c suppkey in supplier^c",
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[2],
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                supplier[0],
+            );
+            pw_edge(
+                "pw: supplier^c suppkey in lineitem^c",
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                supplier[0],
+                q_row[R_LINE],
+                cflag[R_LINE],
+                lineitem[2],
+            );
+
+            // edge supplier - nation, on the shifted s_nationkey = n_nationkey.
+            // The NAT_SHIFT of both columns cancels, so the containment is the
+            // one on the raw nation keys.
+            pw_edge(
+                "pw: supplier^c nationkey in nation^c",
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                s_nkey_cp,
+                q_row[R_NAT],
+                cflag[R_NAT],
+                n_key_cp,
+            );
+            pw_edge(
+                "pw: nation^c nationkey in supplier^c",
+                q_row[R_NAT],
+                cflag[R_NAT],
+                n_key_cp,
+                q_row[R_SUPP],
+                cflag[R_SUPP],
+                s_nkey_cp,
+            );
+        }
+
         // Leaves. Part's input channel is its predicate bit and its clean
         // channel is the bound indicator keep * c on the input side of the
         // Conservation Check; the other three leaves are unfiltered.
@@ -938,7 +768,7 @@ impl<F: Field + Ord> TestChip<F> {
             cp_u8,
             part[0], // p_partkey
             p_keep,
-            p_filt_pad[2],
+            cflag[R_PART],
             MAX_SENTINEL,
         );
         let cp_agg_o = configure_cp_agg::<F, NUM_BYTES>(
@@ -1065,16 +895,37 @@ impl<F: Field + Ord> TestChip<F> {
             meta.advice_column(),
             meta.advice_column(),
         ];
-        meta.create_gate("profit row tie", |m| {
+        // The profit triple of a SELECTED row is its attached (nation, year,
+        // amount); of a deselected row it is the canonical PAD triple. That one
+        // masked gate does the work `q9_obj.rs` split between "profit row tie"
+        // over the join prefix and "profit pad row" over the complement, and it
+        // no longer depends on the clean rows being laid out first.
+        //
+        // The five attach columns and `amount` stay free on a deselected row,
+        // and that is safe for the same reason as before: nothing else reads
+        // them, and the triple the shuffle carries into the group-by is pinned.
+        meta.create_gate("profit row: selected? attached : PAD", |m| {
             let q = m.query_selector(q_amount);
+            let c = m.query_advice(cflag[R_LINE], Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+            let drop = one - c.clone();
+
             let pn = m.query_advice(profit[0], Rotation::cur());
             let py = m.query_advice(profit[1], Rotation::cur());
             let pa = m.query_advice(profit[2], Rotation::cur());
 
             vec![
-                q.clone() * (pn - m.query_advice(l_nationname, Rotation::cur())),
-                q.clone() * (py - m.query_advice(l_year, Rotation::cur())),
-                q * (pa - m.query_advice(amount, Rotation::cur())),
+                q.clone()
+                    * (pn
+                        - (c.clone() * m.query_advice(l_nationname, Rotation::cur())
+                            + drop.clone() * Expression::Constant(F::from(PAD_PROF_N)))),
+                q.clone()
+                    * (py
+                        - (c.clone() * m.query_advice(l_year, Rotation::cur())
+                            + drop.clone() * Expression::Constant(F::from(PAD_PROF_Y)))),
+                q * (pa
+                    - (c * m.query_advice(amount, Rotation::cur())
+                        + drop * Expression::Constant(F::from(PAD_PROF_A)))),
             ]
         });
 
@@ -1367,7 +1218,6 @@ impl<F: Field + Ord> TestChip<F> {
 
         TestCircuitConfig {
             q_part_pred,
-            q_part_perm: perm_part.clone(),
 
             part,
             supplier,
@@ -1378,25 +1228,12 @@ impl<F: Field + Ord> TestChip<F> {
 
             cond,
             q_cond_eq,
+            row_idx,
+            cons,
             cflag,
+            q_row,
             p_keep,
-            p_filt_pad,
-            p_join_pad,
-            perm_part,
 
-            o_join_pad,
-            s_join_pad,
-            n_join_pad,
-            ps_join_pad,
-            l_join_pad,
-
-            perm_orders,
-            perm_supplier,
-            perm_nation,
-            perm_partsupp,
-            perm_lineitem,
-
-            l_ps_key,
             l_supplycost,
             l_year,
             l_nationkey,
@@ -1405,7 +1242,6 @@ impl<F: Field + Ord> TestChip<F> {
             q_amount,
             amount,
 
-            q_prof_pad,
             profit,
             profit_sorted,
             perm_profit,
@@ -1437,17 +1273,10 @@ impl<F: Field + Ord> TestChip<F> {
             iz_res_nation_eq,
             iz_res_year_eq,
 
-            q_lkp_part,
             q_lkp_orders,
             q_lkp_supplier,
             q_lkp_nation,
             q_lkp_partsupp,
-
-            q_tbl_p,
-            q_tbl_o,
-            q_tbl_s,
-            q_tbl_n,
-            q_tbl_ps,
 
             instance,
             instance_test,
@@ -1482,15 +1311,6 @@ impl<F: Field + Ord> TestChip<F> {
             q_cp_nat,
             q_cp_sup,
             q_cp_mu,
-
-            q_cln_flag,
-            q_res_flag,
-            q_pad_flag,
-
-            l_pw_pskey,
-            s_pw_nkey,
-            n_pw_key,
-            q_pw_in,
         }
     }
 
@@ -1646,22 +1466,6 @@ impl<F: Field + Ord> TestChip<F> {
             .filter(|r| s_nkeys.contains(&r[0]))
             .collect();
 
-        // helper: join_pad = join rows then dis rows then PAD
-        fn pad_join_pad(
-            rows_join: &[Vec<u64>],
-            rows_dis: &[Vec<u64>],
-            total: usize,
-            pad: &[u64],
-        ) -> Vec<Vec<u64>> {
-            let mut out = vec![];
-            out.extend_from_slice(rows_join);
-            out.extend_from_slice(rows_dis);
-            while out.len() < total {
-                out.push(pad.to_vec());
-            }
-            out
-        }
-
         // Build join_pad tables for others by partitioning base into join/disjoin
         // disjoin = base - join (by key membership)
         let o_join_keys: HashSet<u64> = o_join.iter().map(|r| r[0]).collect();
@@ -1732,158 +1536,47 @@ impl<F: Field + Ord> TestChip<F> {
             .map(|r| (all_clean || l_pskeys.contains(&r[0])) as u64)
             .collect();
 
-        // the indicator rides along as the last column of each relation, so the
-        // existing Conservation Checks bind it
-        let with_flag = |rows: &[Vec<u64>], f: u64| -> Vec<Vec<u64>> {
-            rows.iter()
-                .map(|r| {
-                    let mut v = r.clone();
-                    v.push(f);
-                    v
-                })
-                .collect()
-        };
-
-        // Build p_filt_pad: keep? (part, c) : PAD. The indicator column pads
-        // with 0, so a part row dropped by the predicate is never clean.
-        let p_filt_pad_u64: Vec<Vec<u64>> = part
-            .iter()
-            .zip(p_keep.iter().zip(cln_p.iter()))
-            .map(|(r, (&k, &c))| {
-                if k == 1 {
-                    let mut v = r.clone();
-                    v.push(c);
-                    v
-                } else {
-                    vec![PAD_PKEY, PAD_PNAME, 0]
-                }
-            })
-            .collect();
-
-        // The flag the rows of the residual section carry. It is 0 except under
-        // the all-clean hook, which declares those same rows clean without
-        // moving them.
-        let res_flag: u64 = all_clean as u64;
-
-        // Build p_join_pad (length = part.len()): clean, residual, then PADs
-        let p_join_pad_u64 = pad_join_pad(
-            &with_flag(&p_cln, 1),
-            &with_flag(&p_res, res_flag),
-            part.len(),
-            &[PAD_PKEY, PAD_PNAME, 0],
-        );
-
-        let o_join_pad_u64 = pad_join_pad(
-            &with_flag(&o_join, 1),
-            &with_flag(&o_dis, res_flag),
-            orders.len(),
-            &[PAD_OKEY, PAD_OYEAR, 0],
-        );
-        let s_join_pad_u64 = pad_join_pad(
-            &with_flag(&s_join, 1),
-            &with_flag(&s_dis, res_flag),
-            supplier.len(),
-            &[PAD_SKEY, PAD_SNAT, 0],
-        );
-        let n_join_pad_u64 = pad_join_pad(
-            &with_flag(&n_join, 1),
-            &with_flag(&n_dis, res_flag),
-            nation.len(),
-            &[PAD_NKEY, PAD_NNAME, 0],
-        );
-        let ps_join_pad_u64 = pad_join_pad(
-            &with_flag(&ps_join, 1),
-            &with_flag(&ps_dis, res_flag),
-            partsupp.len(),
-            &[PAD_PSKEY, PAD_PSCOST, 0],
-        );
-        let l_join_pad_u64 = pad_join_pad(
-            &with_flag(&l_join, 1),
-            &with_flag(&l_dis, res_flag),
-            lineitem.len(),
-            &[
-                PAD_LOKEY, PAD_LPKEY, PAD_LSKEY, PAD_LQTY, PAD_LEXT, PAD_LDISC, 0,
-            ],
-        );
-
-        // ---------------- sections of each partition group ----------------
-        // Every group is laid out [clean rows | residual rows | pad rows], in
-        // the relation order R_PART .. R_LINE. This is the boundary the two
-        // indicator selectors and the whole Pairwise Consistency Check read.
-        let mut pw_sect: [(usize, usize); 6] = [
-            (p_cln.len(), p_res.len()),
-            (s_join.len(), s_dis.len()),
-            (n_join.len(), n_dis.len()),
-            (o_join.len(), o_dis.len()),
-            (ps_join.len(), ps_dis.len()),
-            (l_join.len(), l_dis.len()),
-        ];
-        if all_clean {
-            for s in pw_sect.iter_mut() {
-                *s = (s.0 + s.1, 0);
-            }
-        }
-
-        // ---------------- derived key columns of condition (3) ----------------
-        // The seven raw key columns of the ten lookups are columns of the
-        // partition groups already, so the only witnesses left to build are the
-        // three derived ones: the packed partsupp key on the lineitem rows and the
-        // shifted nation key on the supplier and nation rows. Each covers the
-        // clean section of its group, which is the only section its selector
-        // enables, so together they state exactly pi_K(R^c).
-        let pw_s_nkey: Vec<u64> = s_join_pad_u64[..pw_sect[R_SUPP].0]
-            .iter()
-            .map(|r| r[1] + NAT_SHIFT)
-            .collect();
-        let pw_n_key: Vec<u64> = n_join_pad_u64[..pw_sect[R_NAT].0]
-            .iter()
-            .map(|r| r[0] + NAT_SHIFT)
-            .collect();
-        let pw_l_pskey: Vec<u64> = l_join_pad_u64[..pw_sect[R_LINE].0]
-            .iter()
-            .map(|r| r[1] * PS_SHIFT + r[2])
-            .collect();
-
-        // 4) build profit table aligned to l_join_pad rows
-        // On non-join rows (disjoin/pad), set profit row to PAD_* so later perms/sorts don’t require valid attachments.
-        let join_len = l_join.len();
+        // ---------------- the aggregation witness ----------------
+        // On the committed lineitem rows: a selected row carries its attached
+        // (nation, year, amount), a deselected row the canonical PAD triple.
+        // The `amount` gate covers every row, so a deselected row still needs an
+        // amount consistent with a supplycost of 0.
         let mut profit_u64: Vec<[u64; 3]> =
             vec![[PAD_PROF_N, PAD_PROF_Y, PAD_PROF_A]; lineitem.len()];
+        let mut amount_u64: Vec<u64> = vec![0; lineitem.len()];
 
-        // compute attachment + amount for first join_len rows (join segment)
-        for i in 0..join_len {
-            let r = &l_join_pad_u64[i];
-            let okey = r[0];
-            let pkey = r[1];
-            let skey = r[2];
-            let qty = r[3];
-            let ext = r[4];
-            let disc = r[5];
+        for i in 0..lineitem.len() {
+            let okey = lineitem[i][0];
+            let pkey = lineitem[i][1];
+            let skey = lineitem[i][2];
+            let qty = lineitem[i][3];
+            let ext = lineitem[i][4];
+            let disc = lineitem[i][5];
 
-            let year = ord_map[&okey];
-            let nkey = sup_map[&skey];
-            let nname = nat_map[&nkey];
-
-            let ps_key = pkey * PS_SHIFT + skey;
-            let cost = ps_map[&ps_key];
+            let cost = if l_cln[i] == 1 {
+                ps_map[&(pkey * PS_SHIFT + skey)]
+            } else {
+                0
+            };
 
             // amount_scaled = ext*(SCALE-disc) - cost*qty*SCALE
-            let a: i128 = (ext as i128) * ((SCALE as i128) - (disc as i128))
-                - (cost as i128) * (qty as i128) * (SCALE as i128);
-
-            // store in field mod p: represent i128 as u64 by casting through i128 -> i64? could underflow.
-            // For simplicity: treat as signed but store in field using wrapping via i128 -> u128 -> u64 (low bits).
-            // If you need true signed semantics, use a sign/magnitude gadget. This matches your earlier “field arithmetic only” approach.
             //
             // KNOWN COMPLETENESS LIMIT, see the "amount = ..." gate: for a < 0
-            // this stores F::from(2^64 - |a|) while the gate computes p - |a|, so
-            // the gate is unsatisfiable and the honest prover cannot prove such a
-            // row at all. It is not an under-constraint (no forged witness is
-            // admitted), and repairing it needs a signed representation for
-            // `amount`, `profit[2]` and both running sums.
-            let a_u64 = (a as i128 as u128) as u64;
+            // this stores F::from(2^64 - |a|) while the gate computes p - |a|,
+            // so the gate is unsatisfiable and the honest prover cannot prove
+            // such a row at all. It is not an under-constraint, and repairing it
+            // needs a signed representation for `amount`, `profit[2]` and both
+            // running sums. A deselected row has cost 0, so its amount is
+            // ext*(SCALE-disc) >= 0 and never hits this.
+            let a: i128 = (ext as i128) * ((SCALE as i128) - (disc as i128))
+                - (cost as i128) * (qty as i128) * (SCALE as i128);
+            amount_u64[i] = (a as i128 as u128) as u64;
 
-            profit_u64[i] = [nname, year, a_u64];
+            if l_cln[i] == 1 {
+                let year = ord_map[&okey];
+                let nname = nat_map[&sup_map[&skey]];
+                profit_u64[i] = [nname, year, amount_u64[i]];
+            }
         }
 
         // profit_sorted = sort by (nation asc, year desc), keep amount aligned
@@ -2044,208 +1737,57 @@ impl<F: Field + Ord> TestChip<F> {
                         region.assign_advice(|| "cflag", col, i, || Value::known(F::from(f)))?;
                     }
                 }
-                // partition side: 1 on the clean rows, 0 on the residual rows
-                for (idx, (n_cln, n_res)) in pw_sect.iter().enumerate() {
-                    for i in 0..*n_cln {
-                        self.config.q_cln_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in *n_cln..(*n_cln + *n_res) {
-                        self.config.q_res_flag[idx].enable(&mut region, i)?;
-                    }
-                }
-                // part is the only group with a pad section; its rows carry
-                // flag 0, which is what `pad_join_pad` already writes
-                for i in (pw_sect[R_PART].0 + pw_sect[R_PART].1)..part.len() {
-                    self.config.q_pad_flag.enable(&mut region, i)?;
-                }
-
-                // enable part perm selectors and assign p_filt_pad and p_join_pad
+                // Selector Check and Pairwise Consistency need no witness of
+                // their own beyond the bits assigned above: the ten lookups run
+                // between the committed key columns, gated by those bits, and
+                // the three derived key columns are the ones the propagation
+                // already writes. The fixed selectors below mark nothing but
+                // each relation's real rows.
                 for i in 0..part.len() {
-                    self.config.perm_part.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_part.q_perm2.enable(&mut region, i)?;
-                }
-                for i in 0..part.len() {
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "p_filt_pad",
-                            self.config.p_filt_pad[j],
-                            i,
-                            || Value::known(F::from(p_filt_pad_u64[i][j])),
-                        )?;
-                        region.assign_advice(
-                            || "p_join_pad",
-                            self.config.p_join_pad[j],
-                            i,
-                            || Value::known(F::from(p_join_pad_u64[i][j])),
-                        )?;
-                    }
-                }
-
-                // enable perms base->join_pad for other tables + assign join_pad columns
-                for i in 0..orders.len() {
-                    self.config.perm_orders.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_orders.q_perm2.enable(&mut region, i)?;
+                    self.config.q_row[R_PART].enable(&mut region, i)?;
                 }
                 for i in 0..supplier.len() {
-                    self.config.perm_supplier.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_supplier.q_perm2.enable(&mut region, i)?;
+                    self.config.q_row[R_SUPP].enable(&mut region, i)?;
                 }
                 for i in 0..nation.len() {
-                    self.config.perm_nation.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_nation.q_perm2.enable(&mut region, i)?;
+                    self.config.q_row[R_NAT].enable(&mut region, i)?;
+                }
+                for i in 0..orders.len() {
+                    self.config.q_row[R_ORD].enable(&mut region, i)?;
                 }
                 for i in 0..partsupp.len() {
-                    self.config.perm_partsupp.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_partsupp.q_perm2.enable(&mut region, i)?;
+                    self.config.q_row[R_PS].enable(&mut region, i)?;
                 }
                 for i in 0..lineitem.len() {
-                    self.config.perm_lineitem.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_lineitem.q_perm2.enable(&mut region, i)?;
-                }
-
-                for i in 0..orders.len() {
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "o_join_pad",
-                            self.config.o_join_pad[j],
-                            i,
-                            || Value::known(F::from(o_join_pad_u64[i][j])),
-                        )?;
-                    }
-                }
-                for i in 0..supplier.len() {
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "s_join_pad",
-                            self.config.s_join_pad[j],
-                            i,
-                            || Value::known(F::from(s_join_pad_u64[i][j])),
-                        )?;
-                    }
-                }
-                for i in 0..nation.len() {
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "n_join_pad",
-                            self.config.n_join_pad[j],
-                            i,
-                            || Value::known(F::from(n_join_pad_u64[i][j])),
-                        )?;
-                    }
-                }
-                for i in 0..partsupp.len() {
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "ps_join_pad",
-                            self.config.ps_join_pad[j],
-                            i,
-                            || Value::known(F::from(ps_join_pad_u64[i][j])),
-                        )?;
-                    }
-                }
-                for i in 0..lineitem.len() {
-                    for j in 0..7 {
-                        region.assign_advice(
-                            || "l_join_pad",
-                            self.config.l_join_pad[j],
-                            i,
-                            || Value::known(F::from(l_join_pad_u64[i][j])),
-                        )?;
-                    }
-                }
-
-                // ===================== PAIRWISE CONSISTENCY CHECK =====================
-                // condition (3) of the One-Pass OBJ. One selector per relation over
-                // the clean rows of its partition group, which is what pins the
-                // three derived key columns and what gates that relation's key
-                // column on both sides of the ten lookups. There is no table to
-                // fill: each direction of an edge looks straight into the other
-                // endpoint's clean key column.
-                for i in 0..pw_sect[R_PART].0 {
-                    self.config.q_pw_in[R_PART].enable(&mut region, i)?;
-                }
-                for i in 0..pw_sect[R_ORD].0 {
-                    self.config.q_pw_in[R_ORD].enable(&mut region, i)?;
-                }
-                for i in 0..pw_sect[R_PS].0 {
-                    self.config.q_pw_in[R_PS].enable(&mut region, i)?;
-                }
-                for i in 0..pw_sect[R_SUPP].0 {
-                    self.config.q_pw_in[R_SUPP].enable(&mut region, i)?;
-                    region.assign_advice(
-                        || "s_pw_nkey",
-                        self.config.s_pw_nkey,
-                        i,
-                        || Value::known(F::from(pw_s_nkey[i])),
-                    )?;
-                }
-                for i in 0..pw_sect[R_NAT].0 {
-                    self.config.q_pw_in[R_NAT].enable(&mut region, i)?;
-                    region.assign_advice(
-                        || "n_pw_key",
-                        self.config.n_pw_key,
-                        i,
-                        || Value::known(F::from(pw_n_key[i])),
-                    )?;
-                }
-                for i in 0..pw_sect[R_LINE].0 {
-                    self.config.q_pw_in[R_LINE].enable(&mut region, i)?;
-                    region.assign_advice(
-                        || "l_pw_pskey",
-                        self.config.l_pw_pskey,
-                        i,
-                        || Value::known(F::from(pw_l_pskey[i])),
-                    )?;
-                }
-                // enable table selectors for lookups: enable on full lengths (pads are allowed in table)
-                for i in 0..part.len() {
-                    self.config.q_tbl_p.enable(&mut region, i)?;
-                }
-                for i in 0..orders.len() {
-                    self.config.q_tbl_o.enable(&mut region, i)?;
-                }
-                for i in 0..supplier.len() {
-                    self.config.q_tbl_s.enable(&mut region, i)?;
-                }
-                for i in 0..nation.len() {
-                    self.config.q_tbl_n.enable(&mut region, i)?;
-                }
-                for i in 0..partsupp.len() {
-                    self.config.q_tbl_ps.enable(&mut region, i)?;
-                }
-
-                // enable lookup selectors + amount/attach gates ONLY on join rows
-                for i in 0..join_len {
-                    self.config.q_lkp_part.enable(&mut region, i)?;
+                    self.config.q_row[R_LINE].enable(&mut region, i)?;
                     self.config.q_lkp_orders.enable(&mut region, i)?;
                     self.config.q_lkp_supplier.enable(&mut region, i)?;
                     self.config.q_lkp_nation.enable(&mut region, i)?;
                     self.config.q_lkp_partsupp.enable(&mut region, i)?;
                     self.config.q_amount.enable(&mut region, i)?;
                 }
-                // the complementary section: every profit row the gates above do
-                // not reach is pinned to the PAD triple
-                for i in join_len..lineitem.len() {
-                    self.config.q_prof_pad.enable(&mut region, i)?;
-                }
 
-                // assign attached cols + amount + profit on all lineitem rows
+                // assign attached cols + amount + profit on the committed
+                // lineitem rows. A deselected row carries zeros in the attach
+                // columns and the amount its own gate then forces, and its
+                // profit triple is the PAD triple the masked gate demands.
                 for i in 0..lineitem.len() {
-                    let r = &l_join_pad_u64[i];
-                    let okey = r[0];
-                    let pkey = r[1];
-                    let skey = r[2];
+                    let okey = lineitem[i][0];
+                    let pkey = lineitem[i][1];
+                    let skey = lineitem[i][2];
+                    let ps_key = pkey * PS_SHIFT + skey;
 
-                    // for non-join rows, these maps might not exist -> set PADs
-                    let (year, nkey, nname, cost) = if i < join_len {
+                    let selected = l_cln[i] == 1;
+                    let (year, nkey, nname, cost) = if selected {
                         let year = ord_map[&okey];
                         let nkey = sup_map[&skey];
                         let nname = nat_map[&nkey];
-                        let ps_key = pkey * PS_SHIFT + skey;
-                        let cost = ps_map[&ps_key];
-                        (year, nkey, nname, cost)
+                        (year, nkey, nname, ps_map[&ps_key])
                     } else {
-                        (PAD_OYEAR, PAD_SNAT, PAD_NNAME, PAD_PSCOST)
+                        // `q_amount` covers every row now, so the amount gate
+                        // still has to hold here. With cost 0 it reduces to
+                        // ext * (SCALE - disc), which is what `amount_of` writes.
+                        (0, 0, 0, 0)
                     };
 
                     region.assign_advice(
@@ -2272,48 +1814,20 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cost)),
                     )?;
-
-                    // packed ps_key witness
-                    let ps_key = if i < join_len {
-                        pkey * PS_SHIFT + skey
-                    } else {
-                        PAD_PSKEY
-                    };
-                    region.assign_advice(
-                        || "l_ps_key",
-                        self.config.l_ps_key,
-                        i,
-                        || Value::known(F::from(ps_key)),
-                    )?;
-
-                    // amount witness (use same as profit_u64)
-                    let a_u64 = profit_u64[i][2];
                     region.assign_advice(
                         || "amount",
                         self.config.amount,
                         i,
-                        || Value::known(F::from(a_u64)),
+                        || Value::known(F::from(amount_u64[i])),
                     )?;
-
-                    // profit row witness
-                    region.assign_advice(
-                        || "profit",
-                        self.config.profit[0],
-                        i,
-                        || Value::known(F::from(profit_u64[i][0])),
-                    )?;
-                    region.assign_advice(
-                        || "profit",
-                        self.config.profit[1],
-                        i,
-                        || Value::known(F::from(profit_u64[i][1])),
-                    )?;
-                    region.assign_advice(
-                        || "profit",
-                        self.config.profit[2],
-                        i,
-                        || Value::known(F::from(profit_u64[i][2])),
-                    )?;
+                    for j in 0..3 {
+                        region.assign_advice(
+                            || "profit",
+                            self.config.profit[j],
+                            i,
+                            || Value::known(F::from(profit_u64[i][j])),
+                        )?;
+                    }
                 }
 
                 // profit_sorted assignment + perm selectors
@@ -2516,6 +2030,36 @@ impl<F: Field + Ord> TestChip<F> {
                         Value::known(F::from(res_sorted_u64[i + 1][1])),
                         Value::known(F::from(res_sorted_u64[i][1])),
                     )?;
+                }
+
+                // ===================== (1) CONSERVATION CHECK =====================
+                assign_row_index(
+                    &mut region,
+                    &self.config.row_idx,
+                    [
+                        part.len(),
+                        supplier.len(),
+                        nation.len(),
+                        orders.len(),
+                        partsupp.len(),
+                        lineitem.len(),
+                    ]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0),
+                )?;
+                for (idx, (rows, flags)) in [
+                    (&part, &cln_p),
+                    (&supplier, &cln_s),
+                    (&nation, &cln_n),
+                    (&orders, &cln_o),
+                    (&partsupp, &cln_ps),
+                    (&lineitem, &l_cln),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assign_conserve(&mut region, &self.config.cons[idx], rows, flags)?;
                 }
 
                 // ===================== CARDINALITY PRESERVATION CHECK =====================
@@ -2981,7 +2525,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = &crate::paths::proof_file("proof_obj_q9");
+            let proof_path = &crate::paths::proof_file("proof_obj_q9_new");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }
@@ -3007,7 +2551,13 @@ mod tests {
             cs.lookups().len(),
             cs.shuffles().len(),
         );
-        assert!(degree <= 7, "the maximum gate degree rose to {}", degree);
+        // 8, one above the 7 of `q9_obj.rs`: gating both sides of a lookup by
+        // the selector COLUMN rather than by a selector RANGE costs one degree
+        // on each side. It buys no FFT, which is the number that matters:
+        // halo2 sizes the extended domain at the next power of two above
+        // degree - 1, so 7, 8 and 9 all run on an 8x domain and only 10 doubles
+        // it. Anything that pushes this past 9 does.
+        assert!(degree <= 9, "the maximum gate degree rose to {}", degree);
     }
 
     /// Fast correctness check of the Cardinality Preservation Check: a

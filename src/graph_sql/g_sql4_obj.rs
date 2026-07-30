@@ -3,6 +3,10 @@ use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
@@ -1461,25 +1465,23 @@ pub struct Cycle4OrderedConfig<F: Field + Ord> {
     // not put both clean sets in a prefix anyway).
     w_cflag1: Column<Advice>,
     w_cflag2: Column<Advice>,
-    filt1: Vec<Column<Advice>>, // 6: (x,y,z,e1,e2, pred * c1)
-    part1: Vec<Column<Advice>>, // 6: [clean rows | residual rows | pad rows]
-    perm1: PermAnyConfig,
-    filt2: Vec<Column<Advice>>, // 6: (x,y,z,e1,e2, keep * c2)
-    part2: Vec<Column<Advice>>,
-    perm2: PermAnyConfig,
-    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1   ([role1, role2])
-    q_res_flag: Vec<Selector>, // rows of R^r: flag == 0
-    q_pad_row: Vec<Selector>,  // rows past R^c U R^r: the canonical PAD tuple
 
-    // ---------------- Pairwise Consistency ----------------
-    // condition (3): pi_K(R_1^c) == pi_K(R_2^c) on the one bag tree edge.
-    // Every vector below is indexed [role1, role2]; the two keys are the same
-    // two cells packed in OPPOSITE orders.
-    pw_key: Vec<Column<Advice>>, // packed separator key of the partition rows
-    q_pw_key: Vec<Selector>,     // pins pw_key over the clean rows
-    // Enabled over exactly the clean rows of its role. It gates the input side of
-    // its own direction and the table side of the other one, so the two lookups
-    // need nothing beyond these two columns and these two selectors.
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED bag. W is read in two roles, so
+    // its rows are conserved twice, once per role, each against that role's own
+    // indicator. Padding rows sit in the residual part, their indicator zero.
+    row_idx: RowIndexConfig,
+    cons_role1: ConserveConfig,
+    cons_role2: ConserveConfig,
+
+    // ---------------- (2) Pairwise Consistency ----------------
+    // pi_K(R_1^c) == pi_K(R_2^c) on the one bag tree edge. Every vector below
+    // is indexed [role1, role2]; the two keys are the same two cells packed in
+    // OPPOSITE orders, each MASKED by that role's selector bit.
+    pw_key: Vec<Column<Advice>>, // c * pack2(A, C) on the bag rows
+    q_pw_key: Vec<Selector>,     // pins pw_key on every bag row
+    // Enabled over the bag's whole capacity: the clean row set the containments
+    // range over is carried by the masked key, not by the selector's extent.
     q_pw_in: Vec<Selector>,
 
     // ---------------- Occurrence distinctness ----------------
@@ -1829,6 +1831,26 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // separate even though there is now only one tuple group.
         let w_cflag1 = meta.advice_column();
         let w_cflag2 = meta.advice_column();
+
+        // ---------------- (1) Conservation Check ----------------
+        // One permutation per role, between the indexed bag and the
+        // concatenation of its two parts. The indices are distinct, so the
+        // indexed bag is a set even though W holds duplicate wedges, and the
+        // single permutation rules out an occurrence being fabricated, lost,
+        // duplicated or counted on both sides: no Non-Membership Check.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons_role1 = configure_conserve::<F>(
+            meta,
+            &row_idx,
+            &[w_x, w_y, w_z, w_i, w_j, w_e1, w_e2],
+            w_cflag1,
+        );
+        let cons_role2 = configure_conserve::<F>(
+            meta,
+            &row_idx,
+            &[w_x, w_y, w_z, w_i, w_j, w_e1, w_e2],
+            w_cflag2,
+        );
         for c in [w_cflag1, w_cflag2] {
             meta.enable_equality(c);
         }
@@ -1837,150 +1859,32 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // and the link gate below, which multiplies it by the predicate bit.
         // Two degree-3 constraints under a selector the circuit already enables
         // on every row.
-        meta.create_gate("clean indicator is boolean on the bag rows", |m| {
+        //
+        // The predicate half of the Selector Check comes with it. `g_sql4_obj.rs`
+        // got that structurally: the link gate below padded the indicator away
+        // wherever the role's keep bit was 0, so `filt[5]` was `keep * c` and
+        // the propagation read that product. With no filtered view to pad, the
+        // implication is a constraint, and it is what makes the input channel of
+        // the Cardinality Preservation Check count the join of the
+        // predicate-filtered relations rather than of the raw bag. Role 1's bit
+        // is `w_pred`, role 2's is `agg_msg.in_val` (already forced to
+        // w_real * [x<y] by the "msg input from W" gate), so a selected row is
+        // in particular a REAL row: this is the cluster adjustment, a padding
+        // row contributes to neither channel.
+        meta.create_gate("selector is a bit and implies its predicate", |m| {
             let one = Expression::Constant(F::ONE);
             let q = m.query_selector(q_w_pred);
             let c1 = m.query_advice(w_cflag1, Rotation::cur());
             let c2 = m.query_advice(w_cflag2, Rotation::cur());
+            let b1 = m.query_advice(w_pred, Rotation::cur());
+            let b2 = m.query_advice(agg_msg.in_val, Rotation::cur());
             vec![
-                q.clone() * c1.clone() * (one.clone() - c1),
-                q * c2.clone() * (one - c2),
+                q.clone() * c1.clone() * (one.clone() - c1.clone()),
+                q.clone() * c2.clone() * (one.clone() - c2.clone()),
+                q.clone() * c1 * (one.clone() - b1),
+                q * c2 * (one - b2),
             ]
         });
-
-        // -------- Conservation Check per role: R == R^c U R^r --------
-        // `g_sql4_obj.rs` partitions nothing, so the partition is introduced
-        // here. Six columns per side: the bag tuple, the two edge ids that
-        // identify the occurrence, and the clean indicator.
-        fn mk_perm<FF: PrimeField>(
-            meta: &mut ConstraintSystem<FF>,
-            width: usize,
-        ) -> (Vec<Column<Advice>>, Vec<Column<Advice>>, PermAnyConfig) {
-            let q1 = meta.complex_selector();
-            let q2 = meta.complex_selector();
-            let mut a = vec![];
-            let mut b = vec![];
-            for _ in 0..width {
-                a.push(meta.advice_column());
-                b.push(meta.advice_column());
-            }
-            let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
-            (a, b, perm)
-        }
-
-        // Two partitions of the SAME base tuple group, one per role. They look
-        // mergeable now that there is one bag and they are not: the two clean
-        // sets differ, merging would make condition (9) below compare a set with
-        // itself, and the two channels of condition (10) would collapse into
-        // one. Both sides stay width 6 and the same shape, which the halo2
-        // shuffle evaluator requires.
-        let (filt1, part1, perm1) = mk_perm::<F>(meta, 6);
-        let (filt2, part2, perm2) = mk_perm::<F>(meta, 6);
-
-        // The indicator column pads with 0, so a bag row whose predicate fails
-        // is never clean and contributes to neither channel of the check.
-        let pad_bag: [u64; 6] = [PAD_U64, PAD_U64, PAD_U64, PAD_U64, PAD_U64, 0];
-
-        let mut link_filt_pad = |name: &'static str,
-                                 q: Selector,
-                                 keep: Column<Advice>,
-                                 base: Vec<Column<Advice>>,
-                                 filt: Vec<Column<Advice>>,
-                                 pad: [u64; 6]| {
-            meta.create_gate(name, move |m| {
-                let q = m.query_selector(q);
-                let keep = m.query_advice(keep, Rotation::cur());
-                let one = Expression::Constant(F::ONE);
-                (0..base.len())
-                    .map(|j| {
-                        let b = m.query_advice(base[j], Rotation::cur());
-                        let f = m.query_advice(filt[j], Rotation::cur());
-                        let p = Expression::Constant(F::from(pad[j]));
-                        q.clone() * (f - (keep.clone() * b + (one.clone() - keep.clone()) * p))
-                    })
-                    .collect::<Vec<_>>()
-            });
-        };
-
-        // Both link gates read the SAME five base columns, the tuple and the two
-        // edge ids of the occurrence, and differ only in the bit that keeps a row
-        // and in the indicator they carry. Role 1's bit is `w_pred`; role 2's is
-        // `agg_msg.in_val`, which the "msg input from W (role 2)" gate already
-        // forces to w_real * [x<y].
-        link_filt_pad(
-            "link filt1 = (pred? W tuple : PAD)",
-            perm1.q_perm1,
-            w_pred,
-            vec![w_x, w_y, w_z, w_e1, w_e2, w_cflag1],
-            filt1.clone(),
-            pad_bag,
-        );
-        link_filt_pad(
-            "link filt2 = (keep? W tuple : PAD)",
-            perm2.q_perm1,
-            agg_msg.in_val,
-            vec![w_x, w_y, w_z, w_e1, w_e2, w_cflag2],
-            filt2.clone(),
-            pad_bag,
-        );
-
-        // -------- partition side of the indicator: 1 on R^c rows, 0 on R^r --------
-        // The partition column group is laid out as [clean rows | residual rows
-        // | pad rows], so one selector per section pins the indicator. Without
-        // these the prover could mark a residual row clean and inflate the
-        // clean channel of the check below.
-        //
-        // The pad rows DO need a gate, contrary to what this comment used to
-        // claim: a shuffle constrains a row only through the multiset it takes
-        // part in, and it is satisfied by any assignment of the tail that the
-        // input side matches. Every one of the six columns of a tail row was
-        // free advice, so a prover could copy a joinable bag tuple into a slot
-        // whose predicate fails, mark it clean, and park the extra flag-1
-        // partition row in the tail: `q_cln_flag` and `q_res_flag` cover only
-        // 0..n_cln and n_cln..n_cln+n_res, so both section lengths and hence
-        // the vk stayed identical, Pairwise Consistency (which reads the clean
-        // PREFIX only) never saw the duplicate, and both channels of condition
-        // (10) moved by the same amount, so the COUNT inflated by sigma with
-        // nothing rejecting.
-        //
-        // Pinning the whole tail row to the canonical PAD tuple closes it: the
-        // multiset of PAD tuples on the input side is then exactly the pad rows,
-        // so the clean section can hold no more than n_cln flag-1 rows and the
-        // duplicate has nowhere to go. Six degree-1 constraints under one
-        // selector per role; pinning rather than gating out, so the shuffle keeps
-        // proving that R == R^c U R^r over ALL n rows.
-        //
-        // The role-2 triple is additionally what pins the role-2 row count `m`,
-        // which is what the single occurrence-distinctness argument below counts
-        // against, so neither triple may be dropped.
-        let q_cln_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_pad_row = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-
-        for (idx, part) in [part1.clone(), part2.clone()].iter().enumerate() {
-            let flag_col = *part.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
-            });
-
-            let cols = part.clone();
-            let q_p = q_pad_row[idx];
-            meta.create_gate("partition tail is the canonical PAD tuple", move |m| {
-                let q = m.query_selector(q_p);
-                (0..cols.len())
-                    .map(|j| {
-                        q.clone()
-                            * (m.query_advice(cols[j], Rotation::cur())
-                                - Expression::Constant(F::from(pad_bag[j])))
-                    })
-                    .collect::<Vec<_>>()
-            });
-        }
 
         // ================= Pairwise Consistency (condition (3)) =================
         // pi_K(R_i^c) == pi_K(R_j^c) on every join tree edge. Here the bag tree
@@ -1988,32 +1892,35 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         // so the condition is two mutual Membership Checks between the clean
         // sections of the two partitions.
         //
-        // Both sides read the *partition* columns, whose tuples the Conservation
-        // Check above ties to the bag rows: restricted to the clean rows, the
-        // separator key of that group is exactly pi_K(R^c). A lookup over the
-        // bag rows instead would certify membership in R_j, which is the weaker
-        // statement the two bag lookups already make.
+        // Both sides read the BAG's own columns now, masked by that role's
+        // selector bit. Which rows the containments range over is carried by
+        // the mask: `c * pack2(A, C)` is the packed key on a selected row and 0
+        // on every other one, and the lookup selectors cover the bag's whole
+        // capacity. `g_sql4_obj.rs` read the clean prefix of a materialized
+        // partition group instead, which needed a Conservation Check per role
+        // to mean pi_K(R^c) and baked |R^c| into the fixed columns.
         //
-        // Both partitions hold (x,y,z,e1,e2,c), but they are read in different
-        // roles, so the shared separator key pack2(A,C) is pack2(x,z) on the
-        // role-1 side and pack2(z,x) on the role-2 side: the SAME two columns in
-        // OPPOSITE order. Folding it into one column per role keeps both lookups
-        // at the degree of the circuit's other membership arguments.
+        // The two roles read the same tuple, so the shared separator key
+        // pack2(A,C) is pack2(x,z) on the role-1 side and pack2(z,x) on the
+        // role-2 side: the SAME two columns in OPPOSITE order. Folding the
+        // product into one column per role keeps both lookups at the degree of
+        // the circuit's other membership arguments.
         let pw_key = (0..2).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let q_pw_key = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-        for (idx, (a_col, c_col)) in [(part1[0], part1[2]), (part2[2], part2[0])]
-            .iter()
-            .copied()
-            .enumerate()
+        for (idx, (a_col, c_col, flag)) in
+            [(w_x, w_z, w_cflag1), (w_z, w_x, w_cflag2)].iter().copied().enumerate()
         {
             let q = q_pw_key[idx];
             let key_col = pw_key[idx];
-            meta.create_gate("pw: clean key = pack2(A,C)", move |m| {
+            meta.create_gate("pw: masked separator key = c * pack2(A,C)", move |m| {
                 let q = m.query_selector(q);
                 let a = m.query_advice(a_col, Rotation::cur());
                 let c = m.query_advice(c_col, Rotation::cur());
                 let packed = a * Expression::Constant(F::from(PACK_SHIFT)) + c;
-                vec![q * (m.query_advice(key_col, Rotation::cur()) - packed)]
+                vec![
+                    q * (m.query_advice(key_col, Rotation::cur())
+                        - m.query_advice(flag, Rotation::cur()) * packed),
+                ]
             });
         }
 
@@ -2084,7 +1991,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             cp_u8,
             agg_msg.in_key,
             agg_msg.in_val,
-            filt2[5],
+            w_cflag2,
             PAD_U64,
         );
 
@@ -2101,7 +2008,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         {
             let s_all = cp_join_2.s_all;
             let s_cln = cp_join_2.s_cln;
-            let cln_1 = filt1[5];
+            let cln_1 = w_cflag1;
             let mu_all = cp_root.mu_all;
             let mu_cln = cp_root.mu_cln;
             meta.create_gate("cp: root multiplicities over role 1", move |m| {
@@ -2302,15 +2209,9 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
             q_w_pred,
             w_cflag1,
             w_cflag2,
-            filt1,
-            part1,
-            perm1,
-            filt2,
-            part2,
-            perm2,
-            q_cln_flag,
-            q_res_flag,
-            q_pad_row,
+            row_idx,
+            cons_role1,
+            cons_role2,
             pw_key,
             q_pw_key,
             q_pw_in,
@@ -2657,13 +2558,8 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                         || Value::known(F::from(contrib_u64)),
                     )?;
 
-                    // the folded role-1 bit and both clean indicators of this
-                    // row, plus the input side of both Conservation Checks
+                    // the folded role-1 bit and both selector bits of this row
                     cfg.q_w_pred.enable(&mut region, i)?;
-                    cfg.perm1.q_perm1.enable(&mut region, i)?;
-                    cfg.perm1.q_perm2.enable(&mut region, i)?;
-                    cfg.perm2.q_perm1.enable(&mut region, i)?;
-                    cfg.perm2.q_perm2.enable(&mut region, i)?;
                     region.assign_advice(
                         || "w_pred",
                         cfg.w_pred,
@@ -2709,37 +2605,27 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // "msg input from W (role 2)" gate ties to the row.
                 let _msg_emitted = agg_msg_chip.assign(&mut region, n, &agg_in)?;
 
-                // ---- both Conservation Checks, which bind the two indicators ----
-                // The input side's raw indicators went in with the bag rows
-                // above; the link gate turns each into keep * indicator on its
-                // own filt columns.
-                assign_perm_group(&mut region, "filt1", &cfg.filt1, &filt_1)?;
-                assign_perm_group(&mut region, "part1", &cfg.part1, &part_1)?;
-                assign_perm_group(&mut region, "filt2", &cfg.filt2, &filt_2)?;
-                assign_perm_group(&mut region, "part2", &cfg.part2, &part_2)?;
-                // partition side: 1 on the clean rows, 0 on the residual rows,
-                // and the tail pinned to the canonical PAD tuple rather than
-                // left as free advice
-                for (idx, (n_cln, n_res)) in [(n_cln1, n_res1), (n_cln2, n_res2)]
-                    .iter()
-                    .copied()
-                    .enumerate()
-                {
-                    for i in 0..n_cln {
-                        cfg.q_cln_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in n_cln..(n_cln + n_res) {
-                        cfg.q_res_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in (n_cln + n_res)..n {
-                        cfg.q_pad_row[idx].enable(&mut region, i)?;
-                    }
-                }
-
                 // ---- occurrence distinctness, over the role-2 keep bit ----
                 // `pack2` of the two edge ids is injective only while both fit a
                 // 32-bit lane, which also keeps every real id strictly below the
                 // PAD id that marks the rows failing the keep bit. One argument
+                // ---- (1) Conservation Check, one permutation per role ----
+                {
+                    let w_rows: Vec<Vec<u64>> = (0..n)
+                        .map(|i| {
+                            if i < real_w {
+                                let (x, y, z, i_in, j_out, e1, e2) = w[i];
+                                vec![x, y, z, i_in, j_out, e1, e2]
+                            } else {
+                                vec![0u64; 7]
+                            }
+                        })
+                        .collect();
+                    assign_row_index(&mut region, &cfg.row_idx, n)?;
+                    assign_conserve(&mut region, &cfg.cons_role1, &w_rows, &cln1)?;
+                    assign_conserve(&mut region, &cfg.cons_role2, &w_rows, &cln2)?;
+                }
+
                 // covers both roles: role 1's rows are the role-2 rows that also
                 // pass the pinned [y<z] test.
                 assert!(
@@ -2780,24 +2666,21 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 let cp_stage_2 = build_cp_stage(&cp_rows_2, PAD_U64);
                 assign_cp_agg(&mut region, &cfg.cp_agg_2, &cp_rows_2, &cp_stage_2)?;
 
-                // ============== PAIRWISE CONSISTENCY (condition (3)) ==============
-                // The two key sets of the one bag tree edge, read off the clean
-                // sections of the two partitions rather than off the bag rows,
-                // and each of them looked up in the other. Both partitions hold
-                // (x,y,z,...), but the shared key pack2(A,C) is pack2(x,z) in
-                // role 1 and pack2(z,x) in role 2, the same two columns in
-                // opposite order, exactly as the "pw: clean key = pack2(A,C)"
-                // gate reads them.
-                //
-                // There is no key table to fill: the column of one role is the
-                // table of the other direction, so `q_pw_in[r]` over the clean
-                // rows of role r is all the gating either lookup needs.
+                // ============== (2) PAIRWISE CONSISTENCY ==============
+                // The two key sets of the one bag tree edge, read off the BAG
+                // rows masked by each role's selector bit and looked up in each
+                // other. The shared key pack2(A,C) is pack2(x,z) in role 1 and
+                // pack2(z,x) in role 2, the same two cells in opposite order,
+                // exactly as the masked-key gate reads them. A deselected or
+                // padding row masks to 0, which every table contains, so the
+                // selectors cover the bag's whole capacity and no clean-prefix
+                // extent reaches the fixed columns.
                 let pw_keys: [Vec<u64>; 2] = [
-                    (0..n_cln1)
-                        .map(|i| pack2(part_1[i][0], part_1[i][2]))
+                    (0..n)
+                        .map(|i| if cln1[i] == 1 { pack2(w[i].0, w[i].2) } else { 0 })
                         .collect(),
-                    (0..n_cln2)
-                        .map(|i| pack2(part_2[i][2], part_2[i][0]))
+                    (0..n)
+                        .map(|i| if cln2[i] == 1 { pack2(w[i].2, w[i].0) } else { 0 })
                         .collect(),
                 ];
                 for r in 0..2 {
@@ -3141,7 +3024,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = &crate::paths::proof_file("last_proof_q4");
+            let proof_path = &crate::paths::proof_file("last_proof_q4_new");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

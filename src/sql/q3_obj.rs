@@ -7,12 +7,15 @@ use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
 };
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 const NUM_BYTES: usize = 5;
 const MAX_SENTINEL: u64 = (1u64 << (8 * NUM_BYTES)) - 1; // 2^40-1
@@ -24,38 +27,49 @@ const PAD_DATE: u64 = MAX_SENTINEL; // pad orderdate (max -> last when ASC)
 const PAD_SHIP: u64 = MAX_SENTINEL; // pad shippriority (max)
 const PAD_REV: u64 = 0; // pad revenue (min -> last when DESC)
 
+/// Test hook: deselect one participating order and re-reduce its neighbours
+/// around it, so that (1) and (2) still hold and only (3) can object.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 
+/// Test hook: select every row that passes its predicate, i.e. no reduction at
+/// all. Both channels of (3) then coincide, so only (2) can object.
 pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+
+/// Test hook: additionally select one customer row that FAILS the mktsegment
+/// predicate. Only the predicate half of (1) can object, which is the half the
+/// revision added.
+pub static SELECT_A_FILTERED_ROW: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
 
 #[derive(Clone, Debug)]
 pub struct TestCircuitConfig<F: Field + Ord> {
-    q_enable: Vec<Selector>,
+    // one simple selector per relation for the gates, and one complex selector
+    // over the same rows for the lookup expressions
+    q_enable: Vec<Selector>, // 3: customer, orders, lineitem
+    q_row: Vec<Selector>,    // 3: the same rows, usable inside lookups
 
-    customer: Vec<Column<Advice>>, // 2
-    orders: Vec<Column<Advice>>,   // 4
-    lineitem: Vec<Column<Advice>>, // 4
+    customer: Vec<Column<Advice>>, // 2: [c_mktsegment, c_custkey]
+    orders: Vec<Column<Advice>>,   // 4: [o_orderdate, o_shippriority, o_custkey, o_orderkey]
+    lineitem: Vec<Column<Advice>>, // 4: [l_orderkey, l_extendedprice, l_discount, l_shipdate]
 
-    check: Vec<Column<Advice>>,     // 0..2 used
-    condition: Vec<Column<Advice>>, // 3
+    check: Vec<Column<Advice>>, // 3: the predicate bit b of each relation
+    condition: Vec<Column<Advice>>, // 3: the query parameters
 
     // the query parameters are advice, so they are pinned per proof rather than
     // per row: constant down each column, and the two date columns equal
     q_cond_const: Vec<Selector>, // rows 0..len-2 of each condition column
     q_cond_link: Selector,       // row 0: condition[1] == condition[2]
 
-    // clean indicator per base row: [customer, orders, lineitem]
-    cflag: Vec<Column<Advice>>,
-
-    o_join: Vec<Column<Advice>>,    // 4
-    o_disjoin: Vec<Column<Advice>>, // 4
-    c_join: Vec<Column<Advice>>,    // 2
-    c_disjoin: Vec<Column<Advice>>, // 2
-    l_join: Vec<Column<Advice>>,    // 4
-    l_disjoin: Vec<Column<Advice>>, // 4
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED relation: the committed row
+    // position, the tuple and the indicator are conserved as one entry, so a
+    // single permutation per relation places every occurrence on exactly one
+    // side and binds `cflag` to the split the other two conditions read.
+    row_idx: RowIndexConfig,
+    cons: Vec<ConserveConfig>,  // [customer, orders, lineitem]
+    cflag: Vec<Column<Advice>>, // the indicator c, one column per relation
 
     lt_compare_condition: Vec<LtConfig<F, NUM_BYTES>>,
     equal_condition: Vec<IsZeroConfig<F>>,
@@ -63,8 +77,8 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     instance: Column<Instance>,
     instance_test: Column<Advice>,
 
-    // ---------------- Cardinality Preservation Check ----------------
-    // condition (4): |R^c join| == |R join|, over the tree rooted at orders
+    // ---------------- (3) Cardinality Preservation Check ----------------
+    // over the tree rooted at orders, with customer and lineitem as leaves
     cp_agg_c: CpAggConfig<F, NUM_BYTES>, // child customer, keyed by c_custkey
     cp_agg_l: CpAggConfig<F, NUM_BYTES>, // child lineitem, keyed by l_orderkey
     cp_join_c: CpJoinConfig<F, NUM_BYTES>, // orders -> customer
@@ -72,50 +86,22 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     cp_root: CpRootConfig,
     q_cp_mu: Selector, // the two root product gates
 
-    // clean/residual flag on the partition side of each Conservation Check
-    q_cln_flag: Vec<Selector>, // rows of R^c: flag == 1
-    q_res_flag: Vec<Selector>, // rows of R^r: flag == 0
-    q_pad_part: Vec<Selector>, // rows past R^c U R^r: the whole tuple is PAD
+    // ---------- the selector-masked lineitem key ----------
+    l_key_sel: Column<Advice>, // c ? l_orderkey : PAD_OK
 
-    // ---------------- permutation pads (orders) ----------------
-    o_filt_pad: Vec<Column<Advice>>,
-    o_part_pad: Vec<Column<Advice>>,
-    perm_orders: PermAnyConfig,
-
-    // ---------------- permutation pads (customer) ----------------
-    c_filt_pad: Vec<Column<Advice>>,
-    c_part_pad: Vec<Column<Advice>>,
-    perm_customer: PermAnyConfig,
-
-    // ---------------- permutation pads (lineitem) ----------------
-    l_filt_pad: Vec<Column<Advice>>,
-    l_part_pad: Vec<Column<Advice>>,
-    perm_lineitem: PermAnyConfig,
-
-    // -------- join<->join membership lookups (4 directions) --------
-    // input selectors
-    q_in_o_cust_in_c: Selector, // o_join.custkey -> c_join table
-    q_in_c_cust_in_o: Selector, // c_join.custkey -> o_join table
-    q_in_l_okey_in_o: Selector, // l_join.orderkey -> o_join table
-    q_in_o_okey_in_l: Selector, // o_join.orderkey -> l_join table
-
-    // table selectors (gate the table side!)
-
-    // key-table advice columns
-
-    // ---------- l_join -> l_sorted permutation ----------
-    l_sorted: Vec<Column<Advice>>, // 4 cols (same as lineitem)
+    // ---------- group-by over the sorted lineitem view ----------
+    l_sorted: Vec<Column<Advice>>, // 3: [masked orderkey, extendedprice, discount]
     perm_lsort: PermAnyConfig,
 
     q_line: Selector,  // enable line_rev + emit + same_next
     q_first: Selector, // run_sum[0] = line_rev[0]
     q_accu: Selector,  // enable run_sum recurrence (needs prev)
 
-    // line-level helpers over l_sorted
     line_rev: Column<Advice>,
     run_sum: Column<Advice>,
     iz_same_prev: IsZeroConfig<F>, // cur_okey - prev_okey == 0 (only rows >=1)
     iz_same_next: IsZeroConfig<F>, // next_okey - cur_okey == 0 (rows 0..n-1)
+    is_last: Column<Advice>,       // 1 - iz_same_next, materialized
 
     // l_sorted[0] is nondecreasing (rows 0..n-2, i.e. real consecutive pairs)
     q_lsort: Selector,
@@ -123,12 +109,9 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     lt_lsort_cur_next: LtConfig<F, NUM_BYTES>, // okey_cur < okey_next
     iz_lsort_eq: IsZeroConfig<F>, // okey_next - okey_cur == 0
 
-    // ---------- emitted padded result (length = l_join.len()) ----------
+    // ---------- emitted padded result (length = |lineitem|) ----------
     res_pad: Vec<Column<Advice>>, // [okey, odate, shippri, revenue]
-
-    // attach (okey,odate,shippri) via lookup into o_join
-    q_res_lookup: Selector,
-    q_tbl_o_join: Selector, // gates table-side (o_join rows)
+    q_res_lookup: Selector,       // gates the input side of the attach lookup
 
     // ---------- ORDER BY proof (res_pad -> res_sorted) ----------
     res_sorted: Vec<Column<Advice>>, // same 4 cols
@@ -146,79 +129,248 @@ pub struct TestChip<F: Field + Ord> {
     config: TestCircuitConfig<F>,
 }
 
+/// Everything the prover computes off-circuit for one proof. It is derived
+/// from the three relations and the two query parameters alone, so the only
+/// free choices in it are the three test hooks, and `test_answer_matches_sql`
+/// checks the emitted answer against a direct evaluation of the query.
+#[derive(Debug, Clone, Default)]
+pub struct Witness {
+    pub n_c: usize,
+    pub n_o: usize,
+    pub n_l: usize,
+    /// the certified predicate bit b of each relation, per base row
+    pub c_check: Vec<u64>,
+    pub o_check: Vec<u64>,
+    pub l_check: Vec<u64>,
+    /// the selector bit c of each relation, per base row
+    pub cln_c: Vec<u64>,
+    pub cln_o: Vec<u64>,
+    pub cln_l: Vec<u64>,
+    /// `c ? l_orderkey : PAD_OK`, per lineitem row
+    pub l_key_sel_u64: Vec<u64>,
+    /// the sorted view of `(masked key, extendedprice, discount)`
+    pub l_sorted_u64: Vec<[u64; 3]>,
+    pub line_rev_u64: Vec<u64>,
+    pub run_sum_u64: Vec<u64>,
+    pub is_last_u64: Vec<u64>,
+    /// one `(okey, odate, shippri, revenue)` per group, PAD elsewhere
+    pub res_pad_u64: Vec<[u64; 4]>,
+    /// the same rows under ORDER BY revenue DESC, o_orderdate ASC
+    pub res_sorted_u64: Vec<[u64; 4]>,
+    pub all_clean: bool,
+    pub tamper: bool,
+}
+
+fn build_witness(
+    customer: &[Vec<u64>],
+    orders: &[Vec<u64>],
+    lineitem: &[Vec<u64>],
+    condition: [u64; 2],
+) -> Witness {
+    let n_c = customer.len();
+    let n_o = orders.len();
+    let n_l = lineitem.len();
+
+    // ---------------- predicate bits b ----------------
+    let c_check: Vec<u64> = customer
+        .iter()
+        .map(|c| (c[0] == condition[0]) as u64)
+        .collect();
+    let o_check: Vec<u64> = orders
+        .iter()
+        .map(|o| (o[0] < condition[1]) as u64)
+        .collect();
+    let l_check: Vec<u64> = lineitem
+        .iter()
+        .map(|l| (l[3] > condition[1]) as u64)
+        .collect();
+
+    // ---------------- selector bits c ----------------
+    // The honest selection is the fully reduced instance of the
+    // predicate-filtered query. The tree is customer <- orders -> lineitem, so
+    // one bottom-up pass over the two leaves followed by one top-down pass
+    // reaches the fixed point.
+    let c_keys: HashSet<u64> = customer
+        .iter()
+        .zip(c_check.iter())
+        .filter(|(_, &b)| b == 1)
+        .map(|(c, _)| c[1])
+        .collect();
+    let l_okeys: HashSet<u64> = lineitem
+        .iter()
+        .zip(l_check.iter())
+        .filter(|(_, &b)| b == 1)
+        .map(|(l, _)| l[0])
+        .collect();
+
+    let mut cln_o: Vec<u64> = orders
+        .iter()
+        .zip(o_check.iter())
+        .map(|(o, &b)| (b == 1 && c_keys.contains(&o[2]) && l_okeys.contains(&o[3])) as u64)
+        .collect();
+
+    // test hook only: no reduction at all, everything that passes its predicate
+    // declared clean
+    let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+    if all_clean {
+        cln_o = o_check.clone();
+    }
+
+    // test hook only: deselect one participating order and re-reduce the
+    // neighbours around it, so (1) and (2) survive and only (3) objects
+    let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+    if tamper {
+        if let Some(i) = cln_o.iter().position(|&f| f == 1) {
+            cln_o[i] = 0;
+        }
+    }
+
+    // push the surviving orders back down to the two leaves
+    let cln_o_custkeys: HashSet<u64> = orders
+        .iter()
+        .zip(cln_o.iter())
+        .filter(|(_, &f)| f == 1)
+        .map(|(o, _)| o[2])
+        .collect();
+    let cln_o_orderkeys: HashSet<u64> = orders
+        .iter()
+        .zip(cln_o.iter())
+        .filter(|(_, &f)| f == 1)
+        .map(|(o, _)| o[3])
+        .collect();
+
+    let mut cln_c: Vec<u64> = if all_clean {
+        c_check.clone()
+    } else {
+        customer
+            .iter()
+            .zip(c_check.iter())
+            .map(|(c, &b)| (b == 1 && cln_o_custkeys.contains(&c[1])) as u64)
+            .collect()
+    };
+
+    // test hook only: select a customer row that fails its predicate
+    if SELECT_A_FILTERED_ROW.load(Ordering::Relaxed) {
+        if let Some(i) = c_check.iter().position(|&b| b == 0) {
+            cln_c[i] = 1;
+        }
+    }
+
+    let cln_l: Vec<u64> = if all_clean {
+        l_check.clone()
+    } else {
+        lineitem
+            .iter()
+            .zip(l_check.iter())
+            .map(|(l, &b)| (b == 1 && cln_o_orderkeys.contains(&l[0])) as u64)
+            .collect()
+    };
+
+    // ---------------- the aggregation witness ----------------
+    // the masked key column, then its sorted view
+    let l_key_sel_u64: Vec<u64> = (0..n_l)
+        .map(|i| {
+            if cln_l[i] == 1 {
+                lineitem[i][0]
+            } else {
+                PAD_OK
+            }
+        })
+        .collect();
+
+    let mut l_sorted_u64: Vec<[u64; 3]> = (0..n_l)
+        .map(|i| [l_key_sel_u64[i], lineitem[i][1], lineitem[i][2]])
+        .collect();
+    l_sorted_u64.sort_by_key(|r| r[0]);
+
+    // orderkey -> (orderdate, shippriority), over the selected orders only,
+    // which is what the attach lookup's table side holds
+    let mut o_map: HashMap<u64, (u64, u64)> = HashMap::new();
+    for (o, &f) in orders.iter().zip(cln_o.iter()) {
+        if f == 1 {
+            o_map.insert(o[3], (o[0], o[1]));
+        }
+    }
+
+    let mut line_rev_u64: Vec<u64> = vec![0; n_l];
+    let mut run_sum_u64: Vec<u64> = vec![0; n_l];
+    let mut is_last_u64: Vec<u64> = vec![0; n_l];
+    let mut res_pad_u64: Vec<[u64; 4]> = vec![[PAD_OK, PAD_DATE, PAD_SHIP, PAD_REV]; n_l];
+
+    let mut acc: u128 = 0;
+    let mut prev_ok: Option<u64> = None;
+
+    for i in 0..n_l {
+        let ok = l_sorted_u64[i][0];
+        let ext = l_sorted_u64[i][1] as u128;
+        let disc = l_sorted_u64[i][2] as u128;
+        let lr = ext * ((SCALE as u128) - disc); // (scaled) revenue contribution
+        line_rev_u64[i] = lr as u64;
+
+        if prev_ok == Some(ok) {
+            acc += lr;
+        } else {
+            acc = lr;
+        }
+        run_sum_u64[i] = acc as u64;
+
+        // one past the last row sits the pinned sentinel, whose key is PAD_OK,
+        // so a trailing run of deselected rows never ends a group and the last
+        // real key always does
+        let next_ok = if i + 1 < n_l {
+            l_sorted_u64[i + 1][0]
+        } else {
+            PAD_OK
+        };
+        let is_last = next_ok != ok;
+        is_last_u64[i] = is_last as u64;
+
+        if is_last {
+            let (od, sp) = o_map.get(&ok).copied().unwrap_or((0, 0));
+            res_pad_u64[i] = [ok, od, sp, run_sum_u64[i]];
+        }
+        prev_ok = Some(ok);
+    }
+
+    // res_sorted: the emitted groups by (rev desc, odate asc), padded
+    let mut groups: Vec<[u64; 4]> = res_pad_u64
+        .iter()
+        .copied()
+        .filter(|r| r[0] != PAD_OK)
+        .collect();
+    groups.sort_by(|a, b| b[3].cmp(&a[3]).then(a[1].cmp(&b[1])));
+
+    let mut res_sorted_u64: Vec<[u64; 4]> = Vec::with_capacity(n_l);
+    res_sorted_u64.extend(groups.into_iter());
+    while res_sorted_u64.len() < n_l {
+        res_sorted_u64.push([PAD_OK, PAD_DATE, PAD_SHIP, PAD_REV]);
+    }
+
+    Witness {
+        n_c,
+        n_o,
+        n_l,
+        c_check,
+        o_check,
+        l_check,
+        cln_c,
+        cln_o,
+        cln_l,
+        l_key_sel_u64,
+        l_sorted_u64,
+        line_rev_u64,
+        run_sum_u64,
+        is_last_u64,
+        res_pad_u64,
+        res_sorted_u64,
+        all_clean,
+        tamper,
+    }
+}
+
 impl<F: Field + Ord> TestChip<F> {
     pub fn construct(config: TestCircuitConfig<F>) -> Self {
         Self { config }
-    }
-
-    // ---------- small assignment helpers ----------
-    fn assign_table_u64(
-        region: &mut Region<'_, F>,
-        tag: &'static str,
-        cols: &[Column<Advice>],
-        rows: &[Vec<u64>],
-    ) -> Result<Vec<Vec<AssignedCell<F, F>>>, Error> {
-        let mut out: Vec<Vec<AssignedCell<F, F>>> = Vec::with_capacity(rows.len());
-        for (i, r) in rows.iter().enumerate() {
-            let mut row_cells = Vec::with_capacity(cols.len());
-            for (j, &v) in r.iter().enumerate() {
-                let cell = region.assign_advice(|| tag, cols[j], i, || Value::known(F::from(v)))?;
-                row_cells.push(cell);
-            }
-            out.push(row_cells);
-        }
-        Ok(out)
-    }
-
-    fn assign_table_f(
-        region: &mut Region<'_, F>,
-        tag: &'static str,
-        cols: &[Column<Advice>],
-        rows: &[Vec<F>],
-    ) -> Result<(), Error> {
-        for (i, r) in rows.iter().enumerate() {
-            for (j, &v) in r.iter().enumerate() {
-                region.assign_advice(|| tag, cols[j], i, || Value::known(v))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn assign_part_pad_and_link(
-        region: &mut Region<'_, F>,
-        tag: &'static str,
-        part_cols: &[Column<Advice>],
-        part_rows: &[Vec<F>],                   // total rows
-        join_cells: &[Vec<AssignedCell<F, F>>], // join_len x width
-        dis_cells: &[Vec<AssignedCell<F, F>>],  // dis_len x width
-    ) -> Result<(), Error> {
-        let join_len = join_cells.len();
-        let dis_len = dis_cells.len();
-
-        for (i, r) in part_rows.iter().enumerate() {
-            for (j, &v) in r.iter().enumerate() {
-                let part_cell =
-                    region.assign_advice(|| tag, part_cols[j], i, || Value::known(v))?;
-
-                // **THIS is the missing “query o_join/o_disjoin” part**
-                // tie o_part_pad[i] == o_join[i] or o_disjoin[i-join_len] via equality constraints
-                //
-                // The last column of part_rows is the clean indicator, which has
-                // no counterpart in the join/disjoin tables: it is pinned by
-                // q_cln_flag / q_res_flag instead, so it is skipped here.
-                if i < join_len {
-                    if j < join_cells[i].len() {
-                        region.constrain_equal(part_cell.cell(), join_cells[i][j].cell())?;
-                    }
-                } else if i < join_len + dis_len {
-                    if j < dis_cells[i - join_len].len() {
-                        region
-                            .constrain_equal(part_cell.cell(), dis_cells[i - join_len][j].cell())?;
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn configure(meta: &mut ConstraintSystem<F>) -> TestCircuitConfig<F> {
@@ -227,63 +379,26 @@ impl<F: Field + Ord> TestChip<F> {
         let instance_test = meta.advice_column();
         meta.enable_equality(instance_test);
 
-        let mut q_enable = vec![];
-        for _ in 0..4 {
-            q_enable.push(meta.selector());
-        }
-
-        // Dead, inherited from the pre-One-Pass version of this file: q_enable[3],
-        // the nine `q_sort` selectors, the eight `q_join` selectors and check[3]
-        // are allocated and never referenced again. They cost vk space and they
-        // mislead a reader trying to see from `configure` which conditions are
-        // wired, but they constrain nothing, so removing them is a cost change
-        // rather than a soundness fix and is left out of this pass.
-        let mut q_sort = vec![];
-        for _ in 0..9 {
-            q_sort.push(meta.selector());
-        }
-
-        let mut q_join = vec![];
-        for i in 0..8 {
-            if i < 2 {
-                q_join.push(meta.selector());
-            } else {
-                q_join.push(meta.complex_selector());
-            }
-        }
-
-        let q_accu = meta.selector();
+        // A lookup argument may not read a simple selector, so every relation
+        // carries a second, complex selector over exactly the same rows. Both
+        // are fixed data determined by |R_i| alone.
+        let q_enable = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
+        let q_row = (0..3).map(|_| meta.complex_selector()).collect::<Vec<_>>();
 
         let customer = vec![meta.advice_column(), meta.advice_column()];
         let orders = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let lineitem = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
 
-        let mut condition = vec![];
-        for _ in 0..3 {
-            condition.push(meta.advice_column());
-        }
-        meta.enable_equality(condition[2]);
-
-        let mut check = vec![];
-        for _ in 0..4 {
-            check.push(meta.advice_column());
-        }
+        let condition = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let check = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
 
         // -------- the query parameters are one choice per proof, not per row --------
-        // condition[0..2] are advice columns read as the right-hand side of the
-        // three predicate chips, one row per base tuple. Nothing tied them to
-        // each other or across rows, so a prover could lower `condition[1]` on
-        // one orders row to flip `check[1]` and raise it on another, keeping
-        // every section size and both channels of (10) intact while certifying
-        // the answer to no single query. Forcing each column constant turns the
-        // per-row choice into one per-proof choice, and the extra gate at row 0
-        // records that `o_orderdate < :2` and `:2 < l_shipdate` read the SAME
-        // parameter, which the two columns previously only agreed on by the
-        // honest assigner's convention.
-        //
-        // Binding that per-proof choice to a public value needs a cell in the
-        // instance column, i.e. a change to the instance vector every caller
-        // builds; that part is outside this file.
+        // Inherited from `q3_obj.rs`: the three condition columns are read as
+        // the right-hand side of the predicate chips, one row per base tuple,
+        // so without these gates a prover could lower the date on one orders
+        // row and raise it on another and certify the answer to no single
+        // query. Binding the per-proof choice to a public value still needs a
+        // cell in the instance column, which is outside this file.
         let q_cond_const = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
         for j in 0..3 {
             let q = q_cond_const[j];
@@ -308,53 +423,8 @@ impl<F: Field + Ord> TestChip<F> {
             });
         }
 
-        // clean indicator per base row of customer / orders / lineitem
-        let cflag = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        for &c in cflag.iter() {
-            meta.enable_equality(c);
-        }
-
-        // -------- the clean indicator is a bit --------
-        // The clean channel of condition (10) reads `keep * cflag` (through
-        // c_filt_pad[2], l_filt_pad[4] and o_filt_pad[4]), and `keep` is
-        // booleanized by the link gates below while `cflag` was raw advice. A
-        // base row carrying cflag = 7 would multiply its clean multiplicity by
-        // 7 and let the root equality absorb a real deficit on the clean side.
-        // cflag[i] is read on exactly the rows q_enable[i] covers, which is the
-        // whole base relation, so one gate per relation pins it everywhere it
-        // is read.
-        for (idx, &c) in cflag.iter().enumerate() {
-            let q = q_enable[idx]; // 0: customer, 1: orders, 2: lineitem
-            meta.create_gate("clean indicator is boolean", move |m| {
-                let q = m.query_selector(q);
-                let f = m.query_advice(c, Rotation::cur());
-                vec![q * f.clone() * (Expression::Constant(F::ONE) - f)]
-            });
-        }
-
-        let c_join = vec![meta.advice_column(), meta.advice_column()];
-        let c_disjoin = vec![meta.advice_column(), meta.advice_column()];
-
-        let o_join = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let o_disjoin = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-
-        let l_join = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let l_disjoin = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-
-        // enable equality on join/disjoin columns (needed for constrain_equal with *_part_pad)
-        for &col in o_join
-            .iter()
-            .chain(o_disjoin.iter())
-            .chain(c_join.iter())
-            .chain(c_disjoin.iter())
-            .chain(l_join.iter())
-            .chain(l_disjoin.iter())
-        {
-            meta.enable_equality(col);
-        }
-
-        // ---------------- predicate chips ----------------
-        // IsZero for c_mktsegment == :1  => check[0] in {0,1}
+        // ---------------- predicate chips: the bit b of each relation ----------------
+        // IsZero for c_mktsegment == :1  => check[0]
         let is_zero_aux = meta.advice_column();
         let mut equal_condition = vec![];
         let iz = IsZeroChip::configure(
@@ -414,236 +484,139 @@ impl<F: Field + Ord> TestChip<F> {
         });
         lt_compare_condition.push(lt_l);
 
-        // ---------------- permutation configs (orders/customer/lineitem) ----------------
-        fn mk_perm<FF: PrimeField>(
-            meta: &mut ConstraintSystem<FF>,
-            width: usize,
-        ) -> (Vec<Column<Advice>>, Vec<Column<Advice>>, PermAnyConfig) {
-            let q1 = meta.complex_selector();
-            let q2 = meta.complex_selector();
-            let mut a = vec![];
-            let mut b = vec![];
-            for _ in 0..width {
-                a.push(meta.advice_column());
-                b.push(meta.advice_column());
-            }
-            let perm = PermAnyChip::configure(meta, q1, q2, a.clone(), b.clone());
-            (a, b, perm)
-        }
-
-        // One column wider than in q3_obj.rs: the last column of each pair
-        // carries the clean indicator, so the Conservation Check binds it.
-        let (o_filt_pad, o_part_pad, perm_orders) = mk_perm::<F>(meta, 5);
-        let (c_filt_pad, c_part_pad, perm_customer) = mk_perm::<F>(meta, 3);
-        let (l_filt_pad, l_part_pad, perm_lineitem) = mk_perm::<F>(meta, 5);
-
-        // -------- link gates: filt_pad must equal (keep? base : PAD) --------
-        // NOTE: this is what makes the permutation check talk about *real filtered rows*
-        // The indicator column pads with 0, so a row dropped by the predicate
-        // carries indicator 0 and contributes to neither channel of the
-        // Cardinality Preservation Check.
-        let pad_o: [u64; 5] = [MAX_SENTINEL, 0, MAX_SENTINEL, MAX_SENTINEL, 0];
-        let pad_c: [u64; 3] = [MAX_SENTINEL, MAX_SENTINEL, 0];
-        let pad_l: [u64; 5] = [MAX_SENTINEL, MAX_SENTINEL, MAX_SENTINEL, MAX_SENTINEL, 0];
-
-        let mut link_filt_pad = |name: &'static str,
-                                 q: Selector,
-                                 keep_col: Column<Advice>,
-                                 base: Vec<Column<Advice>>,
-                                 filt: Vec<Column<Advice>>,
-                                 pads: Vec<u64>| {
-            meta.create_gate(name, move |m| {
+        // ================= (1) Selector Check =================
+        // One bit column per relation over the committed rows, and one gate per
+        // relation that makes it a bit and confines it to the rows their
+        // predicate keeps. That second half is what the earlier version got
+        // structurally, by writing the selector into a column group that was
+        // padded away wherever the predicate failed; here it is a constraint,
+        // and it is the constraint the correctness argument needs to define
+        // the input-side join over the filtered relations.
+        let cflag = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        for (idx, &c) in cflag.iter().enumerate() {
+            let q = q_enable[idx];
+            let b = check[idx];
+            meta.create_gate("selector is a bit and implies its predicate", move |m| {
                 let q = m.query_selector(q);
-                let keep = m.query_advice(keep_col, Rotation::cur());
+                let c = m.query_advice(c, Rotation::cur());
+                let b = m.query_advice(b, Rotation::cur());
                 let one = Expression::Constant(F::ONE);
-                let drop = one.clone() - keep.clone();
-
-                let mut cs = vec![q.clone() * keep.clone() * (one.clone() - keep.clone())]; // keep boolean
-
-                for j in 0..base.len() {
-                    let b = m.query_advice(base[j], Rotation::cur());
-                    let f = m.query_advice(filt[j], Rotation::cur());
-                    let p = Expression::Constant(F::from(pads[j]));
-                    cs.push(q.clone() * (f - (keep.clone() * b + drop.clone() * p)));
-                }
-                cs
-            });
-        };
-
-        let mut o_base = orders.clone();
-        o_base.push(cflag[1]);
-        let mut c_base = customer.clone();
-        c_base.push(cflag[0]);
-        let mut l_base = lineitem.clone();
-        l_base.push(cflag[2]);
-
-        link_filt_pad(
-            "link o_filt_pad = (check1? orders : PAD)",
-            perm_orders.q_perm1,
-            check[1],
-            o_base,
-            o_filt_pad.clone(),
-            pad_o.to_vec(),
-        );
-        link_filt_pad(
-            "link c_filt_pad = (check0? customer : PAD)",
-            perm_customer.q_perm1,
-            check[0],
-            c_base,
-            c_filt_pad.clone(),
-            pad_c.to_vec(),
-        );
-        link_filt_pad(
-            "link l_filt_pad = (check2? lineitem : PAD)",
-            perm_lineitem.q_perm1,
-            check[2],
-            l_base,
-            l_filt_pad.clone(),
-            pad_l.to_vec(),
-        );
-
-        // -------- partition side of the indicator: 1 on R^c rows, 0 on R^r --------
-        // The partition column group is laid out as [clean rows | residual rows
-        // | pad rows], so one selector per section pins the indicator. Without
-        // these the prover could mark a residual row clean and inflate the
-        // clean channel of the check below.
-        let q_cln_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-        // ... and the rows past both sections are the canonical PAD tuple.
-        // Without this the tail of *_part_pad is free advice that the
-        // Conservation shuffle still reads, so the shuffle proved only
-        //   multiset(filtered rows) == R^c U R^r U (whatever the tail holds),
-        // and a prover could park real filtered rows there, flag column
-        // included. That both breaks the claim this module makes above (the
-        // shuffle forces the indicator to mark exactly the occurrences of R^c)
-        // and hands the clean channel of (10) an unconstrained flag cell. With
-        // the three selectors covering [clean | residual | pad] every row of the
-        // partition side is now pinned or copy-constrained.
-        let q_pad_part = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-
-        for (idx, (part, pads)) in [
-            (c_part_pad.clone(), pad_c.to_vec()),
-            (o_part_pad.clone(), pad_o.to_vec()),
-            (l_part_pad.clone(), pad_l.to_vec()),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let flag_col = *part.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
-            });
-
-            let q_p = q_pad_part[idx];
-            let cols = part.clone();
-            let pads = pads.clone();
-            meta.create_gate("partition pad rows are the PAD tuple", move |m| {
-                let q = m.query_selector(q_p);
-                cols.iter()
-                    .zip(pads.iter())
-                    .map(|(&c, &p)| {
-                        q.clone()
-                            * (m.query_advice(c, Rotation::cur())
-                                - Expression::Constant(F::from(p)))
-                    })
-                    .collect::<Vec<_>>()
+                vec![
+                    q.clone() * c.clone() * (one.clone() - c.clone()),
+                    q * c * (one - b),
+                ]
             });
         }
 
-        // -------- membership lookup selectors/cols --------
-        let q_in_o_cust_in_c = meta.complex_selector();
-        let q_in_c_cust_in_o = meta.complex_selector();
-        let q_in_l_okey_in_o = meta.complex_selector();
-        let q_in_o_okey_in_l = meta.complex_selector();
+        // ================= (1) Conservation Check =================
+        // One permutation argument per relation, between the indexed relation
+        // R^_i and the concatenation of the two parts. The indices are distinct,
+        // so R^_i is a set even though the relation is a bag, and that single
+        // permutation already rules out an occurrence being fabricated, lost,
+        // duplicated or counted on both sides: no Non-Membership Check is
+        // needed, which is where this gate saves against a value-level split.
+        //
+        // The split covers every committed row, so the two parts fill |R_i|
+        // exactly and there is no pad section.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons: Vec<ConserveConfig> = vec![
+            configure_conserve::<F>(meta, &row_idx, &customer, cflag[0]),
+            configure_conserve::<F>(meta, &row_idx, &orders, cflag[1]),
+            configure_conserve::<F>(meta, &row_idx, &lineitem, cflag[2]),
+        ];
 
-        // -------- condition (3), Pairwise Consistency --------
+        // ================= (2) Pairwise Consistency Check =================
         // Two mutual Membership Checks per tree edge, each looking one clean
-        // relation's key column up directly in the adjacent clean relation's key
-        // column. q3_obj.rs routed these through intermediate `tbl_*` advice
-        // columns holding the deduplicated key sets, but nothing bound those
-        // columns to the relations they claimed to enumerate: a prover could put
-        // o_join's custkeys into the table o_join looks into and c_join's into
-        // the table c_join looks into, and all four lookups would pass for an
-        // arbitrary partition. Looking the columns up in each other removes the
-        // free advice, and with it the escape, at one fewer column per edge
-        // direction.
+        // key column up directly in the adjacent clean key column, with no
+        // intermediate table to bind. Both sides read
         //
-        // A lookup input is 0 on every row where its selector is off, and the
-        // table side is 0 on those rows too, so 0 is always in the table and the
-        // gated-off rows cost nothing. Real custkeys and orderkeys are at least
-        // 1 in TPC-H, so the containment is over the real keys.
+        //     q_row * c(t) * (t[K] + 1),
         //
-        // Standing assumption, not a proved statement: nothing in this circuit
-        // range-checks or nonzero-checks l_join[0], c_join[1], o_join[2] or
-        // o_join[3], so "key 0 is not a real key" is inherited from the dataset
-        // rather than enforced. The same holds of the (0, 0, 0) row of the
-        // attach lookup below. Closing it properly means binding the base
-        // relations to a public commitment, which this harness does not do: the
-        // only instance cell is the constant 1, so every check here is an
-        // internal-consistency check over prover-committed inputs.
+        // so a deselected row and a row past the relation both read 0, 0 is in
+        // every table, and the containment is over the selected keys only. The
+        // shift by one is what stops a real key of 0 from colliding with that
+        // gated-off 0, which would let a selected row satisfy its membership
+        // against nothing. It costs one addition per row.
+        //
+        // Standing assumption, unchanged from `q3_obj.rs`: nothing here binds
+        // the base relations to a public commitment, the only instance cell
+        // being the constant 1, so every check is an internal-consistency
+        // check over prover-committed inputs.
         let mut pw_edge = |name: &'static str,
                            q_in: Selector,
-                           in_col: Column<Advice>,
-                           q_t: Selector,
-                           tbl_col: Column<Advice>| {
+                           c_in: Column<Advice>,
+                           k_in: Column<Advice>,
+                           q_tb: Selector,
+                           c_tb: Column<Advice>,
+                           k_tb: Column<Advice>| {
             meta.lookup_any(name, move |m| {
-                let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
-                let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                let one = Expression::Constant(F::ONE);
+                let lhs = m.query_selector(q_in)
+                    * m.query_advice(c_in, Rotation::cur())
+                    * (m.query_advice(k_in, Rotation::cur()) + one.clone());
+                let rhs = m.query_selector(q_tb)
+                    * m.query_advice(c_tb, Rotation::cur())
+                    * (m.query_advice(k_tb, Rotation::cur()) + one);
                 vec![(lhs, rhs)]
             });
         };
 
         // edge (orders, customer) on custkey
         pw_edge(
-            "pw: o_join.custkey in c_join.custkey",
-            q_in_o_cust_in_c,
-            o_join[2],
-            q_in_c_cust_in_o,
-            c_join[1],
+            "pw: orders.custkey in customer.custkey",
+            q_row[1],
+            cflag[1],
+            orders[2],
+            q_row[0],
+            cflag[0],
+            customer[1],
         );
         pw_edge(
-            "pw: c_join.custkey in o_join.custkey",
-            q_in_c_cust_in_o,
-            c_join[1],
-            q_in_o_cust_in_c,
-            o_join[2],
+            "pw: customer.custkey in orders.custkey",
+            q_row[0],
+            cflag[0],
+            customer[1],
+            q_row[1],
+            cflag[1],
+            orders[2],
         );
 
         // edge (orders, lineitem) on orderkey
         pw_edge(
-            "pw: l_join.orderkey in o_join.orderkey",
-            q_in_l_okey_in_o,
-            l_join[0],
-            q_in_o_okey_in_l,
-            o_join[3],
+            "pw: lineitem.orderkey in orders.orderkey",
+            q_row[2],
+            cflag[2],
+            lineitem[0],
+            q_row[1],
+            cflag[1],
+            orders[3],
         );
         pw_edge(
-            "pw: o_join.orderkey in l_join.orderkey",
-            q_in_o_okey_in_l,
-            o_join[3],
-            q_in_l_okey_in_o,
-            l_join[0],
+            "pw: orders.orderkey in lineitem.orderkey",
+            q_row[1],
+            cflag[1],
+            orders[3],
+            q_row[2],
+            cflag[2],
+            lineitem[0],
         );
 
-        // ---------------- Cardinality Preservation Check (condition (4)) ----------------
+        // ================= (3) Cardinality Preservation Check =================
         // One fixed column serves every Lt chip of the check, so the whole
         // check costs a single u8 range table.
         let cp_u8 = meta.fixed_column();
 
         // Children of the root. Both are leaves, so their two multiplicity
         // columns are columns the circuit already has: the predicate bit is the
-        // input channel and the bound indicator (keep * c) is the clean one.
+        // input channel, mu^all = b, and the selector bit is the clean one,
+        // mu^cln = c. The two agree wherever the row is deselected or fails its
+        // predicate, which is the whole content of the leaf base case.
         let cp_agg_c = configure_cp_agg::<F, NUM_BYTES>(
             meta,
             cp_u8,
             customer[1], // c_custkey
             check[0],
-            c_filt_pad[2],
+            cflag[0],
             MAX_SENTINEL,
         );
         let cp_agg_l = configure_cp_agg::<F, NUM_BYTES>(
@@ -651,7 +624,7 @@ impl<F: Field + Ord> TestChip<F> {
             cp_u8,
             lineitem[0], // l_orderkey
             check[2],
-            l_filt_pad[4],
+            cflag[2],
             MAX_SENTINEL,
         );
 
@@ -671,7 +644,7 @@ impl<F: Field + Ord> TestChip<F> {
             let s_all_l = cp_join_l.s_all;
             let s_cln_l = cp_join_l.s_cln;
             let pred_o = check[1];
-            let cln_o = o_filt_pad[4];
+            let cln_o = cflag[1];
             let mu_all = cp_root.mu_all;
             let mu_cln = cp_root.mu_cln;
             meta.create_gate("cp: root multiplicities over orders", move |m| {
@@ -688,35 +661,55 @@ impl<F: Field + Ord> TestChip<F> {
             });
         }
 
-        // Aggregate
+        // ================= aggregation over the clean instance =================
+        // The operators read the clean instance off the committed rows. The
+        // group-by needs each clean orderkey to occupy one contiguous run of a
+        // sorted view, and the deselected rows must not open runs of their own,
+        // so the sorted view is over the selector-masked key: a deselected row
+        // carries PAD_OK, joins the trailing PAD run and is never a group end,
+        // hence emits nothing. Its extendedprice needs no masking, since its
+        // contribution lands only in the PAD run's running sum, which is never
+        // emitted.
+        let l_key_sel = meta.advice_column();
+        {
+            let q_l = q_enable[2];
+            let c = cflag[2];
+            let k = lineitem[0];
+            meta.create_gate("masked lineitem key: c ? l_orderkey : PAD", move |m| {
+                let q = m.query_selector(q_l);
+                let c = m.query_advice(c, Rotation::cur());
+                let k = m.query_advice(k, Rotation::cur());
+                let ks = m.query_advice(l_key_sel, Rotation::cur());
+                let one = Expression::Constant(F::ONE);
+                let pad = Expression::Constant(F::from(PAD_OK));
+                vec![q * (ks - (c.clone() * k + (one - c) * pad))]
+            });
+        }
+
         let q_line = meta.selector();
         let q_first = meta.selector();
         let q_accu = meta.selector();
-
         let q_res_lookup = meta.complex_selector();
-        let q_tbl_o_join = meta.complex_selector();
-
         let q_sort_res = meta.selector();
 
-        // l_sorted (4 cols)
-        let l_sorted = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        // the sorted view carries only what the group-by reads
+        let l_sorted = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
 
-        // line helpers
         let line_rev = meta.advice_column();
         let run_sum = meta.advice_column();
+        let is_last = meta.advice_column();
 
-        // emitted padded result + sorted result (each 4 cols)
         let res_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let res_sorted = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
 
-        // perm: l_join <-> l_sorted
+        // perm: (masked key, extendedprice, discount) <-> l_sorted
         let q_perm_l_in = meta.complex_selector();
         let q_perm_l_out = meta.complex_selector();
         let perm_lsort = PermAnyChip::configure(
             meta,
             q_perm_l_in,
             q_perm_l_out,
-            l_join.clone(),
+            vec![l_key_sel, lineitem[1], lineitem[2]],
             l_sorted.clone(),
         );
 
@@ -731,7 +724,6 @@ impl<F: Field + Ord> TestChip<F> {
             res_sorted.clone(),
         );
 
-        // Configure IsZero helpers (same_prev / same_next / eqs)
         let aux_same_prev = meta.advice_column();
         let aux_same_next = meta.advice_column();
         let aux_rev_eq = meta.advice_column();
@@ -757,18 +749,27 @@ impl<F: Field + Ord> TestChip<F> {
             aux_same_next,
         );
 
-        // ---- l_sorted is really sorted on l_orderkey ----
-        // perm_lsort only proves l_sorted is a multiset permutation of l_join, it
-        // says nothing about the order of the rows. The group-by below detects
-        // group boundaries with iz_same_prev / iz_same_next on l_sorted[0], so
-        // without an ordering constraint a prover could place one orderkey in two
-        // non-adjacent runs and emit one res_pad row per run, each carrying only a
-        // partial revenue sum (the res_pad -> o_join lookup only checks membership
-        // of (okey, odate, shippri) and the ORDER BY gate only checks ordering, so
-        // neither notices). Force l_sorted[0] nondecreasing, which makes every
-        // orderkey occupy exactly one contiguous run. The Lt chip shares the u8
-        // range column of the Cardinality Preservation Check, so it costs no extra
-        // fixed column and no extra load region.
+        // The group-end indicator, materialized. `iz_same_next.expr()` is a
+        // degree-2 expression, and a lookup costs `2 + input_degree +
+        // table_degree`: with the attach lookup's table side now gated by the
+        // selector as well as by its row selector, reading the indicator as an
+        // expression on the input side would push that lookup to degree 9 and
+        // double every extended-domain FFT of the prover. One advice column and
+        // one degree-3 gate keep the whole circuit at the degree 8 that
+        // `q3_obj.rs` already carries.
+        meta.create_gate("is_last = 1 - same_next", |m| {
+            let q = m.query_selector(q_line);
+            let one = Expression::Constant(F::ONE);
+            vec![q * (m.query_advice(is_last, Rotation::cur()) - (one - iz_same_next.expr()))]
+        });
+
+        // ---- l_sorted is really sorted on the masked orderkey ----
+        // The shuffle only proves l_sorted is a permutation of the masked
+        // column; without an ordering constraint a prover could place one
+        // orderkey in two non-adjacent runs and emit one res_pad row per run,
+        // each carrying a partial revenue. Force nondecreasing, which makes
+        // every key occupy exactly one contiguous run. The Lt chip shares the
+        // u8 range column of the Cardinality Preservation Check.
         let q_lsort = meta.selector();
         let aux_lsort_eq = meta.advice_column();
         let iz_lsort_eq = IsZeroChip::configure(
@@ -794,19 +795,12 @@ impl<F: Field + Ord> TestChip<F> {
         });
 
         // The group-boundary detector on the last real row reads l_sorted[0] at
-        // row n, and neither the shuffle (its selectors stop at n-1) nor the
-        // nondecreasing gate (it compares 0..n-2 only) touches that cell. Left
-        // free, a prover sets it equal to the last real orderkey; `iz_same_next`
-        // then reports "same group" on row n-1, the emit gate writes PAD instead
-        // of that group and the o_join attach lookup is gated off, so the group
-        // with the largest clean orderkey simply vanishes from the answer with
-        // every other constraint, (7), (9) and (10) included, still satisfied.
-        //
-        // Pin the VALUE, exactly as `cp: sorted view sentinel is PAD` does in
-        // card_preserve.rs, rather than asking the last comparison to increase
-        // strictly: PAD_OK is above every real orderkey, so the last real row is
-        // always recognised as a group end, and one degree-1 gate under its own
-        // selector costs no column and no lookup.
+        // row n, which neither the shuffle nor the nondecreasing gate touches.
+        // Left free, a prover sets it equal to the last key; iz_same_next then
+        // reports "same group" on row n-1, the emit gate writes PAD instead of
+        // that group, and the group with the largest clean orderkey vanishes
+        // from the answer with every other constraint still satisfied. Pin the
+        // value, as `cp: sorted view sentinel is PAD` does in card_preserve.rs.
         let q_lsort_sentinel = meta.selector();
         {
             let key = l_sorted[0];
@@ -840,7 +834,6 @@ impl<F: Field + Ord> TestChip<F> {
             aux_date_eq,
         );
 
-        // Configure revenue/date LT chips for ORDER BY gate
         let lt_rev_next_cur = LtChip::<F, NUM_BYTES>::configure(
             meta,
             |m| m.query_selector(q_sort_res),
@@ -855,7 +848,6 @@ impl<F: Field + Ord> TestChip<F> {
             |m| m.query_advice(res_sorted[1], Rotation::next()), // date_next
         );
 
-        // Gates: line_rev, run_sum, emit padded group row
         // line_rev = ext * (SCALE - disc)
         meta.create_gate("line_rev", |m| {
             let q = m.query_selector(q_line);
@@ -884,12 +876,11 @@ impl<F: Field + Ord> TestChip<F> {
             vec![q * (rs_cur - (same * rs_prev + lr))]
         });
 
-        // emit group row only at last row of each orderkey group
+        // emit group row only at the last row of each orderkey group
         meta.create_gate("emit_res_pad", |m| {
             let q = m.query_selector(q_line);
             let one = Expression::Constant(F::ONE);
-            let same_next = iz_same_next.expr();
-            let is_last = one.clone() - same_next; // 1 if next != cur
+            let is_last = m.query_advice(is_last, Rotation::cur()); // 1 if next != cur
             let not_last = one.clone() - is_last.clone();
 
             let cur_okey = m.query_advice(l_sorted[0], Rotation::cur());
@@ -914,35 +905,43 @@ impl<F: Field + Ord> TestChip<F> {
                 q * not_last * (out_ship - pad_ship),
             ]
         });
-        // Lookup: (orderkey, orderdate, shippriority) must exist in o_join
-        meta.lookup_any("attach o_join attrs to res_pad", |m| {
-            let q_in = m.query_selector(q_res_lookup);
-            let q_tbl = m.query_selector(q_tbl_o_join);
 
-            let one = Expression::Constant(F::ONE);
-            let is_last = one - iz_same_next.expr(); // reuse same_next on l_sorted rows
+        // Lookup: (orderkey, orderdate, shippriority) must name a SELECTED row
+        // of orders. The table side spans the whole relation and is gated by
+        // the selector, so a deselected orders row contributes (0, 0, 0), which
+        // is what a gated-off input row reads; the shift by one keeps that
+        // dummy tuple away from any real one.
+        {
+            let cln_o = cflag[1];
+            let ok_col = orders[3];
+            let od_col = orders[0];
+            let sp_col = orders[1];
+            let q_tbl = q_row[1];
+            let rp = res_pad.clone();
+            meta.lookup_any("attach orders attrs to res_pad", move |m| {
+                let q_in = m.query_selector(q_res_lookup);
+                let one = Expression::Constant(F::ONE);
+                // the group-end indicator, on the same l_sorted rows
+                let gate = q_in * m.query_advice(is_last, Rotation::cur());
 
-            let gate = q_in * is_last;
+                let tbl = m.query_selector(q_tbl) * m.query_advice(cln_o, Rotation::cur());
 
-            let ok = m.query_advice(res_pad[0], Rotation::cur());
-            let od = m.query_advice(res_pad[1], Rotation::cur());
-            let sp = m.query_advice(res_pad[2], Rotation::cur());
-
-            vec![
-                (
-                    gate.clone() * ok,
-                    q_tbl.clone() * m.query_advice(o_join[3], Rotation::cur()),
-                ),
-                (
-                    gate.clone() * od,
-                    q_tbl.clone() * m.query_advice(o_join[0], Rotation::cur()),
-                ),
-                (
-                    gate * sp,
-                    q_tbl * m.query_advice(o_join[1], Rotation::cur()),
-                ),
-            ]
-        });
+                vec![
+                    (
+                        gate.clone() * (m.query_advice(rp[0], Rotation::cur()) + one.clone()),
+                        tbl.clone() * (m.query_advice(ok_col, Rotation::cur()) + one.clone()),
+                    ),
+                    (
+                        gate.clone() * (m.query_advice(rp[1], Rotation::cur()) + one.clone()),
+                        tbl.clone() * (m.query_advice(od_col, Rotation::cur()) + one.clone()),
+                    ),
+                    (
+                        gate * (m.query_advice(rp[2], Rotation::cur()) + one.clone()),
+                        tbl * (m.query_advice(sp_col, Rotation::cur()) + one),
+                    ),
+                ]
+            });
+        }
 
         // ORDER BY gate on res_sorted
         meta.create_gate("ORDER BY revenue DESC, o_orderdate ASC", |m| {
@@ -960,7 +959,7 @@ impl<F: Field + Ord> TestChip<F> {
 
         TestCircuitConfig {
             q_enable,
-            q_accu,
+            q_row,
 
             customer,
             orders,
@@ -970,14 +969,10 @@ impl<F: Field + Ord> TestChip<F> {
             condition,
             q_cond_const,
             q_cond_link,
-            cflag,
 
-            o_join,
-            o_disjoin,
-            c_join,
-            c_disjoin,
-            l_join,
-            l_disjoin,
+            row_idx,
+            cons,
+            cflag,
 
             lt_compare_condition,
             equal_condition,
@@ -991,45 +986,30 @@ impl<F: Field + Ord> TestChip<F> {
             cp_join_l,
             cp_root,
             q_cp_mu,
-            q_cln_flag,
-            q_res_flag,
-            q_pad_part,
 
-            o_filt_pad,
-            o_part_pad,
-            perm_orders,
+            l_key_sel,
 
-            c_filt_pad,
-            c_part_pad,
-            perm_customer,
-
-            l_filt_pad,
-            l_part_pad,
-            perm_lineitem,
-
-            q_in_o_cust_in_c,
-            q_in_c_cust_in_o,
-            q_in_l_okey_in_o,
-            q_in_o_okey_in_l,
-
+            l_sorted,
+            perm_lsort,
             q_line,
             q_first,
-            q_res_lookup,
-            q_sort_res,
-            l_sorted,
+            q_accu,
             line_rev,
             run_sum,
-            res_pad,
-            res_sorted,
-            perm_lsort,
-            perm_res,
-            iz_same_next,
             iz_same_prev,
+            iz_same_next,
+            is_last,
             q_lsort,
             q_lsort_sentinel,
             lt_lsort_cur_next,
             iz_lsort_eq,
-            q_tbl_o_join,
+
+            res_pad,
+            q_res_lookup,
+
+            res_sorted,
+            perm_res,
+            q_sort_res,
             lt_rev_next_cur,
             lt_date_cur_next,
             iz_rev_eq,
@@ -1054,13 +1034,13 @@ impl<F: Field + Ord> TestChip<F> {
         let lt_l_chip = LtChip::construct(self.config.lt_compare_condition[1].clone());
         lt_l_chip.load(layouter)?;
 
-        // Every Lt chip of the Cardinality Preservation Check shares one u8
-        // fixed column, so a single load covers the whole check.
+        // Every Lt chip of the Cardinality Preservation Check, and the sorted
+        // lineitem view with it, shares one u8 fixed column, so a single load
+        // covers them all.
         LtChip::<F, NUM_BYTES>::construct(self.config.cp_agg_c.lt_key_cur_next).load(layouter)?;
 
         let iz_same_prev_chip = IsZeroChip::construct(self.config.iz_same_prev.clone());
         let iz_same_next_chip = IsZeroChip::construct(self.config.iz_same_next.clone());
-        // shares cp_u8 with the Cardinality Preservation Check, already loaded above
         let iz_lsort_eq_chip = IsZeroChip::construct(self.config.iz_lsort_eq.clone());
         let lt_lsort_chip =
             LtChip::<F, NUM_BYTES>::construct(self.config.lt_lsort_cur_next.clone());
@@ -1072,335 +1052,34 @@ impl<F: Field + Ord> TestChip<F> {
         let lt_date_chip = LtChip::<F, NUM_BYTES>::construct(self.config.lt_date_cur_next.clone());
         lt_date_chip.load(layouter)?;
 
-        let _start = Instant::now();
-
-        // predicate flags
-        let mut c_check = vec![];
-        for i in 0..customer.len() {
-            c_check.push(if customer[i][0] == condition[0] {
-                1u64
-            } else {
-                0u64
-            });
-        }
-        let mut o_check = vec![];
-        for i in 0..orders.len() {
-            o_check.push(orders[i][0] < condition[1]);
-        }
-        let mut l_check = vec![];
-        for i in 0..lineitem.len() {
-            l_check.push(lineitem[i][3] > condition[1]);
-        }
-
-        // filtered tables
-        let c_combined: Vec<Vec<u64>> = customer
-            .iter()
-            .cloned()
-            .filter(|r| r[0] == condition[0])
-            .collect();
-        let o_combined: Vec<Vec<u64>> = orders
-            .iter()
-            .cloned()
-            .filter(|r| r[0] < condition[1])
-            .collect();
-        let l_combined: Vec<Vec<u64>> = lineitem
-            .iter()
-            .cloned()
-            .filter(|r| r[3] > condition[1])
-            .collect();
-
-        // sets from filtered tables
-        let c_keys: HashSet<u64> = c_combined.iter().map(|c| c[1]).collect();
-        let l_orderkeys: HashSet<u64> = l_combined.iter().map(|l| l[0]).collect();
-
-        // contributing vs noncontributing orders (on filtered orders)
-        let mut contributing_orders = vec![];
-        let mut noncontributing_orders = vec![];
-        for o in o_combined.iter() {
-            let ok = c_keys.contains(&o[2]) && l_orderkeys.contains(&o[3]);
-            if ok {
-                contributing_orders.push(o.clone());
-            } else {
-                noncontributing_orders.push(o.clone());
-            }
-        }
-
-        let contributing_o_custkeys: HashSet<u64> =
-            contributing_orders.iter().map(|o| o[2]).collect();
-        let contributing_o_orderkeys: HashSet<u64> =
-            contributing_orders.iter().map(|o| o[3]).collect();
-
-        // contributing vs noncontributing customers (on filtered customers)
-        let mut contributing_customers = vec![];
-        let mut noncontributing_customers = vec![];
-        for c in c_combined.iter() {
-            if contributing_o_custkeys.contains(&c[1]) {
-                contributing_customers.push(c.clone());
-            } else {
-                noncontributing_customers.push(c.clone());
-            }
-        }
-
-        // contributing vs noncontributing lineitems (on filtered lineitems)
-        let mut contributing_lineitems = vec![];
-        let mut noncontributing_lineitems = vec![];
-        for l in l_combined.iter() {
-            if contributing_o_orderkeys.contains(&l[0]) {
-                contributing_lineitems.push(l.clone());
-            } else {
-                noncontributing_lineitems.push(l.clone());
-            }
-        }
-
-        // test hook only: hide one joinable order and re-reduce around it
-        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
-        if tamper && !contributing_orders.is_empty() {
-            let hidden = contributing_orders.remove(0);
-            noncontributing_orders.push(hidden);
-
-            let ck: HashSet<u64> = contributing_orders.iter().map(|o| o[2]).collect();
-            let ok: HashSet<u64> = contributing_orders.iter().map(|o| o[3]).collect();
-
-            let (c_keep2, c_drop2): (Vec<_>, Vec<_>) = contributing_customers
-                .drain(..)
-                .partition(|c| ck.contains(&c[1]));
-            contributing_customers = c_keep2;
-            noncontributing_customers.extend(c_drop2);
-
-            let (l_keep2, l_drop2): (Vec<_>, Vec<_>) = contributing_lineitems
-                .drain(..)
-                .partition(|l| ok.contains(&l[0]));
-            contributing_lineitems = l_keep2;
-            noncontributing_lineitems.extend(l_drop2);
-        }
-
-        // test hook only: declare everything clean, i.e. no reduction at all
-        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
-        if all_clean {
-            contributing_orders = o_combined.clone();
-            contributing_customers = c_combined.clone();
-            contributing_lineitems = l_combined.clone();
-            noncontributing_orders.clear();
-            noncontributing_customers.clear();
-            noncontributing_lineitems.clear();
-        }
-
-        let contributing_o_custkeys: HashSet<u64> =
-            contributing_orders.iter().map(|o| o[2]).collect();
-        let contributing_o_orderkeys: HashSet<u64> =
-            contributing_orders.iter().map(|o| o[3]).collect();
-
-        let join_value = vec![
-            contributing_orders.clone(),    // orders
-            contributing_customers.clone(), // customer
-            contributing_lineitems.clone(), // lineitem
-        ];
-
-        let disjoin_value = vec![
-            noncontributing_orders.clone(),
-            noncontributing_customers.clone(),
-            noncontributing_lineitems.clone(),
-        ];
-
-        // ---------------- permutation padding helpers ----------------
-        fn pad_filter_u64(rows: &[Vec<u64>], keep: &[bool], pad: &[u64]) -> Vec<Vec<u64>> {
-            rows.iter()
-                .zip(keep.iter())
-                .map(|(r, &k)| if k { r.clone() } else { pad.to_vec() })
-                .collect()
-        }
-        fn pad_partition_u64(
-            join: &[Vec<u64>],
-            dis: &[Vec<u64>],
-            total: usize,
-            pad: &[u64],
-        ) -> Vec<Vec<u64>> {
-            let mut out: Vec<Vec<u64>> = Vec::with_capacity(total);
-            out.extend_from_slice(join);
-            out.extend_from_slice(dis);
-            while out.len() < total {
-                out.push(pad.to_vec());
-            }
-            out
-        }
-        fn to_field_rows<FF: Field + Ord>(u: &[Vec<u64>]) -> Vec<Vec<FF>> {
-            u.iter()
-                .map(|r| r.iter().map(|&x| FF::from(x)).collect())
-                .collect()
-        }
-
-        // PAD rows: one column wider than in q3_obj.rs, the clean indicator,
-        // which pads with 0 so a row dropped by the predicate is never clean
-        let pad_o: [u64; 5] = [MAX_SENTINEL, 0, MAX_SENTINEL, MAX_SENTINEL, 0];
-        let pad_c: [u64; 3] = [MAX_SENTINEL, MAX_SENTINEL, 0];
-        let pad_l: [u64; 5] = [MAX_SENTINEL, MAX_SENTINEL, MAX_SENTINEL, MAX_SENTINEL, 0];
-
-        let c_keep: Vec<bool> = c_check.iter().map(|&x| x == 1).collect();
-        let o_keep: Vec<bool> = o_check.clone();
-        let l_keep: Vec<bool> = l_check.clone();
-
-        // ---------------- clean indicator per base row ----------------
-        // A base row is clean iff it passes its predicate and its tuple went to
-        // the clean side above. The tests are the same ones that built
-        // join_value, so the indicator marks exactly the occurrences of R^c.
-        let hidden_orders: HashSet<(u64, u64)> = noncontributing_orders
-            .iter()
-            .map(|o| (o[2], o[3]))
-            .collect();
-        let cln_o: Vec<u64> = orders
-            .iter()
-            .zip(o_keep.iter())
-            .map(|(o, &k)| {
-                (k && (all_clean
-                    || (c_keys.contains(&o[2])
-                        && l_orderkeys.contains(&o[3])
-                        && !hidden_orders.contains(&(o[2], o[3]))))) as u64
-            })
-            .collect();
-        let cln_c: Vec<u64> = customer
-            .iter()
-            .zip(c_keep.iter())
-            .map(|(c, &k)| (k && (all_clean || contributing_o_custkeys.contains(&c[1]))) as u64)
-            .collect();
-        let cln_l: Vec<u64> = lineitem
-            .iter()
-            .zip(l_keep.iter())
-            .map(|(l, &k)| (k && (all_clean || contributing_o_orderkeys.contains(&l[0]))) as u64)
-            .collect();
-
-        // the indicator rides along as the last column of each base relation,
-        // so the existing filt_pad link gates bind it
-        let ext = |rows: &Vec<Vec<u64>>, flag: &Vec<u64>| -> Vec<Vec<u64>> {
-            rows.iter()
-                .zip(flag.iter())
-                .map(|(r, &f)| {
-                    let mut v = r.clone();
-                    v.push(f);
-                    v
-                })
-                .collect()
-        };
-        let orders_ext = ext(&orders, &cln_o);
-        let customer_ext = ext(&customer, &cln_c);
-        let lineitem_ext = ext(&lineitem, &cln_l);
-
-        // the partition side carries a constant 1 on the clean rows and 0 on
-        // the residual rows, pinned by q_cln_flag / q_res_flag
-        let with_flag = |rows: &Vec<Vec<u64>>, f: u64| -> Vec<Vec<u64>> {
-            rows.iter()
-                .map(|r| {
-                    let mut v = r.clone();
-                    v.push(f);
-                    v
-                })
-                .collect()
-        };
-        let join_ext: Vec<Vec<Vec<u64>>> = join_value.iter().map(|t| with_flag(t, 1)).collect();
-        let dis_ext: Vec<Vec<Vec<u64>>> = disjoin_value.iter().map(|t| with_flag(t, 0)).collect();
-
-        // filt_pad values (these are ALSO constrained by the link gates in configure)
-        let o_filt_pad_f: Vec<Vec<F>> =
-            to_field_rows::<F>(&pad_filter_u64(&orders_ext, &o_keep, &pad_o));
-        let c_filt_pad_f: Vec<Vec<F>> =
-            to_field_rows::<F>(&pad_filter_u64(&customer_ext, &c_keep, &pad_c));
-        let l_filt_pad_f: Vec<Vec<F>> =
-            to_field_rows::<F>(&pad_filter_u64(&lineitem_ext, &l_keep, &pad_l));
-
-        // part_pad values (we will additionally constrain_equal them to o_join/o_disjoin etc)
-        let o_part_pad_f: Vec<Vec<F>> = to_field_rows::<F>(&pad_partition_u64(
-            &join_ext[0],
-            &dis_ext[0],
-            orders.len(),
-            &pad_o,
-        ));
-        let c_part_pad_f: Vec<Vec<F>> = to_field_rows::<F>(&pad_partition_u64(
-            &join_ext[1],
-            &dis_ext[1],
-            customer.len(),
-            &pad_c,
-        ));
-        let l_part_pad_f: Vec<Vec<F>> = to_field_rows::<F>(&pad_partition_u64(
-            &join_ext[2],
-            &dis_ext[2],
-            lineitem.len(),
-            &pad_l,
-        ));
-
-        // compute witnesses from o_join and l_join (NO join materialization)
-        let o_rows = &join_value[0]; // [odate, shippri, custkey, okey]
-        let l_rows = &join_value[2]; // [okey, ext, disc, shipdate]
-        let m = o_rows.len();
-        let n = l_rows.len();
-
-        // map orderkey -> (orderdate, shippriority)
-        let mut o_map: HashMap<u64, (u64, u64)> = HashMap::new();
-        for r in o_rows.iter() {
-            o_map.insert(r[3], (r[0], r[1]));
-        }
-
-        // l_sorted = sort l_rows by l_orderkey
-        let mut l_sorted_u64 = l_rows.clone();
-        l_sorted_u64.sort_by_key(|r| r[0]);
-
-        // compute line_rev/run_sum and emit res_pad rows
-        let mut line_rev_u64: Vec<u64> = vec![0; n];
-        let mut run_sum_u64: Vec<u64> = vec![0; n];
-        let mut res_pad_u64: Vec<[u64; 4]> = vec![[PAD_OK, PAD_DATE, PAD_SHIP, PAD_REV]; n];
-
-        let mut acc: u128 = 0;
-        let mut prev_ok: Option<u64> = None;
-
-        for i in 0..n {
-            let ok = l_sorted_u64[i][0];
-            let ext = l_sorted_u64[i][1] as u128;
-            let disc = l_sorted_u64[i][2] as u128;
-            let lr = ext * ((SCALE as u128) - disc); // (scaled) revenue contribution
-            line_rev_u64[i] = lr as u64;
-
-            if prev_ok == Some(ok) {
-                acc += lr;
-            } else {
-                acc = lr;
-            }
-            run_sum_u64[i] = acc as u64;
-
-            // one past the last real row sits the pinned sentinel, whose key is
-            // PAD_OK, so the last real row always ends its group
-            let next_ok = if i + 1 < n {
-                l_sorted_u64[i + 1][0]
-            } else {
-                PAD_OK
-            };
-            let is_last = next_ok != ok;
-
-            if is_last {
-                let (od, sp) = o_map.get(&ok).copied().unwrap_or((0, 0));
-                res_pad_u64[i] = [ok, od, sp, run_sum_u64[i]];
-            }
-            prev_ok = Some(ok);
-        }
-
-        // build res_sorted witness: sort group rows by (rev desc, odate asc), pad to length n
-        let mut groups: Vec<[u64; 4]> = res_pad_u64
-            .iter()
-            .copied()
-            .filter(|r| r[0] != PAD_OK)
-            .collect();
-
-        groups.sort_by(|a, b| b[3].cmp(&a[3]).then(a[1].cmp(&b[1])));
-
-        let mut res_sorted_u64: Vec<[u64; 4]> = Vec::with_capacity(n);
-        res_sorted_u64.extend(groups.into_iter());
-        while res_sorted_u64.len() < n {
-            res_sorted_u64.push([PAD_OK, PAD_DATE, PAD_SHIP, PAD_REV]);
-        }
+        let Witness {
+            n_c,
+            n_o,
+            n_l,
+            c_check,
+            o_check,
+            l_check,
+            cln_c,
+            cln_o,
+            cln_l,
+            l_key_sel_u64,
+            l_sorted_u64,
+            line_rev_u64,
+            run_sum_u64,
+            is_last_u64,
+            res_pad_u64,
+            res_sorted_u64,
+            all_clean,
+            tamper,
+        } = build_witness(&customer, &orders, &lineitem, condition);
 
         layouter.assign_region(
             || "witness",
             |mut region| {
-                // ---------------- base tables ----------------
-                for i in 0..customer.len() {
+                // ---------------- base tables, predicate bits, selectors ----------------
+                for i in 0..n_c {
                     self.config.q_enable[0].enable(&mut region, i)?;
+                    self.config.q_row[0].enable(&mut region, i)?;
                     for j in 0..2 {
                         region.assign_advice(
                             || "customer",
@@ -1421,10 +1100,17 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(condition[0])),
                     )?;
+                    region.assign_advice(
+                        || "cflag customer",
+                        self.config.cflag[0],
+                        i,
+                        || Value::known(F::from(cln_c[i])),
+                    )?;
                 }
 
-                for i in 0..orders.len() {
+                for i in 0..n_o {
                     self.config.q_enable[1].enable(&mut region, i)?;
+                    self.config.q_row[1].enable(&mut region, i)?;
                     for j in 0..4 {
                         region.assign_advice(
                             || "orders",
@@ -1437,7 +1123,7 @@ impl<F: Field + Ord> TestChip<F> {
                         || "check1",
                         self.config.check[1],
                         i,
-                        || Value::known(F::from(o_check[i] as u64)),
+                        || Value::known(F::from(o_check[i])),
                     )?;
                     region.assign_advice(
                         || "cond1",
@@ -1445,16 +1131,17 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(condition[1])),
                     )?;
+                    region.assign_advice(
+                        || "cflag orders",
+                        self.config.cflag[1],
+                        i,
+                        || Value::known(F::from(cln_o[i])),
+                    )?;
                 }
 
-                for i in 0..lineitem.len() {
+                for i in 0..n_l {
                     self.config.q_enable[2].enable(&mut region, i)?;
-                    region.assign_advice(
-                        || "cond2",
-                        self.config.condition[2],
-                        i,
-                        || Value::known(F::from(condition[1])),
-                    )?;
+                    self.config.q_row[2].enable(&mut region, i)?;
                     for j in 0..4 {
                         region.assign_advice(
                             || "lineitem",
@@ -1467,73 +1154,48 @@ impl<F: Field + Ord> TestChip<F> {
                         || "check2",
                         self.config.check[2],
                         i,
-                        || Value::known(F::from(l_check[i] as u64)),
+                        || Value::known(F::from(l_check[i])),
+                    )?;
+                    region.assign_advice(
+                        || "cond2",
+                        self.config.condition[2],
+                        i,
+                        || Value::known(F::from(condition[1])),
+                    )?;
+                    region.assign_advice(
+                        || "cflag lineitem",
+                        self.config.cflag[2],
+                        i,
+                        || Value::known(F::from(cln_l[i])),
+                    )?;
+                    region.assign_advice(
+                        || "l_key_sel",
+                        self.config.l_key_sel,
+                        i,
+                        || Value::known(F::from(l_key_sel_u64[i])),
                     )?;
                 }
 
                 // the query parameters: constant down each condition column,
                 // and one shared date for the two date predicates
-                for (idx, len) in [customer.len(), orders.len(), lineitem.len()]
-                    .iter()
-                    .enumerate()
-                {
+                for (idx, len) in [n_c, n_o, n_l].iter().enumerate() {
                     for i in 0..len.saturating_sub(1) {
                         self.config.q_cond_const[idx].enable(&mut region, i)?;
                     }
                 }
-                if !orders.is_empty() && !lineitem.is_empty() {
+                if n_o > 0 && n_l > 0 {
                     self.config.q_cond_link.enable(&mut region, 0)?;
                 }
 
-                // ---------------- join/disjoin witnesses (capture cells) ----------------
-                let o_join_cells = Self::assign_table_u64(
-                    &mut region,
-                    "o_join",
-                    &self.config.o_join,
-                    &join_value[0],
-                )?;
-                let o_dis_cells = Self::assign_table_u64(
-                    &mut region,
-                    "o_disjoin",
-                    &self.config.o_disjoin,
-                    &disjoin_value[0],
-                )?;
-
-                let c_join_cells = Self::assign_table_u64(
-                    &mut region,
-                    "c_join",
-                    &self.config.c_join,
-                    &join_value[1],
-                )?;
-                let c_dis_cells = Self::assign_table_u64(
-                    &mut region,
-                    "c_disjoin",
-                    &self.config.c_disjoin,
-                    &disjoin_value[1],
-                )?;
-
-                let l_join_cells = Self::assign_table_u64(
-                    &mut region,
-                    "l_join",
-                    &self.config.l_join,
-                    &join_value[2],
-                )?;
-                let l_dis_cells = Self::assign_table_u64(
-                    &mut region,
-                    "l_disjoin",
-                    &self.config.l_disjoin,
-                    &disjoin_value[2],
-                )?;
-
                 // ---------------- predicate subchips ----------------
-                for i in 0..customer.len() {
+                for i in 0..n_c {
                     equal_chip.assign(
                         &mut region,
                         i,
                         Value::known(F::from(customer[i][0]) - F::from(condition[0])),
                     )?;
                 }
-                for i in 0..orders.len() {
+                for i in 0..n_o {
                     lt_o_chip.assign(
                         &mut region,
                         i,
@@ -1541,7 +1203,7 @@ impl<F: Field + Ord> TestChip<F> {
                         Value::known(F::from(condition[1])),
                     )?;
                 }
-                for i in 0..lineitem.len() {
+                for i in 0..n_l {
                     lt_l_chip.assign(
                         &mut region,
                         i,
@@ -1550,117 +1212,28 @@ impl<F: Field + Ord> TestChip<F> {
                     )?;
                 }
 
-                // ===================== PERMUTATION PROOFS (the fix) =====================
-                // 1) Enable shuffle selectors
-                // 2) Assign filt_pad columns (already linked to base tables by link-gates)
-                // 3) Assign part_pad columns AND constrain_equal them to (join || disjoin)
-                // => shuffle now proves: filtered_rows == join ∪ disjoin  (as multisets)
-
-                // ---- orders perm ----
-                for i in 0..orders.len() {
-                    self.config.perm_orders.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_orders.q_perm2.enable(&mut region, i)?;
-                }
-                Self::assign_table_f(
-                    &mut region,
-                    "o_filt_pad",
-                    &self.config.o_filt_pad,
-                    &o_filt_pad_f,
-                )?;
-                Self::assign_part_pad_and_link(
-                    &mut region,
-                    "o_part_pad",
-                    &self.config.o_part_pad,
-                    &o_part_pad_f,
-                    &o_join_cells,
-                    &o_dis_cells,
-                )?;
-
-                // ---- customer perm ----
-                for i in 0..customer.len() {
-                    self.config.perm_customer.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_customer.q_perm2.enable(&mut region, i)?;
-                }
-                Self::assign_table_f(
-                    &mut region,
-                    "c_filt_pad",
-                    &self.config.c_filt_pad,
-                    &c_filt_pad_f,
-                )?;
-                Self::assign_part_pad_and_link(
-                    &mut region,
-                    "c_part_pad",
-                    &self.config.c_part_pad,
-                    &c_part_pad_f,
-                    &c_join_cells,
-                    &c_dis_cells,
-                )?;
-
-                // ---- lineitem perm ----
-                for i in 0..lineitem.len() {
-                    self.config.perm_lineitem.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_lineitem.q_perm2.enable(&mut region, i)?;
-                }
-                Self::assign_table_f(
-                    &mut region,
-                    "l_filt_pad",
-                    &self.config.l_filt_pad,
-                    &l_filt_pad_f,
-                )?;
-                Self::assign_part_pad_and_link(
-                    &mut region,
-                    "l_part_pad",
-                    &self.config.l_part_pad,
-                    &l_part_pad_f,
-                    &l_join_cells,
-                    &l_dis_cells,
-                )?;
-
-                // ---- clean indicator on both sides of every Conservation Check ----
-                // input side: the raw indicator on the base rows, which the
-                // link gates turn into keep * indicator on the pad columns
-                for (col, flags) in [
-                    (self.config.cflag[0], &cln_c),
-                    (self.config.cflag[1], &cln_o),
-                    (self.config.cflag[2], &cln_l),
-                ] {
-                    for (i, &f) in flags.iter().enumerate() {
-                        region.assign_advice(|| "cflag", col, i, || Value::known(F::from(f)))?;
-                    }
-                }
-                // partition side: 1 on the clean rows, 0 on the residual rows,
-                // and the whole PAD tuple on the rows past both sections
-                for (idx, (n_cln, n_res, total)) in [
-                    (join_value[1].len(), disjoin_value[1].len(), customer.len()),
-                    (join_value[0].len(), disjoin_value[0].len(), orders.len()),
-                    (join_value[2].len(), disjoin_value[2].len(), lineitem.len()),
-                ]
-                .iter()
-                .enumerate()
+                // ===================== (1) CONSERVATION CHECK =====================
+                // The indexed relation against the two parts. Nothing else has
+                // to be assigned for it: the entries are the committed rows and
+                // the indicator, both already written above.
+                assign_row_index(&mut region, &self.config.row_idx, n_c.max(n_o).max(n_l))?;
+                for (idx, (rows, flags)) in
+                    [(&customer, &cln_c), (&orders, &cln_o), (&lineitem, &cln_l)]
+                        .into_iter()
+                        .enumerate()
                 {
-                    for i in 0..*n_cln {
-                        self.config.q_cln_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in *n_cln..(*n_cln + *n_res) {
-                        self.config.q_res_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in (*n_cln + *n_res)..*total {
-                        self.config.q_pad_part[idx].enable(&mut region, i)?;
-                    }
+                    assign_conserve(&mut region, &self.config.cons[idx], rows, flags)?;
                 }
 
                 // ===================== CARDINALITY PRESERVATION CHECK =====================
-                // condition (4) of the One-Pass OBJ: the two multiplicity
-                // channels are propagated to the root and their sums compared.
-                //
                 // Both children are leaves, so a child row's input-channel
                 // multiplicity is its predicate bit and its clean-channel
-                // multiplicity is that bit times the clean indicator.
-                let cp_rows_c: Vec<[u64; 3]> = (0..customer.len())
+                // multiplicity is its selector bit.
+                let cp_rows_c: Vec<[u64; 3]> = (0..n_c)
                     .map(|i| [customer[i][1], c_check[i], cln_c[i]])
                     .collect();
-                let cp_rows_l: Vec<[u64; 3]> = (0..lineitem.len())
-                    .map(|i| [lineitem[i][0], l_check[i] as u64, cln_l[i]])
+                let cp_rows_l: Vec<[u64; 3]> = (0..n_l)
+                    .map(|i| [lineitem[i][0], l_check[i], cln_l[i]])
                     .collect();
 
                 let cp_stage_c = build_cp_stage(&cp_rows_c, MAX_SENTINEL);
@@ -1688,44 +1261,29 @@ impl<F: Field + Ord> TestChip<F> {
                 )?;
 
                 // root multiplicities and the equality between the two sums
-                let cp_mu: Vec<(u64, u64)> = (0..orders.len())
+                let cp_mu: Vec<(u64, u64)> = (0..n_o)
                     .map(|i| {
-                        let pred = o_check[i] as u64;
-                        let cln = cln_o[i];
                         (
-                            pred * fetched_c[i].0 * fetched_l[i].0,
-                            cln * fetched_c[i].1 * fetched_l[i].1,
+                            o_check[i] * fetched_c[i].0 * fetched_l[i].0,
+                            cln_o[i] * fetched_c[i].1 * fetched_l[i].1,
                         )
                     })
                     .collect();
-                for i in 0..orders.len() {
+                for i in 0..n_o {
                     self.config.q_cp_mu.enable(&mut region, i)?;
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
-                if !tamper && !all_clean {
+                if !tamper && !all_clean && !SELECT_A_FILTERED_ROW.load(Ordering::Relaxed) {
                     debug_assert_eq!(
                         cp_all, cp_cln,
-                        "cardinality preservation: |R^c join| != |R join|"
+                        "cardinality preservation: |R^c join| != |R^p join|"
                     );
                 }
 
-                // inputs: only enable on real rows of each join table
-                for i in 0..join_value[0].len() {
-                    self.config.q_in_o_cust_in_c.enable(&mut region, i)?; // o_join.cust -> c_join
-                    self.config.q_in_o_okey_in_l.enable(&mut region, i)?; // o_join.okey -> l_join
-                }
-
-                for i in 0..join_value[1].len() {
-                    self.config.q_in_c_cust_in_o.enable(&mut region, i)?; // c_join.cust -> o_join
-                }
-
-                for i in 0..join_value[2].len() {
-                    self.config.q_in_l_okey_in_o.enable(&mut region, i)?; // l_join.okey -> o_join
-                }
-
-                // assign l_sorted (rows 0..n) + sentinel row n (needed for same_next on last row)
-                for i in 0..n {
-                    for j in 0..4 {
+                // ===================== AGGREGATION =====================
+                // the sorted view, plus the pinned PAD sentinel at row n_l
+                for i in 0..n_l {
+                    for j in 0..3 {
                         region.assign_advice(
                             || "l_sorted",
                             self.config.l_sorted[j],
@@ -1734,22 +1292,18 @@ impl<F: Field + Ord> TestChip<F> {
                         )?;
                     }
                 }
-                // the sentinel row the group-boundary detector reads on row n-1.
-                // Its key is PAD_OK and pinned by q_lsort_sentinel; the other
-                // three columns are read by nothing at row n.
-                for j in 0..4 {
+                for j in 0..3 {
                     let v = if j == 0 { PAD_OK } else { 0u64 };
                     region.assign_advice(
                         || "l_sorted_sentinel",
                         self.config.l_sorted[j],
-                        n,
+                        n_l,
                         || Value::known(F::from(v)),
                     )?;
                 }
-                self.config.q_lsort_sentinel.enable(&mut region, n)?;
+                self.config.q_lsort_sentinel.enable(&mut region, n_l)?;
 
-                // assign line_rev, run_sum and res_pad/res_sorted
-                for i in 0..n {
+                for i in 0..n_l {
                     region.assign_advice(
                         || "line_rev",
                         self.config.line_rev,
@@ -1761,6 +1315,12 @@ impl<F: Field + Ord> TestChip<F> {
                         self.config.run_sum,
                         i,
                         || Value::known(F::from(run_sum_u64[i])),
+                    )?;
+                    region.assign_advice(
+                        || "is_last",
+                        self.config.is_last,
+                        i,
+                        || Value::known(F::from(is_last_u64[i])),
                     )?;
 
                     let rp = res_pad_u64[i];
@@ -1784,50 +1344,38 @@ impl<F: Field + Ord> TestChip<F> {
                     }
                 }
 
-                // enable permutation selectors: l_join <-> l_sorted
-                for i in 0..n {
+                // permutation selectors: masked lineitem columns <-> l_sorted,
+                // and res_pad <-> res_sorted
+                for i in 0..n_l {
                     self.config.perm_lsort.q_perm1.enable(&mut region, i)?;
                     self.config.perm_lsort.q_perm2.enable(&mut region, i)?;
-                }
-
-                // enable line/accu selectors
-                if n > 0 {
-                    self.config.q_line.enable(&mut region, 0)?;
-                    self.config.q_first.enable(&mut region, 0)?;
-                    self.config.q_res_lookup.enable(&mut region, 0)?;
-                }
-                for i in 0..n {
-                    self.config.q_line.enable(&mut region, i)?;
-                    self.config.q_res_lookup.enable(&mut region, i)?;
-                }
-                for i in 1..n {
-                    self.config.q_accu.enable(&mut region, i)?;
-                }
-
-                // enable o_join table gate for lookup
-                for i in 0..m {
-                    self.config.q_tbl_o_join.enable(&mut region, i)?;
-                }
-
-                // enable permutation selectors: res_pad <-> res_sorted
-                for i in 0..n {
                     self.config.perm_res.q_perm1.enable(&mut region, i)?;
                     self.config.perm_res.q_perm2.enable(&mut region, i)?;
                 }
 
-                // enable sort gate on rows 0..n-2
-                for i in 0..n.saturating_sub(1) {
+                // line / accumulate / emit selectors
+                if n_l > 0 {
+                    self.config.q_first.enable(&mut region, 0)?;
+                }
+                for i in 0..n_l {
+                    self.config.q_line.enable(&mut region, i)?;
+                    self.config.q_res_lookup.enable(&mut region, i)?;
+                }
+                for i in 1..n_l {
+                    self.config.q_accu.enable(&mut region, i)?;
+                }
+                for i in 0..n_l.saturating_sub(1) {
                     self.config.q_sort_res.enable(&mut region, i)?;
                 }
 
                 // same_prev only for i>=1
-                for i in 1..n {
+                for i in 1..n_l {
                     let diff = F::from(l_sorted_u64[i][0]) - F::from(l_sorted_u64[i - 1][0]);
                     iz_same_prev_chip.assign(&mut region, i, Value::known(diff))?;
                 }
-                // same_next for i=0..n-1 (needs sentinel row n assigned)
-                for i in 0..n {
-                    let next_ok = if i + 1 < n {
+                // same_next for i=0..n-1 (needs the sentinel row assigned)
+                for i in 0..n_l {
+                    let next_ok = if i + 1 < n_l {
                         l_sorted_u64[i + 1][0]
                     } else {
                         PAD_OK
@@ -1836,10 +1384,9 @@ impl<F: Field + Ord> TestChip<F> {
                     iz_same_next_chip.assign(&mut region, i, Value::known(diff))?;
                 }
 
-                // sortedness of l_sorted[0]: compare real rows i and i+1, so the
-                // gate runs on 0..n-2. Row n is the zero sentinel that only
-                // iz_same_next reads, and it is not part of the sorted run.
-                for i in 0..n.saturating_sub(1) {
+                // sortedness of l_sorted[0]: real consecutive pairs only. Row
+                // n_l is the pinned sentinel, which only iz_same_next reads.
+                for i in 0..n_l.saturating_sub(1) {
                     self.config.q_lsort.enable(&mut region, i)?;
                     let cur = l_sorted_u64[i][0];
                     let next = l_sorted_u64[i + 1][0];
@@ -1857,7 +1404,7 @@ impl<F: Field + Ord> TestChip<F> {
                 }
 
                 // ORDER BY helpers on res_sorted: rows 0..n-2
-                for i in 0..n.saturating_sub(1) {
+                for i in 0..n_l.saturating_sub(1) {
                     let rev_cur = res_sorted_u64[i][3];
                     let rev_next = res_sorted_u64[i + 1][3];
                     let date_cur = res_sorted_u64[i][1];
@@ -1911,9 +1458,6 @@ impl<F: Field + Ord> TestChip<F> {
 }
 
 // ---------------- Circuit wrapper ----------------
-// Visibility only (revision): `pub` so the additive bench harness in
-// `crate::bench_queries` can build this circuit outside the test module.
-// No field, gate, or synthesis logic is changed.
 pub struct MyCircuit<F> {
     pub customer: Vec<Vec<u64>>,
     pub orders: Vec<Vec<u64>>,
@@ -2046,303 +1590,39 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "inherited heavy end-to-end test; the fast check is test_cardinality_preservation"]
-    fn test_2() {
-        use crate::data::data_processing;
-        use std::collections::HashMap;
+    /// The three tamper hooks are process-wide statics and `cargo test` runs
+    /// the tests of one binary in parallel, so every test that reads or writes
+    /// them takes this lock first.
+    static HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        // ---------------- paths ----------------
-        let customer_file_path = &crate::paths::data_file("customer.tbl");
-        let orders_file_path = &crate::paths::data_file("orders.tbl");
-        let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
-        let supplier_file_path = &crate::paths::data_file("supplier.tbl");
+    fn lock_hooks() -> std::sync::MutexGuard<'static, ()> {
+        HOOKS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-        // ---------------- load records ----------------
-        let customers = data_processing::customer_read_records_from_file(customer_file_path)
-            .expect("failed to read customer.tbl");
-        let orders = data_processing::orders_read_records_from_file(orders_file_path)
-            .expect("failed to read orders.tbl");
-        let lineitems = data_processing::lineitem_read_records_from_file(lineitem_file_path)
-            .expect("failed to read lineitem.tbl");
-        let suppliers = data_processing::supplier_read_records_from_file(supplier_file_path)
-            .expect("failed to read supplier.tbl");
-
-        // ---------------- helpers ----------------
-        fn max_freq(counts: &HashMap<u64, u64>) -> (u64, u64) {
-            counts
-                .iter()
-                .max_by_key(|(_, &c)| c)
-                .map(|(&k, &c)| (k, c))
-                .unwrap_or((0u64, 0u64))
+    fn string_to_u64(s: &str) -> u64 {
+        let mut result = 0;
+        for (i, c) in s.chars().enumerate() {
+            result += (i as u64 + 1) * (c as u64);
         }
-
-        // ---------------- suppkey frequencies ----------------
-        let mut supp_in_lineitem: HashMap<u64, u64> = HashMap::new();
-        for r in lineitems.iter() {
-            *supp_in_lineitem.entry(r.l_suppkey).or_default() += 1;
-        }
-        let (max_supp_li, max_cnt_li) = max_freq(&supp_in_lineitem);
-
-        let mut supp_in_supplier: HashMap<u64, u64> = HashMap::new();
-        for r in suppliers.iter() {
-            *supp_in_supplier.entry(r.s_suppkey).or_default() += 1;
-        }
-        let (max_supp_s, max_cnt_s) = max_freq(&supp_in_supplier);
-
-        // ---------------- custkey frequencies ----------------
-        let mut cust_in_customer: HashMap<u64, u64> = HashMap::new();
-        for r in customers.iter() {
-            *cust_in_customer.entry(r.c_custkey).or_default() += 1;
-        }
-        let (max_cust_c, max_cnt_c) = max_freq(&cust_in_customer);
-
-        let mut cust_in_orders: HashMap<u64, u64> = HashMap::new();
-        for r in orders.iter() {
-            *cust_in_orders.entry(r.o_custkey).or_default() += 1;
-        }
-        let (max_cust_o, max_cnt_o) = max_freq(&cust_in_orders);
-
-        // ---------------- print results ----------------
-        println!(
-            "[suppkey] lineitem: max frequency = {} (suppkey={}) over {} rows",
-            max_cnt_li,
-            max_supp_li,
-            lineitems.len()
-        );
-        println!(
-            "[suppkey] supplier : max frequency = {} (suppkey={}) over {} rows",
-            max_cnt_s,
-            max_supp_s,
-            suppliers.len()
-        );
-
-        println!(
-            "[custkey] customer: max frequency = {} (custkey={}) over {} rows",
-            max_cnt_c,
-            max_cust_c,
-            customers.len()
-        );
-        println!(
-            "[custkey] orders  : max frequency = {} (custkey={}) over {} rows",
-            max_cnt_o,
-            max_cust_o,
-            orders.len()
-        );
-
-        #[test]
-        fn test_2() {
-            use crate::data::data_processing;
-            use std::collections::HashMap;
-
-            // ---------------- paths ----------------
-            let customer_file_path = &crate::paths::data_file("customer.tbl");
-            let orders_file_path = &crate::paths::data_file("orders.tbl");
-            let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
-            let supplier_file_path = &crate::paths::data_file("supplier.tbl");
-
-            // ---------------- load records ----------------
-            let customers = data_processing::customer_read_records_from_file(customer_file_path)
-                .expect("failed to read customer.tbl");
-            let orders = data_processing::orders_read_records_from_file(orders_file_path)
-                .expect("failed to read orders.tbl");
-            let lineitems = data_processing::lineitem_read_records_from_file(lineitem_file_path)
-                .expect("failed to read lineitem.tbl");
-            let suppliers = data_processing::supplier_read_records_from_file(supplier_file_path)
-                .expect("failed to read supplier.tbl");
-
-            // ---------------- helpers ----------------
-            fn max_freq(counts: &HashMap<u64, u64>) -> (u64, u64) {
-                counts
-                    .iter()
-                    .max_by_key(|(_, &c)| c)
-                    .map(|(&k, &c)| (k, c))
-                    .unwrap_or((0u64, 0u64))
+        result
+    }
+    fn scale_by_1000(x: f64) -> u64 {
+        (1000.0 * x) as u64
+    }
+    fn date_to_timestamp(date_str: &str) -> u64 {
+        match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            Ok(date) => {
+                let datetime: DateTime<Utc> = DateTime::<Utc>::from_utc(date.and_hms(0, 0, 0), Utc);
+                datetime.timestamp() as u64
             }
-
-            // ---------------- suppkey frequencies ----------------
-            let mut supp_in_lineitem: HashMap<u64, u64> = HashMap::new();
-            for r in lineitems.iter() {
-                *supp_in_lineitem.entry(r.l_suppkey).or_default() += 1;
-            }
-            let (max_supp_li, max_cnt_li) = max_freq(&supp_in_lineitem);
-
-            let mut supp_in_supplier: HashMap<u64, u64> = HashMap::new();
-            for r in suppliers.iter() {
-                *supp_in_supplier.entry(r.s_suppkey).or_default() += 1;
-            }
-            let (max_supp_s, max_cnt_s) = max_freq(&supp_in_supplier);
-
-            // ---------------- custkey frequencies ----------------
-            let mut cust_in_customer: HashMap<u64, u64> = HashMap::new();
-            for r in customers.iter() {
-                *cust_in_customer.entry(r.c_custkey).or_default() += 1;
-            }
-            let (max_cust_c, max_cnt_c) = max_freq(&cust_in_customer);
-
-            let mut cust_in_orders: HashMap<u64, u64> = HashMap::new();
-            for r in orders.iter() {
-                *cust_in_orders.entry(r.o_custkey).or_default() += 1;
-            }
-            let (max_cust_o, max_cnt_o) = max_freq(&cust_in_orders);
-
-            // ---------------- print results ----------------
-            println!(
-                "[suppkey] lineitem: max frequency = {} (suppkey={}) over {} rows",
-                max_cnt_li,
-                max_supp_li,
-                lineitems.len()
-            );
-            println!(
-                "[suppkey] supplier : max frequency = {} (suppkey={}) over {} rows",
-                max_cnt_s,
-                max_supp_s,
-                suppliers.len()
-            );
-
-            println!(
-                "[custkey] customer: max frequency = {} (custkey={}) over {} rows",
-                max_cnt_c,
-                max_cust_c,
-                customers.len()
-            );
-            println!(
-                "[custkey] orders  : max frequency = {} (custkey={}) over {} rows",
-                max_cnt_o,
-                max_cust_o,
-                orders.len()
-            );
-            // [suppkey] lineitem: max frequency = 668 (suppkey=38) over 60175 rows
-            // [suppkey] supplier : max frequency = 1 (suppkey=48) over 100 rows
-            // [custkey] customer: max frequency = 1 (custkey=1202) over 1500 rows
-            // [custkey] orders  : max frequency = 32 (custkey=643) over 15000 rows
+            Err(_) => 0,
         }
     }
 
-    #[test]
-    #[ignore = "inherited heavy end-to-end test; the fast check is test_cardinality_preservation"]
-    fn test_1() {
-        let k = 16;
-
-        fn string_to_u64(s: &str) -> u64 {
-            let mut result = 0;
-            for (i, c) in s.chars().enumerate() {
-                result += (i as u64 + 1) * (c as u64);
-            }
-            result
-        }
-        fn scale_by_1000(x: f64) -> u64 {
-            (1000.0 * x) as u64
-        }
-        fn date_to_timestamp(date_str: &str) -> u64 {
-            match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                Ok(date) => {
-                    let datetime: DateTime<Utc> =
-                        DateTime::<Utc>::from_utc(date.and_hms(0, 0, 0), Utc);
-                    datetime.timestamp() as u64
-                }
-                Err(_) => 0,
-            }
-        }
-
-        let customer_file_path = &crate::paths::data_file("customer.tbl");
-        let orders_file_path = &crate::paths::data_file("orders.tbl");
-        let lineitem_file_path = &crate::paths::data_file("lineitem.tbl");
-
-        let mut customer: Vec<Vec<u64>> = Vec::new();
-        let mut orders: Vec<Vec<u64>> = Vec::new();
-        let mut lineitem: Vec<Vec<u64>> = Vec::new();
-
-        if let Ok(records) = data_processing::customer_read_records_from_file(customer_file_path) {
-            customer = records
-                .iter()
-                .map(|record| vec![string_to_u64(&record.c_mktsegment), record.c_custkey])
-                .collect();
-        }
-        if let Ok(records) = data_processing::orders_read_records_from_file(orders_file_path) {
-            orders = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        date_to_timestamp(&record.o_orderdate),
-                        record.o_shippriority,
-                        record.o_custkey,
-                        record.o_orderkey,
-                    ]
-                })
-                .collect();
-        }
-        if let Ok(records) = data_processing::lineitem_read_records_from_file(lineitem_file_path) {
-            lineitem = records
-                .iter()
-                .map(|record| {
-                    vec![
-                        record.l_orderkey,
-                        scale_by_1000(record.l_extendedprice),
-                        scale_by_1000(record.l_discount),
-                        date_to_timestamp(&record.l_shipdate),
-                    ]
-                })
-                .collect();
-        }
-
-        let condition = [string_to_u64("HOUSEHOLD"), date_to_timestamp("1995-03-25")];
-
-        let circuit = MyCircuit::<Fp> {
-            customer,
-            orders,
-            lineitem,
-            condition,
-            _marker: PhantomData,
-        };
-
-        let public_input = vec![Fp::from(1)];
-
-        // With VPJOIN_MOCK=1 this checks every gate, lookup and shuffle at full
-        // scale under MockProver, which does no cryptography at all, instead of
-        // generating a real proof. That is the cheap way to confirm the circuit
-        // still fits its degree on the whole dataset. Unset, it measures a real
-        // keygen / prove / verify, which is the number the paper reports.
-        let test = std::env::var("VPJOIN_MOCK")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-        if test {
-            let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
-            prover.assert_satisfied();
-        } else {
-            let proof_path = &crate::paths::proof_file("proof_obj_q3");
-            generate_and_verify_proof(circuit, &public_input, proof_path);
-        }
-    }
-
-    /// The truncated dataset slice both fast tests share: small enough for
-    /// MockProver and for one real proof, large enough that the semijoin
-    /// reduction actually drops tuples on all three relations.
+    /// The truncated dataset slice the fast tests share: small enough for
+    /// MockProver and for one real proof, large enough that the reduction
+    /// actually drops tuples on all three relations.
     fn small_slice() -> (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<Vec<u64>>, [u64; 2]) {
-        fn string_to_u64(s: &str) -> u64 {
-            let mut result = 0;
-            for (i, c) in s.chars().enumerate() {
-                result += (i as u64 + 1) * (c as u64);
-            }
-            result
-        }
-        fn scale_by_1000(x: f64) -> u64 {
-            (1000.0 * x) as u64
-        }
-        fn date_to_timestamp(date_str: &str) -> u64 {
-            match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                Ok(date) => {
-                    let datetime: DateTime<Utc> =
-                        DateTime::<Utc>::from_utc(date.and_hms(0, 0, 0), Utc);
-                    datetime.timestamp() as u64
-                }
-                Err(_) => 0,
-            }
-        }
-
-        // a slice small enough for MockProver but large enough that the
-        // reduction actually drops tuples on every relation
         const N_CUST: usize = 300;
         const N_ORD: usize = 2000;
         const N_LINE: usize = 8000;
@@ -2404,12 +1684,87 @@ mod tests {
         (customer, orders, lineitem, condition)
     }
 
+    /// The full dataset, one real proof or one MockProver run under
+    /// `VPJOIN_MOCK=1`, exactly as `q3_obj.rs::test_1` does for the previous
+    /// realization.
+    #[test]
+    #[ignore = "full-scale end-to-end run; the fast check is test_one_pass_conditions"]
+    fn test_full() {
+        let k = 16;
+
+        let mut customer: Vec<Vec<u64>> = Vec::new();
+        let mut orders: Vec<Vec<u64>> = Vec::new();
+        let mut lineitem: Vec<Vec<u64>> = Vec::new();
+
+        if let Ok(records) = data_processing::customer_read_records_from_file(
+            &crate::paths::data_file("customer.tbl"),
+        ) {
+            customer = records
+                .iter()
+                .map(|record| vec![string_to_u64(&record.c_mktsegment), record.c_custkey])
+                .collect();
+        }
+        if let Ok(records) =
+            data_processing::orders_read_records_from_file(&crate::paths::data_file("orders.tbl"))
+        {
+            orders = records
+                .iter()
+                .map(|record| {
+                    vec![
+                        date_to_timestamp(&record.o_orderdate),
+                        record.o_shippriority,
+                        record.o_custkey,
+                        record.o_orderkey,
+                    ]
+                })
+                .collect();
+        }
+        if let Ok(records) = data_processing::lineitem_read_records_from_file(
+            &crate::paths::data_file("lineitem.tbl"),
+        ) {
+            lineitem = records
+                .iter()
+                .map(|record| {
+                    vec![
+                        record.l_orderkey,
+                        scale_by_1000(record.l_extendedprice),
+                        scale_by_1000(record.l_discount),
+                        date_to_timestamp(&record.l_shipdate),
+                    ]
+                })
+                .collect();
+        }
+
+        let condition = [string_to_u64("HOUSEHOLD"), date_to_timestamp("1995-03-25")];
+
+        let circuit = MyCircuit::<Fp> {
+            customer,
+            orders,
+            lineitem,
+            condition,
+            _marker: PhantomData,
+        };
+
+        let public_input = vec![Fp::from(1)];
+
+        let mock = std::env::var("VPJOIN_MOCK")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        if mock {
+            let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
+            prover.assert_satisfied();
+        } else {
+            let proof_path = &crate::paths::proof_file("proof_obj_q3_new");
+            generate_and_verify_proof(circuit, &public_input, proof_path);
+        }
+    }
+
     /// The real prover, not MockProver, on a truncated slice. MockProver checks
     /// every constraint but tolerates cells that are never read; this closes
-    /// that gap by generating and verifying an actual proof, so the converted
-    /// circuit is known to be provable and not only satisfiable.
+    /// that gap by generating and verifying an actual proof.
     #[test]
-    #[ignore = "real IPA proof, ~3 min in a debug build; run explicitly to check provability"]
+    #[ignore = "real IPA proof, minutes in a debug build; run explicitly to check provability"]
     fn test_real_proof_small() {
         let (customer, orders, lineitem, condition) = small_slice();
         let circuit = MyCircuit::<Fp> {
@@ -2420,18 +1775,18 @@ mod tests {
             _marker: PhantomData,
         };
         let t = Instant::now();
-        // the shipped param16 is the smallest set on disk, and the slice fits it
         generate_and_verify_proof(
             circuit,
             &[Fp::from(1)],
-            &crate::paths::proof_file("proof_obj_q3_small"),
+            &crate::paths::proof_file("proof_obj_q3_new_small"),
         );
         println!("real proof of the truncated slice took {:?}", t.elapsed());
     }
 
-    /// Cost probe. The soundness patches of this file are all degree-1 or
-    /// degree-2 equalities under their own selector, so none of them may raise
-    /// the maximum gate degree: a rise would double every FFT of the prover.
+    /// Cost probe. Every condition of the One-Pass gate is a degree-1 to
+    /// degree-3 expression under its own selector, so none of them may raise
+    /// the maximum gate degree above what `q3_obj.rs` already carries: a rise
+    /// would double every FFT of the prover.
     #[test]
     fn test_max_gate_degree() {
         use halo2_proofs::plonk::ConstraintSystem;
@@ -2452,8 +1807,6 @@ mod tests {
             cs.lookups().len(),
             cs.shuffles().len(),
         );
-        // 8 is the degree before the soundness patches of this file; every
-        // patch is a degree-1 or degree-2 equality, so this must not move.
         assert!(
             cs.degree() <= 8,
             "the maximum gate degree rose to {}",
@@ -2461,11 +1814,13 @@ mod tests {
         );
     }
 
-    /// Fast correctness check of the Cardinality Preservation Check: a
-    /// truncated slice of the dataset under MockProver, which verifies every
-    /// gate, shuffle and lookup of the circuit without paying for a real proof.
+    /// Fast correctness check of the three conditions: a truncated slice under
+    /// MockProver, which verifies every gate, shuffle and lookup of the circuit
+    /// without paying for a real proof, plus the two tampered witnesses that
+    /// separate what (2) catches from what (3) catches.
     #[test]
-    fn test_cardinality_preservation() {
+    fn test_one_pass_conditions() {
+        let _hooks = lock_hooks();
         let k = 15;
         let (customer, orders, lineitem, condition) = small_slice();
 
@@ -2480,16 +1835,15 @@ mod tests {
         let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         prover.assert_satisfied();
 
-        // Negative direction: the same witness with one joinable tuple hidden
-        // in the residual side, and the neighbours re-reduced around it so that
-        // Conservation, Non-Membership and Pairwise Consistency all still hold.
-        // Only condition (4) can see this, so the circuit must now reject.
+        // One participating order deselected, its neighbours re-reduced around
+        // it, so the Selector Check and Pairwise Consistency both still hold.
+        // Only the Cardinality Preservation Check can see this.
         super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
         super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
 
-        let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
+        let failures = verdict.expect_err("condition (3) accepted a hidden participating tuple");
         assert!(
             failures
                 .iter()
@@ -2498,22 +1852,153 @@ mod tests {
             failures
         );
 
-        // Third direction: no reduction at all, every tuple that passes its
-        // predicate declared clean. Conservation holds and condition (4) is
-        // satisfied for free, since both channels then agree row by row, so this
-        // is the escape that condition (3) exists to close.
+        // No reduction at all: every row that passes its predicate selected.
+        // Both channels of (3) then agree row by row, so this is the escape
+        // that Pairwise Consistency exists to close.
         super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
         let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = unreduced.verify();
         super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
 
-        let failures = verdict.expect_err("condition (3) accepted an unreduced clean instance");
+        let failures = verdict.expect_err("condition (2) accepted an unreduced clean instance");
         assert!(
             failures.iter().any(|f| matches!(
                 f,
                 VerifyFailure::Lookup { name, .. } if name.starts_with("pw: ")
             )),
             "the circuit rejected, but not through a Pairwise Consistency lookup: {:?}",
+            failures
+        );
+    }
+
+    /// The emitted answer against a direct evaluation of Q3 over the same
+    /// slice. This is what the restructured aggregation has to preserve: the
+    /// sorted view now covers every lineitem row rather than the clean ones
+    /// alone, and the group boundaries come from the selector-masked key, so
+    /// nothing but this check rules out a deselected row opening a group of its
+    /// own or a clean group being split by one.
+    #[test]
+    fn test_answer_matches_sql() {
+        use std::collections::HashMap;
+        let _hooks = lock_hooks();
+
+        let (customer, orders, lineitem, condition) = small_slice();
+        let (seg, d) = (condition[0], condition[1]);
+
+        // c_custkey is the customer primary key, so a filtered order matches at
+        // most one filtered customer. The group-by sums line revenue per
+        // orderkey without a customer-multiplicity factor, exactly as
+        // q3_obj.rs does, so the comparison below is meaningful only under that
+        // key property. Assert it rather than assume it.
+        let mut mult: HashMap<u64, u64> = HashMap::new();
+        for c in customer.iter().filter(|c| c[0] == seg) {
+            *mult.entry(c[1]).or_default() += 1;
+        }
+        assert!(
+            mult.values().all(|&m| m <= 1),
+            "the slice has a duplicate c_custkey, so Q3's SUM is not the plain per-orderkey sum"
+        );
+
+        let mut by_okey: HashMap<u64, (u64, u64, u128)> = HashMap::new();
+        for o in orders.iter().filter(|o| o[0] < d) {
+            if mult.get(&o[2]).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            for l in lineitem.iter().filter(|l| l[0] == o[3] && l[3] > d) {
+                let e = by_okey.entry(o[3]).or_insert((o[0], o[1], 0));
+                e.2 += (l[1] as u128) * (1000u128 - l[2] as u128);
+            }
+        }
+
+        let total = |r: &[u64; 4], s: &[u64; 4]| {
+            s[3].cmp(&r[3]).then(r[1].cmp(&s[1])).then(r[0].cmp(&s[0]))
+        };
+
+        let mut expected: Vec<[u64; 4]> = by_okey
+            .into_iter()
+            .map(|(k, (od, sp, rev))| [k, od, sp, rev as u64])
+            .collect();
+        expected.sort_by(total);
+        assert!(!expected.is_empty(), "the slice produced no answer rows");
+
+        let w = super::build_witness(&customer, &orders, &lineitem, condition);
+        let mut got: Vec<[u64; 4]> = w.res_sorted_u64[..expected.len()].to_vec();
+        got.sort_by(total);
+
+        assert_eq!(got, expected, "the answer differs from the query's");
+        assert!(
+            w.res_sorted_u64[expected.len()..]
+                .iter()
+                .all(|r| r[0] == super::PAD_OK),
+            "a real group survived past the answer's length"
+        );
+    }
+
+    /// The Conservation Check of condition (1). Moving one occurrence across
+    /// the clean/residual boundary while leaving the flag pattern intact keeps
+    /// every section size and every other constraint satisfied, so only the
+    /// permutation argument can reject it.
+    #[test]
+    fn test_conservation_rejects_a_misplaced_occurrence() {
+        let k = 15;
+        let _hooks = lock_hooks();
+        let (customer, orders, lineitem, condition) = small_slice();
+
+        let circuit = MyCircuit::<Fp> {
+            customer,
+            orders,
+            lineitem,
+            condition,
+            _marker: PhantomData,
+        };
+
+        crate::circuits::conserve_idx::set_misplace_one_occurrence(true);
+        let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        let verdict = tampered.verify();
+        crate::circuits::conserve_idx::set_misplace_one_occurrence(false);
+
+        let failures = verdict.expect_err("the Conservation Check accepted a misplaced occurrence");
+        assert!(
+            failures
+                .iter()
+                .any(|f| matches!(f, VerifyFailure::Shuffle { .. })),
+            "the circuit rejected, but not through a Conservation permutation: {:?}",
+            failures
+        );
+    }
+
+    /// The predicate half of the Selector Check, which is what the revision
+    /// added to the condition list. A row that fails its WHERE clause must not
+    /// be selectable: without `c(t)(1 - b(t)) = 0` the input-side channel of
+    /// (3) would count the raw join and a prover could certify a
+    /// WHERE-violating row while every other check held.
+    #[test]
+    fn test_selector_implies_predicate() {
+        let _hooks = lock_hooks();
+        let k = 15;
+        let (customer, orders, lineitem, condition) = small_slice();
+
+        let circuit = MyCircuit::<Fp> {
+            customer,
+            orders,
+            lineitem,
+            condition,
+            _marker: PhantomData,
+        };
+
+        super::SELECT_A_FILTERED_ROW.store(true, Ordering::Relaxed);
+        let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        let verdict = tampered.verify();
+        super::SELECT_A_FILTERED_ROW.store(false, Ordering::Relaxed);
+
+        let failures = verdict.expect_err("the Selector Check accepted a filtered-out row");
+        assert!(
+            failures.iter().any(|f| matches!(
+                f,
+                VerifyFailure::ConstraintNotSatisfied { constraint, .. }
+                    if format!("{:?}", constraint).contains("implies its predicate")
+            )),
+            "the circuit rejected, but not through the Selector Check: {:?}",
             failures
         );
     }

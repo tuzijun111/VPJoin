@@ -512,25 +512,11 @@ fn main() {
             // `proof_path = None`: this binary writes nothing to disk. Keygen
             // happens inside, per configuration: the lane count is part of the
             // circuit shape, so keys cannot be hoisted out of this loop.
-            // VPJOIN_OBJ=new selects the revised One-Pass OBJ. The lane
-            // geometry and every released capacity are identical either way, so
-            // the paired difference isolates the gate's realization. GQ4 has
-            // only one circuit: its DP file never materialized a partition, so
-            // it already realizes the three conditions.
-            let obj_new = std::env::var("VPJOIN_OBJ")
-                .map(|v| v.to_lowercase() == "new")
-                .unwrap_or(false);
-            let run: DpLaneRun = match (q.as_str(), obj_new) {
-                ("q5", false) => {
-                    halo2_experiments::sql::q5_obj_dp::run_dp_lanes(b.privacy, reps, None)
-                }
-                ("q5", true) => {
-                    halo2_experiments::sql::q5_obj_dp_new::run_dp_lanes(b.privacy, reps, None)
-                }
-                ("gq3", false) => halo2_experiments::graph_sql::g_sql3_obj_dp::run_dp_lanes(
-                    ds, b.privacy, reps, None,
-                ),
-                ("gq3", true) => halo2_experiments::graph_sql::g_sql3_obj_dp_new::run_dp_lanes(
+            // Each query has one DP circuit, realizing the One-Pass OBJ over
+            // the lane rows.
+            let run: DpLaneRun = match q.as_str() {
+                "q5" => halo2_experiments::sql::q5_obj_dp::run_dp_lanes(b.privacy, reps, None),
+                "gq3" => halo2_experiments::graph_sql::g_sql3_obj_dp::run_dp_lanes(
                     ds, b.privacy, reps, None,
                 ),
                 _ => halo2_experiments::graph_sql::g_sql4_obj_dp::run_dp_lanes(

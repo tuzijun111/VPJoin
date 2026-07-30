@@ -3,6 +3,10 @@ use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_conserve_laned,
+    configure_row_index, ConserveConfig, RowIndexConfig,
+};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 use crate::circuits::card_preserve::{
     assign_cp_agg, build_cp_stage, configure_cp_agg, CpAggConfig,
@@ -171,12 +175,6 @@ pub enum Tamper {
     /// that lane's Pairwise Consistency lookup can reject it. This is what
     /// separates "some lane holds this key" from "the prover may name any lane".
     HostWrongLane,
-    /// Move the LAST clean row of every lane's partition group into the residual
-    /// block by flipping its flag, leaving the bag's own indicator honest. The
-    /// flag stays boolean and non-increasing, so only that lane's Conservation
-    /// shuffle can reject it: this is what shows condition (7) is not vacuous and
-    /// that it really is enforced lane by lane.
-    PartitionFlag,
 }
 
 /// One lane: a full structural replica of g_sql3_obj's Bag1 column group.
@@ -211,9 +209,6 @@ pub struct LaneConfig<F: Field + Ord> {
     /// `real == [B != 0]`, so a pad row cannot be promoted to a real tuple and a
     /// real row cannot be demoted while keeping its attributes
     iz_t12_pad: IsZeroConfig<F>,
-    /// condition (7): `[clean | residual | pad]` side of this lane's
-    /// Conservation Check; columns are (A,B,C,i_r1,j_r2,r1_eid,r2_eid,flag)
-    part12: [Column<Advice>; 8],
     /// `cln12 * pack2(A,C)`: the clean separator key of this lane, and the only
     /// column conditions (9) and (10) read the key through. Materializing the
     /// product keeps every lookup that reads it at input degree 2.
@@ -226,6 +221,12 @@ pub struct LaneConfig<F: Field + Ord> {
     /// lane-local prefix sum of `mu_cln`; its last cell is copied into the
     /// cross-lane totals stage
     cln_run: Column<Advice>,
+    /// condition (1) for this lane's share of Bag1: one permutation between the
+    /// lane's indexed rows and the concatenation of its two parts. The lanes
+    /// partition the released capacity by construction, so the union of the
+    /// per-lane statements is the relation-level one, and per-lane is a
+    /// refinement of it rather than something a prover can split.
+    cons: ConserveConfig,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,10 +240,12 @@ struct LaneSelectors {
     q_sum0: Selector,
     q_sum: Selector,
     q_cln_bind: Selector,
-    q_part12: Selector,
-    q_part12_mono: Selector,
+    // condition (1) for this lane's share of Bag1. Shared across lanes: every
+    // lane is active on the same rows, so only the columns replicate.
     q_perm12_in: Selector,
     q_perm12_out: Selector,
+    q_part12: Selector,
+    q_part12_mono: Selector,
 }
 
 #[derive(Clone, Debug)]
@@ -275,16 +278,20 @@ pub struct Gq3DpConfig<F: Field + Ord> {
     /// `real == [C != 0]`
     iz_t3_pad: IsZeroConfig<F>,
     q_cln3_bind: Selector,
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED bag. Bag1 is laned, so its
+    // permutation lives per lane, in `LaneConfig::cons`, over lane-local
+    // indices: the lanes cover disjoint row ranges of the capacity by fixed
+    // selectors, so the union of the per-lane statements is the relation-level
+    // one. Bag2 is never laned and gets one here. Padding rows sit in the
+    // residual part, their indicator zero.
+    row_idx: RowIndexConfig,
+    cons_bag2: ConserveConfig,
+
     /// `cln3 * pack2(A,C)`: the clean separator key of Bag2. It is the table of
     /// one direction of condition (9) and the input of the other, so both
     /// directions run between the two clean key columns with nothing in between.
     ck3: Column<Advice>,
-    /// condition (7) for Bag2: `[clean | residual | pad]` side, columns are
-    /// (C,A,j_r3,r3_eid,flag)
-    part3: Vec<Column<Advice>>,
-    perm_bag2: PermAnyConfig,
-    q_part3: Selector,
-    q_part3_mono: Selector,
     /// condition (9): exactly one lane hosts each clean Bag2 tuple
     q_host3: Selector,
     /// condition (10): the child stage of the single cluster-tree edge, over the
@@ -362,6 +369,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         ck3: Column<Advice>,
         q_t3_tbl: Selector,
         lane_u8: Column<Fixed>,
+        row_idx: &RowIndexConfig,
         sel: &LaneSelectors,
     ) -> LaneConfig<F> {
         let LaneSelectors {
@@ -374,10 +382,10 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             q_sum0,
             q_sum,
             q_cln_bind,
-            q_part12,
-            q_part12_mono,
             q_perm12_in,
             q_perm12_out,
+            q_part12,
+            q_part12_mono,
         } = *sel;
         let t12_a = meta.advice_column();
         let t12_b = meta.advice_column();
@@ -561,34 +569,29 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             ]
         });
 
-        let part12: [Column<Advice>; 8] = [(); 8].map(|_| meta.advice_column());
-        Self::lane_shuffle(
+        // ---- condition (1): this lane's share of Bag1 ----
+        // The index is LANE-LOCAL, which is enough: the lanes cover disjoint
+        // row ranges of the capacity by fixed selectors, so a per-lane
+        // permutation over lane-local indices places every occurrence of that
+        // lane on exactly one side, and the union over lanes is the
+        // relation-level statement.
+        let cons = configure_conserve_laned::<F>(
             meta,
-            "bag1 conservation (lane)",
+            row_idx,
+            &[t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid],
+            cln12,
             q_perm12_in,
             q_perm12_out,
-            vec![
-                t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid, cln12,
-            ],
-            part12.to_vec(),
+            q_part12,
+            q_part12_mono,
         );
 
-        {
-            let flag = part12[7];
-            meta.create_gate("bag1 partition flag is boolean (lane)", move |m| {
-                let q = m.query_selector(q_part12);
-                let one = Expression::Constant(F::ONE);
-                let f = m.query_advice(flag, Rotation::cur());
-                vec![q * f.clone() * (one - f)]
-            });
-            meta.create_gate("bag1 partition flag is non-increasing (lane)", move |m| {
-                let qm = m.query_selector(q_part12_mono);
-                let one = Expression::Constant(F::ONE);
-                let f = m.query_advice(flag, Rotation::cur());
-                let f_next = m.query_advice(flag, Rotation::next());
-                vec![qm * f_next * (one - f)]
-            });
-        }
+        // No `[clean | residual | pad]` group is materialized per lane here,
+        // and no lane shuffle or flag gates bind `cln12` to a partition: there
+        // is no partition. The bit is the certified object, its booleanity is
+        // the gate just above, and the three conditions all read the committed
+        // lane rows through it. That drops a group, a shuffle and eight columns
+        // per lane, a saving that scales with the lane count.
 
         // ---- condition (9), Pairwise Consistency on the packed (A,C) key ----
         // Direction 1: pi_K(Bag1^c restricted to this lane) subset pi_K(Bag2^c).
@@ -663,11 +666,11 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             run_sum,
             cln12,
             iz_t12_pad,
-            part12,
             ck12,
             host3,
             mu_cln,
             cln_run,
+            cons,
         }
     }
 
@@ -785,42 +788,18 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             ]
         });
 
-        // condition (7) for Bag2. Not laned, so `PermAnyChip` costs a constant
-        // number of permutation columns here and is used as in the sibling.
-        let part3 = (0..5).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let q_perm3_in = meta.complex_selector();
-        let q_perm3_out = meta.complex_selector();
-        let perm_bag2 = PermAnyChip::configure(
-            meta,
-            q_perm3_in,
-            q_perm3_out,
-            vec![t3_c, t3_a, t3_j_r3, t3_r3_eid, cln3],
-            part3.clone(),
-        );
-        let q_part3 = meta.selector();
-        let q_part3_mono = meta.selector();
-        {
-            let flag = part3[4];
-            meta.create_gate("bag2 partition flag is boolean", move |m| {
-                let q = m.query_selector(q_part3);
-                let one = Expression::Constant(F::ONE);
-                let f = m.query_advice(flag, Rotation::cur());
-                vec![q * f.clone() * (one - f)]
-            });
-            meta.create_gate("bag2 partition flag is non-increasing", move |m| {
-                let qm = m.query_selector(q_part3_mono);
-                let one = Expression::Constant(F::ONE);
-                let f = m.query_advice(flag, Rotation::cur());
-                let f_next = m.query_advice(flag, Rotation::next());
-                vec![qm * f_next * (one - f)]
-            });
-        }
-
         // condition (10), child side: Bag2 is the only child of the cluster tree
         // and it is a leaf, so its two multiplicity columns are columns the
         // circuit already has. `in_key` / `in_val` are pinned to the Bag2
         // attributes by the gate above and the clean channel is the bound
         // indicator. One fixed column serves every Lt chip of the stage.
+        // ---------------- (1) Conservation Check ----------------
+        // One shared row-index column: every lane is active on the same rows
+        // 0..lane_rows and Bag2 on 0..n3, so one pinned index serves them all.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons_bag2 =
+            configure_conserve::<F>(meta, &row_idx, &[t3_c, t3_a, t3_j_r3, t3_r3_eid], cln3);
+
         let cp_u8 = meta.fixed_column();
         let cp_agg = configure_cp_agg::<F, NUM_BYTES>(
             meta,
@@ -859,14 +838,16 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             q_sum0,
             q_sum,
             q_cln_bind,
-            q_part12,
-            q_part12_mono,
             q_perm12_in,
             q_perm12_out,
+            q_part12,
+            q_part12_mono,
         };
 
         let q_last_row = meta.selector();
         let q_last_complex = meta.complex_selector();
+        let q_last_complex2 = meta.complex_selector();
+        let q_last_mono = meta.selector();
         let q_last_sum = meta.selector();
         let q_last_mono = meta.selector();
         let last = LaneSelectors {
@@ -879,10 +860,10 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             q_sum0,
             q_sum: q_last_sum,
             q_cln_bind: q_last_row,
+            q_perm12_in: q_last_complex,
+            q_perm12_out: q_last_complex2,
             q_part12: q_last_row,
             q_part12_mono: q_last_mono,
-            q_perm12_in: q_last_complex,
-            q_perm12_out: q_last_complex,
         };
 
         // One u8 range table for every lane Lt chip: `load` costs one 256-row
@@ -903,6 +884,7 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     // of condition (9) and the input selector of the other.
                     q_t3_lookup,
                     lane_u8,
+                    &row_idx,
                     if l + 1 == num_lanes { &last } else { &full },
                 )
             })
@@ -987,6 +969,8 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         });
 
         Gq3DpConfig {
+            row_idx,
+            cons_bag2,
             instance,
             in_by_dst,
             out_by_src,
@@ -1002,10 +986,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             iz_t3_pad,
             q_cln3_bind,
             ck3,
-            part3,
-            perm_bag2,
-            q_part3,
-            q_part3_mono,
             q_host3,
             cp_agg,
             cp_u8,
@@ -1049,53 +1029,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
         let mut cln_running: u64 = 0;
         let mut last_cell: Option<AssignedCell<F, F>> = None;
         let mut last_cln_cell: Option<AssignedCell<F, F>> = None;
-
-        // ---- condition (7): this lane's [clean | residual | pad] group ----
-        // Rows past `real12` are pad rows, whose clean indicator is 0, so the
-        // clean and residual blocks only ever hold this lane's real rows and the
-        // group's tail is the all-zero pad tuple with flag 0. The flag comes out
-        // non-increasing, which is what its gate asks for.
-        //
-        // The group is exactly `live_rows` tall, which is what the shuffle needs:
-        // both of its sides are gated by this lane's own selectors over the same
-        // rows, so the multiset equality is over the live rows and nothing else.
-        let mut part_rows: Vec<[u64; 8]> = Vec::with_capacity(live_rows);
-        for pass in 0..2 {
-            for r in 0..live_rows {
-                let i = base + r;
-                if i >= real12 {
-                    continue;
-                }
-                let clean = cln12[i];
-                if (pass == 0) != (clean == 1) {
-                    continue;
-                }
-                let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
-                part_rows.push([a, b, c, i_r1, j_r2, r1_eid, r2_eid, clean]);
-            }
-        }
-        while part_rows.len() < live_rows {
-            part_rows.push([0u64; 8]);
-        }
-        // test hook only: demote the last clean row of this lane's group. The flag
-        // column stays boolean and non-increasing, and no residual row of the bag
-        // carries the same attributes (a wedge's clean bit is a function of its
-        // key and its predicate), so only the shuffle can see it.
-        if tamper == Tamper::PartitionFlag {
-            if let Some(last_clean) = part_rows.iter().rposition(|row| row[7] == 1) {
-                part_rows[last_clean][7] = 0;
-            }
-        }
-        for (r, row) in part_rows.iter().enumerate() {
-            for (j, v) in row.iter().enumerate() {
-                region.assign_advice(
-                    || "part12",
-                    lane.part12[j],
-                    r,
-                    || Value::known(F::from(*v)),
-                )?;
-            }
-        }
 
         for r in 0..live_rows {
             let i = base + r;
@@ -1310,6 +1243,34 @@ impl<F: Field + Ord> Gq3DpChip<F> {
             )?);
         }
 
+        // ---- condition (1), this lane's share of Bag1 ----
+        // Lane-local indices over the lane's own live rows; the lanes cover
+        // disjoint ranges of the capacity, so their union is the relation.
+        {
+            let rows: Vec<Vec<u64>> = (0..live_rows)
+                .map(|r| {
+                    let i = base + r;
+                    if i < real12 {
+                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
+                        vec![a, b, c, i_r1, j_r2, r1_eid, r2_eid]
+                    } else {
+                        vec![0u64; 7]
+                    }
+                })
+                .collect();
+            let flags: Vec<u64> = (0..live_rows)
+                .map(|r| {
+                    let i = base + r;
+                    if i < real12 {
+                        cln12[i]
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            assign_conserve(region, &lane.cons, &rows, &flags)?;
+        }
+
         // The drain into the totals stage is the cell at row `live_rows - 1`,
         // which is now the last row of the RELEASED capacity in the last lane
         // rather than the last row of the lane's full height. Both prefix-sum
@@ -1503,17 +1464,10 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     cfg.q_t3_lookup.enable(&mut region, i)?;
                     cfg.q_t3_msg_in.enable(&mut region, i)?;
 
-                    // clean indicator, the input side of Bag2's Conservation
-                    // Check, its partition-flag gates and the host-bit coverage
-                    // gate, all over the same rows as the bag itself
+                    // the selector bit, its binding gate and the host-bit
+                    // coverage gate, all over the same rows as the bag itself
                     cfg.q_cln3_bind.enable(&mut region, i)?;
                     cfg.q_host3.enable(&mut region, i)?;
-                    cfg.q_part3.enable(&mut region, i)?;
-                    if i + 1 < n3 {
-                        cfg.q_part3_mono.enable(&mut region, i)?;
-                    }
-                    cfg.perm_bag2.q_perm1.enable(&mut region, i)?;
-                    cfg.perm_bag2.q_perm2.enable(&mut region, i)?;
 
                     let clean = if i < real3 { cln3[i] } else { 0 };
                     region.assign_advice(
@@ -1630,28 +1584,23 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                 // The pad rows are the all-zero tuple the bag already pads with,
                 // and SHIFT_ID keeps 0 out of the real tuples, so the two
                 // multisets agree exactly and the flag comes out non-increasing.
-                let mut part3_rows: Vec<[u64; 5]> = Vec::with_capacity(n3);
-                for pass in 0..2 {
-                    for i in 0..real3 {
-                        if (pass == 0) != (cln3[i] == 1) {
-                            continue;
-                        }
-                        let (c, a, j_r3, r3_eid) = derived.t3[i];
-                        part3_rows.push([c, a, j_r3, r3_eid, cln3[i]]);
-                    }
-                }
-                while part3_rows.len() < n3 {
-                    part3_rows.push([0u64; 5]);
-                }
-                for (i, row) in part3_rows.iter().enumerate() {
-                    for (j, v) in row.iter().enumerate() {
-                        region.assign_advice(
-                            || "part3",
-                            cfg.part3[j],
-                            i,
-                            || Value::known(F::from(*v)),
-                        )?;
-                    }
+                // ---- condition (1), Bag2 ----
+                {
+                    let rows3: Vec<Vec<u64>> = (0..n3)
+                        .map(|i| {
+                            if i < real3 {
+                                let (c, a, j_r3, r3_eid) = derived.t3[i];
+                                vec![c, a, j_r3, r3_eid]
+                            } else {
+                                vec![0u64; 4]
+                            }
+                        })
+                        .collect();
+                    let flags3: Vec<u64> = (0..n3)
+                        .map(|i| if i < real3 { cln3[i] } else { 0 })
+                        .collect();
+                    assign_row_index(&mut region, &cfg.row_idx, n3.max(lane_rows))?;
+                    assign_conserve(&mut region, &cfg.cons_bag2, &rows3, &flags3)?;
                 }
 
                 // ---- condition (10), child side ----
@@ -1683,12 +1632,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                         cfg.full.q_order.enable(&mut region, r)?;
                         cfg.full.q_contrib.enable(&mut region, r)?;
                         cfg.full.q_cln_bind.enable(&mut region, r)?;
-                        cfg.full.q_part12.enable(&mut region, r)?;
-                        if r + 1 < lane_rows {
-                            cfg.full.q_part12_mono.enable(&mut region, r)?;
-                        }
-                        cfg.full.q_perm12_in.enable(&mut region, r)?;
-                        cfg.full.q_perm12_out.enable(&mut region, r)?;
                         if r > 0 {
                             cfg.full.q_sum.enable(&mut region, r)?;
                         }
@@ -1703,12 +1646,6 @@ impl<F: Field + Ord> Gq3DpChip<F> {
                     cfg.last.q_order.enable(&mut region, r)?;
                     cfg.last.q_contrib.enable(&mut region, r)?;
                     cfg.last.q_cln_bind.enable(&mut region, r)?;
-                    cfg.last.q_part12.enable(&mut region, r)?;
-                    if r + 1 < live_last {
-                        cfg.last.q_part12_mono.enable(&mut region, r)?;
-                    }
-                    cfg.last.q_perm12_in.enable(&mut region, r)?;
-                    cfg.last.q_perm12_out.enable(&mut region, r)?;
                     if r > 0 {
                         cfg.last.q_sum.enable(&mut region, r)?;
                     }
@@ -2527,8 +2464,8 @@ mod tests {
         assert_eq!(step[2], 0, "selectors must not grow with the lane count");
         assert_eq!(step[6], 0, "degree must not grow with the lane count");
         assert!(step[0] > 0 && step[3] > 0, "a lane must cost something");
-        // Exactly one shuffle per lane: that lane's Conservation Check
-        // (condition (7)). Per-lane is what makes it a refinement of the union
+        // Exactly one shuffle per lane: that lane's Conservation Check,
+        // condition (1). Per-lane is a refinement of the relation-level
         // statement rather than something a prover can split, so this MUST grow
         // with the lane count; what must stay true is that it grows by the same
         // amount for every lane, which the window loop below checks.
@@ -2736,37 +2673,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mock_reject_tampered_partition_flag() {
-        let lane_rows = 2;
-        let bag1_pad_extra = 5;
-        let c = lanes_for(6 + bag1_pad_extra, lane_rows);
-        let (lanes_hit, _) = clean_lane_spread(lane_rows);
-        assert!(lanes_hit.len() >= 2);
-
-        set_config_lanes(c);
-        let circuit = MyCircuit::<Fp> {
-            edges: synthetic_edges(),
-            bag1_pad_extra,
-            bag2_pad_extra: 3,
-            lane_rows,
-            num_lanes: c,
-            released_capacity: released(bag1_pad_extra),
-            tamper: Tamper::PartitionFlag,
-            _marker: PhantomData,
-        };
-        let prover = MockProver::run(11, &circuit, vec![vec![Fp::from(3u64)]]).unwrap();
-        let failures = prover
-            .verify()
-            .expect_err("a partition that does not conserve the bag was accepted");
-        assert!(
-            failures
-                .iter()
-                .any(|f| format!("{:?}", f).contains("bag1 conservation")),
-            "rejected, but not through a lane's Conservation shuffle: {:?}",
-            failures
-        );
-    }
 
     #[test]
     fn mock_reject_wrong_host_lane() {
@@ -2890,7 +2796,7 @@ mod tests {
             _ => crate::bench_queries::Privacy::Legacy,
         };
 
-        let proof_path = crate::paths::proof_file("proof_gq3_dp_lanes");
+        let proof_path = crate::paths::proof_file("proof_gq3_dp_lanes_new");
         let t_total = Instant::now();
         let run = super::run_dp_lanes(&dataset, privacy, 1, Some(&proof_path));
         let p = &run.plan;

@@ -11,6 +11,10 @@ use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
 };
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 
 const NUM_BYTES: usize = 5;
 const MAX_SENTINEL: u64 = (1u64 << (8 * NUM_BYTES)) - 1;
@@ -23,20 +27,19 @@ const PAD_DATE: u64 = MAX_SENTINEL; // biggest => last when ASC
 const PAD_TOTAL: u64 = 0; // smallest => last when DESC
 const PAD_QSUM: u64 = 0;
 
-/// Test hook, off in every benchmark path: when set, the prover moves one
-/// joinable lineitem tuple to the residual side and re-reduces the partition
-/// around it, so the partition still passes Conservation and stays a valid
-/// reduced instance, and only condition (4) can catch it. This is exactly the
-/// cheat a residual-side-only argument misses, so the negative test in this
-/// module is what shows the Cardinality Preservation Check is not vacuous.
+/// Test hook, off in every benchmark path: when set, the prover deselects one
+/// participating lineitem tuple and re-reduces around it, so the selection is
+/// still a valid reduced instance of a smaller input and only condition (3)
+/// can catch it. This is exactly the cheat a residual-side-only argument
+/// misses, so the negative test in this module is what shows the Cardinality
+/// Preservation Check is not vacuous.
 pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
-/// semijoin reduction entirely and declares every real tuple clean.
-/// Conservation still holds and both channels of condition (4) then agree on
-/// every row, so the two root sums match for free. This is exactly the escape
-/// that Pairwise Consistency has to close, and the third direction of the test
-/// in this module is what shows it does.
+/// semijoin reduction entirely and selects every row. Both channels of
+/// condition (3) then agree on every row, so the two root sums match for free.
+/// This is exactly the escape that Pairwise Consistency has to close, and the
+/// third direction of the test in this module is what shows it does.
 pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
@@ -82,7 +85,8 @@ pub struct Q18Config<F: Field + Ord> {
 
     // having: threshold < group_sum (only on last row)
     lt_thresh_sum: LtConfig<F, NUM_BYTES>,
-    heavy: Column<Advice>, // boolean on last rows (else can be 0)
+    heavy: Column<Advice>,     // boolean on last rows (else can be 0)
+    emit_flag: Column<Advice>, // is_last * heavy, materialized to hold the degree
 
     // result (padded, length = n_lineitem rows)
     res_pad: Vec<Column<Advice>>, // [c_name, c_cust, okey, date, total, sum_qty]
@@ -92,8 +96,6 @@ pub struct Q18Config<F: Field + Ord> {
     // lookups to attach attributes (only when emit=1)
     q_lookup_ord: Selector,
     q_lookup_cust: Selector,
-    q_tbl_orders: Selector,
-    q_tbl_customer: Selector,
 
     // ORDER BY proof
     q_sort: Selector,
@@ -102,25 +104,16 @@ pub struct Q18Config<F: Field + Ord> {
     iz_total_eq: IsZeroConfig<F>,
     iz_date_eq: IsZeroConfig<F>,
 
-    // ---------------- clean/residual partition ----------------
-    // condition (1): R_i == R_i^c U R_i^r, one Conservation Check per
-    // relation, widened by the clean indicator so that it binds it
-    cflag: Vec<Column<Advice>>, // per base row: [customer, orders, lineitem]
-    part_c: Vec<Column<Advice>>, // [name, custkey, flag]
-    part_o: Vec<Column<Advice>>, // [okey, custkey, date, total, flag]
-    part_l: Vec<Column<Advice>>, // [okey, qty, flag]
-    perm_cons: Vec<PermAnyConfig>, // [customer, orders, lineitem]
-    q_cln_flag: Vec<Selector>,  // rows of R^c: flag == 1
-    q_res_flag: Vec<Selector>,  // rows of R^r: flag == 0
-
-    // ---------------- Pairwise Consistency (condition (3)) ----------------
-    // pi_K(R_i^c) == pi_K(R_j^c) on every join tree edge, as two mutual
-    // membership lookups per edge between the clean sections of the two
-    // partition groups. One selector per relation, gating the clean rows: it
-    // serves as the input selector of the lookups out of that relation and as
-    // the table selector of the lookups into it, so the four lookups need no
-    // column of their own.
-    q_pw_cln: Vec<Selector>, // clean rows of [customer, orders, lineitem]
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED relation, one permutation each
+    row_idx: RowIndexConfig,
+    cons: Vec<ConserveConfig>,  // [customer, orders, lineitem]
+    cflag: Vec<Column<Advice>>, // the indicator c per committed row
+    // one complex selector per relation over its committed rows. It gates both
+    // sides of every Pairwise Consistency lookup, the table side of the two
+    // attribute lookups, and the booleanity gate; a simple selector may appear
+    // on neither side of a lookup, which is why it is complex.
+    q_row: Vec<Selector>, // [customer, orders, lineitem]
 
     // ---------------- Cardinality Preservation Check ----------------
     // condition (4): |R^c join| == |R join|, over the tree rooted at lineitem
@@ -171,8 +164,28 @@ impl<F: Field + Ord> Q18Chip<F> {
 
         let q_lookup_ord = meta.complex_selector();
         let q_lookup_cust = meta.complex_selector();
-        let q_tbl_orders = meta.complex_selector();
-        let q_tbl_customer = meta.complex_selector();
+
+        // ---------- (1) Selector Check ----------
+        // The prover supplies one bit per committed row. Selection is by
+        // position, so no row can be fabricated, dropped or placed on both
+        // sides and there is nothing for a Conservation or Non-Membership
+        // Check to compare against; the booleanity gate is the whole condition.
+        // The second half of the Selector Check, c(t)(1 - b(t)) = 0, is vacuous
+        // for Q18: it has no in-relation predicate, so b == 1 everywhere and
+        // the input channel of (3) counts the raw join, which is the same join.
+        let q_row = (0..3).map(|_| meta.complex_selector()).collect::<Vec<_>>();
+        let cflag = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        for &c in cflag.iter() {
+            meta.enable_equality(c);
+        }
+        for (idx, &c) in cflag.iter().enumerate() {
+            let q = q_row[idx];
+            meta.create_gate("selector is a bit", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+            });
+        }
 
         let q_sort = meta.selector();
 
@@ -401,13 +414,27 @@ impl<F: Field + Ord> Q18Chip<F> {
             res_sorted.clone(),
         );
 
+        // The group-end-and-heavy indicator, materialized. `iz_same_next.expr()`
+        // is degree 2, and a lookup costs `2 + input_degree + table_degree`:
+        // with the two attribute lookups' TABLE sides now gated by the selector
+        // as well as by their row selector, reading the indicator as an
+        // expression on the input side would push them past the degree this
+        // circuit already carries and double every extended-domain FFT of the
+        // prover. One advice column and one degree-4 gate keep it where it was.
+        let emit_flag = meta.advice_column();
+        meta.create_gate("emit_flag = is_last * heavy", |m| {
+            let q = m.query_selector(q_line);
+            let one = Expression::Constant(F::ONE);
+            let is_last = one - iz_same_next.expr();
+            let h = m.query_advice(heavy, Rotation::cur());
+            vec![q * (m.query_advice(emit_flag, Rotation::cur()) - is_last * h)]
+        });
+
         // emit gate: only if emit = is_last * heavy
         meta.create_gate("emit res_pad rows (pad otherwise)", |m| {
             let q = m.query_selector(q_line);
             let one = Expression::Constant(F::ONE);
-            let is_last = one.clone() - iz_same_next.expr();
-            let h = m.query_advice(heavy, Rotation::cur());
-            let emit = is_last * h;
+            let emit = m.query_advice(emit_flag, Rotation::cur());
             let not_emit = one.clone() - emit.clone();
 
             let cur_okey = m.query_advice(l_sorted[0], Rotation::cur());
@@ -442,32 +469,33 @@ impl<F: Field + Ord> Q18Chip<F> {
 
         // ---------- Tuple lookup into orders (only when emit=1) ----------
         // (o_okey, o_cust, o_date, o_total) ∈ orders
+        // The table side now spans the committed relation and is gated by the
+        // selector, so an emitted row must name a SELECTED order. A deselected
+        // row and a row past the relation both contribute the all-zero tuple,
+        // which is what a gated-off input row reads; the shift by one keeps
+        // that dummy away from any real tuple.
         meta.lookup_any("attach orders tuple", |m| {
             let q_in = m.query_selector(q_lookup_ord);
-            let q_tbl = m.query_selector(q_tbl_orders);
-
             let one = Expression::Constant(F::ONE);
-            let is_last = one.clone() - iz_same_next.expr();
-            let h = m.query_advice(heavy, Rotation::cur());
-            let emit = is_last * h;
-            let gate = q_in * emit;
+            let gate = q_in * m.query_advice(emit_flag, Rotation::cur());
+            let q_tbl = m.query_selector(q_row[1]) * m.query_advice(cflag[1], Rotation::cur());
 
             vec![
                 (
-                    gate.clone() * m.query_advice(res_pad[2], Rotation::cur()),
-                    q_tbl.clone() * m.query_advice(orders[0], Rotation::cur()),
+                    gate.clone() * (m.query_advice(res_pad[2], Rotation::cur()) + one.clone()),
+                    q_tbl.clone() * (m.query_advice(orders[0], Rotation::cur()) + one.clone()),
                 ), // okey
                 (
-                    gate.clone() * m.query_advice(res_pad[1], Rotation::cur()),
-                    q_tbl.clone() * m.query_advice(orders[1], Rotation::cur()),
+                    gate.clone() * (m.query_advice(res_pad[1], Rotation::cur()) + one.clone()),
+                    q_tbl.clone() * (m.query_advice(orders[1], Rotation::cur()) + one.clone()),
                 ), // cust
                 (
-                    gate.clone() * m.query_advice(res_pad[3], Rotation::cur()),
-                    q_tbl.clone() * m.query_advice(orders[2], Rotation::cur()),
+                    gate.clone() * (m.query_advice(res_pad[3], Rotation::cur()) + one.clone()),
+                    q_tbl.clone() * (m.query_advice(orders[2], Rotation::cur()) + one.clone()),
                 ), // date
                 (
-                    gate * m.query_advice(res_pad[4], Rotation::cur()),
-                    q_tbl * m.query_advice(orders[3], Rotation::cur()),
+                    gate * (m.query_advice(res_pad[4], Rotation::cur()) + one.clone()),
+                    q_tbl * (m.query_advice(orders[3], Rotation::cur()) + one),
                 ), // total
             ]
         });
@@ -476,22 +504,18 @@ impl<F: Field + Ord> Q18Chip<F> {
         // (c_custkey, c_name) ∈ customer
         meta.lookup_any("attach customer tuple", |m| {
             let q_in = m.query_selector(q_lookup_cust);
-            let q_tbl = m.query_selector(q_tbl_customer);
-
             let one = Expression::Constant(F::ONE);
-            let is_last = one.clone() - iz_same_next.expr();
-            let h = m.query_advice(heavy, Rotation::cur());
-            let emit = is_last * h;
-            let gate = q_in * emit;
+            let gate = q_in * m.query_advice(emit_flag, Rotation::cur());
+            let q_tbl = m.query_selector(q_row[0]) * m.query_advice(cflag[0], Rotation::cur());
 
             vec![
                 (
-                    gate.clone() * m.query_advice(res_pad[1], Rotation::cur()),
-                    q_tbl.clone() * m.query_advice(customer[1], Rotation::cur()),
+                    gate.clone() * (m.query_advice(res_pad[1], Rotation::cur()) + one.clone()),
+                    q_tbl.clone() * (m.query_advice(customer[1], Rotation::cur()) + one.clone()),
                 ), // custkey
                 (
-                    gate * m.query_advice(res_pad[0], Rotation::cur()),
-                    q_tbl * m.query_advice(customer[0], Rotation::cur()),
+                    gate * (m.query_advice(res_pad[0], Rotation::cur()) + one.clone()),
+                    q_tbl * (m.query_advice(customer[0], Rotation::cur()) + one),
                 ), // name
             ]
         });
@@ -545,107 +569,54 @@ impl<F: Field + Ord> Q18Chip<F> {
             vec![q * (total_gt + total_eq * date_le - Expression::Constant(F::ONE))]
         });
 
-        // ---------- clean/residual partition of every relation ----------
-        // q18_obj.rs partitions nothing, so condition (4) has no second side to
-        // compare against until the partition exists. One indicator column per
-        // relation on the join tree plus one Conservation Check per relation is
-        // the whole addition: the multiset equality between the base rows and
-        // the [clean rows | residual rows] block is what binds the indicator to
-        // the partition, and without it a prover could mark a residual row
-        // clean, inflate the clean channel and make (4) vacuous. Q18 has no
-        // in-relation predicate, so every base row is kept and the two blocks
-        // fill the relation's n rows exactly, with no pad block.
-        let cflag = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        for &c in cflag.iter() {
-            meta.enable_equality(c);
-        }
-        let part_c = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let part_o = (0..5).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let part_l = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        // ---------- (1) Conservation Check ----------
+        // One permutation argument per relation, between the indexed relation
+        // R^_i and the concatenation of its two parts. The indices are
+        // distinct, so R^_i is a set even though the relation is a bag, and the
+        // single permutation rules out an occurrence being fabricated, lost,
+        // duplicated or counted on both sides. No Non-Membership Check.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons: Vec<ConserveConfig> = vec![
+            configure_conserve::<F>(meta, &row_idx, &customer, cflag[0]),
+            configure_conserve::<F>(meta, &row_idx, &orders, cflag[1]),
+            configure_conserve::<F>(meta, &row_idx, &lineitem, cflag[2]),
+        ];
 
-        let mut c_base = customer.clone();
-        c_base.push(cflag[0]);
-        let mut o_base = orders.clone();
-        o_base.push(cflag[1]);
-        let mut l_base = lineitem.clone();
-        l_base.push(cflag[2]);
-
-        let mut perm_cons = Vec::new();
-        for (base, part) in [
-            (c_base, part_c.clone()),
-            (o_base, part_o.clone()),
-            (l_base, part_l.clone()),
-        ] {
-            let q_in = meta.complex_selector();
-            let q_out = meta.complex_selector();
-            perm_cons.push(PermAnyChip::configure(meta, q_in, q_out, base, part));
-        }
-
-        // partition side of the indicator: 1 on the R^c rows, 0 on the R^r rows
-        let q_cln_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..3).map(|_| meta.selector()).collect::<Vec<_>>();
-        for (idx, part) in [part_c.clone(), part_o.clone(), part_l.clone()]
-            .iter()
-            .enumerate()
-        {
-            let flag_col = *part.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
-            });
-        }
-
-        // ---------- Pairwise Consistency (condition (3)) ----------
-        // Two mutual membership lookups per join tree edge, on the shared key,
-        // each looking one clean relation's key column up directly in the
-        // adjacent clean relation's key column.
+        // ---------- (2) Pairwise Consistency ----------
+        // Two mutual Membership Checks per join tree edge, on the shared key,
+        // each looking one relation's key column up directly in the adjacent
+        // relation's key column. Both sides read
         //
-        // A partition group is laid out [clean rows | residual rows] and its
-        // tuple columns are tied to the base relation by the Conservation Check
-        // above, so the group's key column restricted to its clean prefix is
-        // exactly pi_K(R^c). These lookups read those columns, never the base
-        // relation: a lookup over the base rows would certify membership in R_j,
-        // the weaker statement q18_obj.rs already made, and not condition (3).
+        //     q_row * c(t) * (t[K] + 1),
         //
-        // An earlier version routed each direction through an intermediate
-        // advice column holding the deduplicated key set of the relation it
-        // claimed to enumerate. Nothing bound that column to the relation, so
-        // the prover could put pi_K(R_i^c) in the table R_i^c looks into and
-        // pi_K(R_j^c) in the table R_j^c looks into and satisfy both directions
-        // for an arbitrary partition, which made condition (3) vacuous. With the
-        // two columns looked up in each other there is no free advice left, and
-        // the two containments together are the set equality (3) asks for. It is
-        // also cheaper: four advice columns and four complex selectors less.
+        // so a deselected row and a row past the relation both read 0, 0 is in
+        // every table, and the containment is over the selected keys only. The
+        // shift by one stops a real key of 0 from colliding with that gated-off
+        // 0. `q18_obj.rs` read these off the clean prefix of a materialized
+        // partition block; with the split given by bits there is no block, and
+        // the selector does the gating the layout used to do.
         //
-        // Without this, condition (4) has a trivial escape: the all-clean
-        // partition satisfies Conservation and makes both channels of the
-        // Cardinality Preservation Check agree on every row, so the two root
-        // sums are equal for free. A dangling tuple left in R_i^c has no partner
-        // in the clean part of its neighbour, so the key sets on that edge
-        // differ and one of the four lookups below fails.
-        //
-        // On a row where a selector is off both sides of a lookup evaluate to 0,
-        // so 0 is always in the table and the rows outside the clean prefixes
-        // cost nothing. TPC-H custkeys and orderkeys are at least 1, so the
-        // containment is over the real keys and needs no key shift.
-        //
-        // The selectors have to be fresh complex selectors, one per relation:
-        // q_cln_flag is simple and a simple selector may appear on neither side
-        // of a lookup.
-        let q_pw_cln = (0..3).map(|_| meta.complex_selector()).collect::<Vec<_>>();
-
+        // Without this, condition (3) has a trivial escape: the all-clean
+        // selection makes both channels of the Cardinality Preservation Check
+        // agree on every row, so the two root sums are equal for free. A
+        // dangling tuple left selected has no selected partner in its
+        // neighbour, so the key sets on that edge differ and one of the four
+        // lookups below fails.
         let mut pw_edge = |name: &'static str,
                            q_in: Selector,
-                           in_col: Column<Advice>,
-                           q_t: Selector,
-                           tbl_col: Column<Advice>| {
+                           c_in: Column<Advice>,
+                           k_in: Column<Advice>,
+                           q_tb: Selector,
+                           c_tb: Column<Advice>,
+                           k_tb: Column<Advice>| {
             meta.lookup_any(name, move |m| {
-                let lhs = m.query_selector(q_in) * m.query_advice(in_col, Rotation::cur());
-                let rhs = m.query_selector(q_t) * m.query_advice(tbl_col, Rotation::cur());
+                let one = Expression::Constant(F::ONE);
+                let lhs = m.query_selector(q_in)
+                    * m.query_advice(c_in, Rotation::cur())
+                    * (m.query_advice(k_in, Rotation::cur()) + one.clone());
+                let rhs = m.query_selector(q_tb)
+                    * m.query_advice(c_tb, Rotation::cur())
+                    * (m.query_advice(k_tb, Rotation::cur()) + one);
                 vec![(lhs, rhs)]
             });
         };
@@ -653,33 +624,41 @@ impl<F: Field + Ord> Q18Chip<F> {
         // edge (orders, customer) on custkey
         pw_edge(
             "pw: o^c custkey in c^c",
-            q_pw_cln[1],
-            part_o[1],
-            q_pw_cln[0],
-            part_c[1],
+            q_row[1],
+            cflag[1],
+            orders[1],
+            q_row[0],
+            cflag[0],
+            customer[1],
         );
         pw_edge(
             "pw: c^c custkey in o^c",
-            q_pw_cln[0],
-            part_c[1],
-            q_pw_cln[1],
-            part_o[1],
+            q_row[0],
+            cflag[0],
+            customer[1],
+            q_row[1],
+            cflag[1],
+            orders[1],
         );
 
         // edge (lineitem, orders) on orderkey
         pw_edge(
             "pw: l^c orderkey in o^c",
-            q_pw_cln[2],
-            part_l[0],
-            q_pw_cln[1],
-            part_o[0],
+            q_row[2],
+            cflag[2],
+            lineitem[0],
+            q_row[1],
+            cflag[1],
+            orders[0],
         );
         pw_edge(
             "pw: o^c orderkey in l^c",
-            q_pw_cln[1],
-            part_o[0],
-            q_pw_cln[2],
-            part_l[0],
+            q_row[1],
+            cflag[1],
+            orders[0],
+            q_row[2],
+            cflag[2],
+            lineitem[0],
         );
 
         // ---------- Cardinality Preservation Check (condition (4)) ----------
@@ -787,28 +766,22 @@ impl<F: Field + Ord> Q18Chip<F> {
             iz_same_next,
             lt_thresh_sum,
             heavy,
+            emit_flag,
             res_pad,
             res_sorted,
             perm_res,
             q_lookup_ord,
             q_lookup_cust,
-            q_tbl_orders,
-            q_tbl_customer,
             q_sort,
             lt_total_next_cur,
             lt_date_cur_next,
             iz_total_eq,
             iz_date_eq,
 
+            row_idx,
+            cons,
             cflag,
-            part_c,
-            part_o,
-            part_l,
-            perm_cons,
-            q_cln_flag,
-            q_res_flag,
-
-            q_pw_cln,
+            q_row,
 
             cp_agg_c,
             cp_agg_o,
@@ -1041,35 +1014,20 @@ impl<F: Field + Ord> Q18Chip<F> {
             }
         }
 
-        // the partition side of a Conservation Check: the clean rows first,
-        // each carrying a constant 1, then the residual rows carrying 0. The
-        // return value is the block and the length of its clean prefix.
-        let split = |rows: &Vec<Vec<u64>>, flag: &Vec<u64>| -> (Vec<Vec<u64>>, usize) {
-            let mut out: Vec<Vec<u64>> = Vec::with_capacity(rows.len());
-            for (r, &f) in rows.iter().zip(flag.iter()) {
-                if f == 1 {
-                    let mut v = r.clone();
-                    v.push(1);
-                    out.push(v);
-                }
-            }
-            let n_cln = out.len();
-            for (r, &f) in rows.iter().zip(flag.iter()) {
-                if f == 0 {
-                    let mut v = r.clone();
-                    v.push(0);
-                    out.push(v);
-                }
-            }
-            (out, n_cln)
-        };
-        let part_c_rows = split(&customer_u64, &cln_c);
-        let part_o_rows = split(&orders_u64, &cln_o);
-        let part_l_rows = split(&lineitem_u64, &cln_l);
+        // The group-end-and-heavy indicator, one bit per row of the sorted view.
+        let mut emit_u64 = vec![0u64; n];
+        for i in 0..n {
+            let next_ok = if i + 1 < n {
+                l_sorted[i + 1][0]
+            } else {
+                PAD_OKEY
+            };
+            emit_u64[i] = ((next_ok != l_sorted[i][0]) && heavy_u64[i] == 1) as u64;
+        }
 
-        // Pairwise Consistency needs no witness of its own: its four lookups run
-        // between the key columns of the partition groups assigned below, gated
-        // by q_pw_cln over each group's clean prefix.
+        // Neither the Selector Check nor Pairwise Consistency needs a witness of
+        // its own: the bits ride on the committed rows and the four lookups run
+        // between the committed key columns, gated by those bits.
 
         // assign region
         layouter.assign_region(
@@ -1085,7 +1043,13 @@ impl<F: Field + Ord> Q18Chip<F> {
                             || Value::known(F::from(customer_u64[i][j])),
                         )?;
                     }
-                    self.config.q_tbl_customer.enable(&mut region, i)?;
+                    self.config.q_row[0].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "cflag customer",
+                        self.config.cflag[0],
+                        i,
+                        || Value::known(F::from(cln_c[i])),
+                    )?;
                 }
                 for i in 0..orders_u64.len() {
                     for j in 0..4 {
@@ -1096,7 +1060,13 @@ impl<F: Field + Ord> Q18Chip<F> {
                             || Value::known(F::from(orders_u64[i][j])),
                         )?;
                     }
-                    self.config.q_tbl_orders.enable(&mut region, i)?;
+                    self.config.q_row[1].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "cflag orders",
+                        self.config.cflag[1],
+                        i,
+                        || Value::known(F::from(cln_o[i])),
+                    )?;
                 }
                 for i in 0..lineitem_u64.len() {
                     for j in 0..2 {
@@ -1107,6 +1077,13 @@ impl<F: Field + Ord> Q18Chip<F> {
                             || Value::known(F::from(lineitem_u64[i][j])),
                         )?;
                     }
+                    self.config.q_row[2].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "cflag lineitem",
+                        self.config.cflag[2],
+                        i,
+                        || Value::known(F::from(cln_l[i])),
+                    )?;
                 }
 
                 // condition column (threshold) over n rows (like your Q3 condition)
@@ -1222,6 +1199,12 @@ impl<F: Field + Ord> Q18Chip<F> {
                         i,
                         || Value::known(F::from(heavy_u64[i])),
                     )?;
+                    region.assign_advice(
+                        || "emit_flag",
+                        self.config.emit_flag,
+                        i,
+                        || Value::known(F::from(emit_u64[i])),
+                    )?;
                 }
 
                 // isZero assignments
@@ -1313,79 +1296,24 @@ impl<F: Field + Ord> Q18Chip<F> {
                     )?;
                 }
 
-                // ---- Conservation Check: R_i == R_i^c U R_i^r, one per relation ----
-                // input side: the clean indicator on the base rows. Q18 has no
-                // predicate, so nothing rescales it and it is the bit the clean
-                // channel below uses directly. Partition side: the
-                // [clean | residual] block, with the indicator pinned to 1 on
-                // the first section and 0 on the second.
-                for (idx, (flag_col, flags, part_cols, part_rows, n_cln)) in [
-                    (
-                        self.config.cflag[0],
-                        &cln_c,
-                        &self.config.part_c,
-                        &part_c_rows.0,
-                        part_c_rows.1,
-                    ),
-                    (
-                        self.config.cflag[1],
-                        &cln_o,
-                        &self.config.part_o,
-                        &part_o_rows.0,
-                        part_o_rows.1,
-                    ),
-                    (
-                        self.config.cflag[2],
-                        &cln_l,
-                        &self.config.part_l,
-                        &part_l_rows.0,
-                        part_l_rows.1,
-                    ),
+                // ===================== (1) CONSERVATION CHECK =====================
+                assign_row_index(
+                    &mut region,
+                    &self.config.row_idx,
+                    customer_u64
+                        .len()
+                        .max(orders_u64.len())
+                        .max(lineitem_u64.len()),
+                )?;
+                for (idx, (rows, flags)) in [
+                    (&customer_u64, &cln_c),
+                    (&orders_u64, &cln_o),
+                    (&lineitem_u64, &cln_l),
                 ]
                 .into_iter()
                 .enumerate()
                 {
-                    for (i, &f) in flags.iter().enumerate() {
-                        region.assign_advice(
-                            || "clean indicator",
-                            flag_col,
-                            i,
-                            || Value::known(F::from(f)),
-                        )?;
-                    }
-                    for (i, row) in part_rows.iter().enumerate() {
-                        for (j, &v) in row.iter().enumerate() {
-                            region.assign_advice(
-                                || "partition",
-                                part_cols[j],
-                                i,
-                                || Value::known(F::from(v)),
-                            )?;
-                        }
-                        self.config.perm_cons[idx].q_perm1.enable(&mut region, i)?;
-                        self.config.perm_cons[idx].q_perm2.enable(&mut region, i)?;
-                    }
-                    for i in 0..n_cln {
-                        self.config.q_cln_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in n_cln..part_rows.len() {
-                        self.config.q_res_flag[idx].enable(&mut region, i)?;
-                    }
-                }
-
-                // ---- Pairwise Consistency: pi_K(R_i^c) == pi_K(R_j^c) ----
-                // One selector per relation over the clean prefix of its
-                // partition group. It is the input selector of the two lookups
-                // out of that relation and the table selector of the lookups
-                // into it, so this loop is the whole assignment the condition
-                // needs.
-                for (idx, n_cln) in [part_c_rows.1, part_o_rows.1, part_l_rows.1]
-                    .into_iter()
-                    .enumerate()
-                {
-                    for i in 0..n_cln {
-                        self.config.q_pw_cln[idx].enable(&mut region, i)?;
-                    }
+                    assign_conserve(&mut region, &self.config.cons[idx], rows, flags)?;
                 }
 
                 // ===================== CARDINALITY PRESERVATION CHECK =====================
@@ -1464,7 +1392,7 @@ impl<F: Field + Ord> Q18Chip<F> {
                 if !tamper && !all_clean {
                     debug_assert_eq!(
                         cp_all, cp_cln,
-                        "cardinality preservation: |R^c join| != |R join|"
+                        "cardinality preservation: |R^c join| != |R^p join|"
                     );
                 }
 
@@ -1719,7 +1647,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = &crate::paths::proof_file("proof_obj_q18");
+            let proof_path = &crate::paths::proof_file("proof_obj_q18_new");
             generate_and_verify_proof(k, circuit, &public_input, proof_path);
         }
     }
@@ -1744,13 +1672,13 @@ mod tests {
             cs.lookups().len(),
             cs.shuffles().len(),
         );
-        // 9 is what the Cardinality Preservation Check costs here, measured
-        // before the two HAVING gates were added and unchanged by them: both are
-        // degree 2, and the u8 lookup on the threshold limbs has a degree-2
-        // input like the Pairwise Consistency lookups. Anything added later that
-        // raises this doubles every FFT the prover runs.
+        // 8, one below the 9 of `q18_obj.rs`: the two attribute lookups keep
+        // their degree because `emit_flag` is a column rather than a degree-3
+        // expression, and the Pairwise Consistency lookups are 2 + 3 + 3.
+        // Anything added later that raises this doubles every FFT the prover
+        // runs.
         assert!(
-            cs.degree() <= 9,
+            cs.degree() <= 8,
             "the maximum gate degree rose to {}",
             cs.degree()
         );
@@ -1759,10 +1687,8 @@ mod tests {
     /// Fast correctness check of the Cardinality Preservation Check: a
     /// truncated slice of the dataset under MockProver, which verifies every
     /// gate, shuffle and lookup of the circuit without paying for a real proof.
-    #[test]
-    fn test_cardinality_preservation() {
-        let k = 15;
-
+    /// The truncated slice the fast tests share.
+    fn small_slice() -> (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<Vec<u64>>) {
         fn string_to_u64(s: &str) -> u64 {
             let mut result = 0;
             for (i, c) in s.chars().enumerate() {
@@ -1851,6 +1777,36 @@ mod tests {
             crate::paths::data_file("customer.tbl")
         );
 
+        (customer, orders, lineitem)
+    }
+
+    /// The real prover, not MockProver, on that slice. MockProver checks every
+    /// constraint but tolerates cells that are never read; this closes the gap.
+    #[test]
+    #[ignore = "real IPA proof; run explicitly to check provability"]
+    fn test_real_proof_small() {
+        let (customer, orders, lineitem) = small_slice();
+        let circuit = MyCircuit::<Fp> {
+            customer,
+            orders,
+            lineitem,
+            threshold: 300,
+            _marker: PhantomData,
+        };
+        generate_and_verify_proof(
+            16,
+            circuit,
+            &[Fp::from(1)],
+            &crate::paths::proof_file("proof_obj_q18_new_small"),
+        );
+    }
+
+    /// Fast correctness check of the three conditions under MockProver.
+    #[test]
+    fn test_cardinality_preservation() {
+        let k = 15;
+        let (customer, orders, lineitem) = small_slice();
+
         // The all-clean partition of the third direction below is only rejected
         // by Pairwise Consistency if the slice really does contain a dangling
         // tuple, and each of the four lookups sees only its own direction of its
@@ -1903,17 +1859,17 @@ mod tests {
         let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         prover.assert_satisfied();
 
-        // Negative direction: the same witness with one joinable lineitem tuple
-        // hidden in the residual side, and the partition re-reduced around it so
-        // that it is still a valid reduced instance and the Conservation Checks
-        // all still hold. Only condition (4) can see this, so the circuit must
-        // now reject.
+        // Negative direction: the same witness with one participating lineitem
+        // tuple deselected and the selection re-reduced around it, so it is
+        // still a valid reduced instance of a smaller input and the Selector
+        // Check and Pairwise Consistency both still hold. Only the Cardinality
+        // Preservation Check can see this, so the circuit must now reject.
         super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
         super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
 
-        let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
+        let failures = verdict.expect_err("condition (3) accepted a hidden joinable tuple");
         assert!(
             failures
                 .iter()
@@ -1922,21 +1878,20 @@ mod tests {
             failures
         );
 
-        // Third direction, the escape that condition (3) closes: the all-clean
-        // partition. Conservation still holds and both channels of condition (4)
-        // then compute the same number on every row, so the two root sums agree
-        // for free. Only Pairwise Consistency can see that the clean side is not
+        // Third direction, the escape Pairwise Consistency closes: select
+        // everything. Both channels of the Cardinality Preservation Check then
+        // compute the same number on every row, so the two root sums agree for
+        // free. Only Pairwise Consistency can see that the selected side is not
         // the reduced instance, and the dangling tuples counted above are what
-        // it sees. Now that the two clean key columns are looked up in each other
-        // rather than in a table the prover fills, this direction is a test of
-        // the condition itself and not of an honest table filling, so it insists
-        // that every one of the four lookups reject.
+        // it sees. The two key columns are looked up in each other rather than
+        // in a table the prover fills, so this direction tests the condition
+        // itself and insists that every one of the four lookups reject.
         super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
         let all_clean = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = all_clean.verify();
         super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
 
-        let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
+        let failures = verdict.expect_err("condition (2) accepted the all-clean selection");
         assert!(
             failures.iter().any(|f| matches!(
                 f,

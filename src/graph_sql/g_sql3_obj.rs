@@ -3,6 +3,10 @@ use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
@@ -1279,26 +1283,26 @@ pub struct TrianglePathCloserConfig<F: Field + Ord> {
     iz_t12_pad: IsZeroConfig<F>,
     iz_t3_pad: IsZeroConfig<F>,
 
-    // Conservation Check (condition (1)) per bag: the bag rows carrying the
-    // indicator are a permutation of [clean rows | residual rows | pad rows]
-    part12: Vec<Column<Advice>>, // 8: (A,B,C,i_r1,j_r2,r1_eid,r2_eid,flag)
-    part3: Vec<Column<Advice>>,  // 5: (C,A,j_r3,r3_eid,flag)
-    perm_bag1: PermAnyConfig,
-    perm_bag2: PermAnyConfig,
-    q_cln_flag: Vec<Selector>, // [bag1, bag2] rows of R^c: flag == 1
-    q_res_flag: Vec<Selector>, // [bag1, bag2] rows of R^r: flag == 0
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED bag, one permutation each. A
+    // bag laid out at a capacity simply has its padding rows in the residual
+    // part, since their indicator is zero.
+    row_idx: RowIndexConfig,
+    cons_bag1: ConserveConfig,
+    cons_bag2: ConserveConfig,
 
-    // ---------------- Pairwise Consistency (condition (3)) ----------------
-    // packed (A,C) separator key of each partition group, pinned to that
-    // group's own attribute columns
+    // ---------------- (2) Pairwise Consistency ----------------
+    // the packed (A,C) separator key of each bag, MASKED by that bag's selector
+    // bit: the shifted key on a selected row and 0 on every other row
     pk12: Column<Advice>,
     pk3: Column<Advice>,
     q_pk12: Selector,
     q_pk3: Selector,
 
-    // one complex selector per group, enabled over exactly the clean block of
-    // that group. Each one is the input selector of one direction and the table
-    // selector of the other, so no free advice is left to forge.
+    // one complex selector per bag over ALL of its rows. The clean row set the
+    // two containments range over is carried by the masked key column, not by
+    // the selector's extent, so these are a function of the public capacity
+    // alone.
     q_pw_in_12: Selector,
     q_pw_in_3: Selector,
 
@@ -1420,113 +1424,67 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             ]
         });
 
-        // Conservation Check per bag: the bag rows, carrying the bound
-        // indicator, are a permutation of [clean rows | residual rows | pad
-        // rows]. The flag is a constant 1 over the clean rows and 0 over the
-        // residual rows, so the multiset equality forces the indicator on a bag
-        // row to mark exactly the tuples that went to R^c. Without it a prover
-        // could mark a residual row clean and inflate the clean channel.
-        let part12 = (0..8).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let part3 = (0..5).map(|_| meta.advice_column()).collect::<Vec<_>>();
-
-        let q_perm12_in = meta.complex_selector();
-        let q_perm12_out = meta.complex_selector();
-        let perm_bag1 = PermAnyChip::configure(
+        // ---------------- (1) Conservation Check ----------------
+        // One permutation per bag, between the indexed bag and the
+        // concatenation of its two parts. The indices are distinct, so the
+        // indexed bag is a set even though the bag holds duplicate wedges, and
+        // the single permutation rules out an occurrence being fabricated,
+        // lost, duplicated or counted on both sides: no Non-Membership Check.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons_bag1 = configure_conserve::<F>(
             meta,
-            q_perm12_in,
-            q_perm12_out,
-            vec![
-                t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid, cln12,
-            ],
-            part12.clone(),
+            &row_idx,
+            &[t12_a, t12_b, t12_c, t12_i_r1, t12_j_r2, t12_r1_eid, t12_r2_eid],
+            cln12,
         );
+        let cons_bag2 =
+            configure_conserve::<F>(meta, &row_idx, &[t3_c, t3_a, t3_j_r3, t3_r3_eid], cln3);
 
-        let q_perm3_in = meta.complex_selector();
-        let q_perm3_out = meta.complex_selector();
-        let perm_bag2 = PermAnyChip::configure(
-            meta,
-            q_perm3_in,
-            q_perm3_out,
-            vec![t3_c, t3_a, t3_j_r3, t3_r3_eid, cln3],
-            part3.clone(),
-        );
-
-        let q_cln_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..2).map(|_| meta.selector()).collect::<Vec<_>>();
-        for (idx, part) in [part12.clone(), part3.clone()].iter().enumerate() {
-            let flag_col = *part.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
-            });
-        }
-
-        // ---------------- Pairwise Consistency (condition (3)) ----------------
+        // ---------------- (2) Pairwise Consistency ----------------
         // pi_K(Bag1^c) == pi_K(Bag2^c) on the single edge of the cluster tree,
         // the packed (A,C) separator, as two mutual Membership Checks.
         //
-        // Both sides are read off the CLEAN block of the two partition groups,
-        // rows [0, n_cln), never off the bag rows. A lookup over the bag rows
-        // would only certify membership in the whole relation R_i, which is the
-        // weaker statement the message table already makes. A group's tuple
-        // columns are tied to its bag by that group's Conservation Check and the
-        // flag gate above pins flag == 1 on rows [0, n_cln) and 0 after them, so
-        // the group's own packed key restricted to that block is exactly
-        // pi_K(R^c).
+        // Both sides read the BAG's own attribute columns now, not the clean
+        // block of a materialized partition group. Which rows the containments
+        // range over is carried by the selector bit itself: each side is a
+        // masked key `c * (A * PACK_SHIFT + C)`, the packed key on a selected
+        // row and 0 on every other row, and the lookup selector is enabled on
+        // all of the bag's rows. Node ids are SHIFT_ID-shifted, so a real
+        // packed key is at least PACK_SHIFT + 1 and 0 is unambiguously the
+        // masked-out value, which every table contains for free.
         //
-        // The key is composite, so it is packed with the same pack2 the rest of
-        // the file uses; the packed column is derived from the group's own A and
-        // C columns by one degree-2 gate rather than packed a second time by
-        // hand.
+        // Two things follow. There is no clean-prefix extent baked into a fixed
+        // column any more, so `g_sql3_obj.rs`'s note about `n_cln12` and
+        // `n_cln3` leaking |Bag1^c| and |Bag2^c| through the verifying key no
+        // longer applies: the selectors mark the bag's capacity, which is
+        // public. And the mask lives in the column rather than in the lookup
+        // expression, so both sides stay degree 2 and the constraint system
+        // stays at the degree it had.
         let pk12 = meta.advice_column();
         let pk3 = meta.advice_column();
         let q_pk12 = meta.selector();
         let q_pk3 = meta.selector();
         {
-            let p_a = part12[0];
-            let p_c = part12[2];
-            meta.create_gate("pw: bag1 partition packed key", move |m| {
+            meta.create_gate("pw: bag1 masked separator key", move |m| {
                 let q = m.query_selector(q_pk12);
-                let key = m.query_advice(p_a, Rotation::cur())
+                let key = m.query_advice(t12_a, Rotation::cur())
                     * Expression::Constant(F::from(PACK_SHIFT))
-                    + m.query_advice(p_c, Rotation::cur());
-                vec![q * (m.query_advice(pk12, Rotation::cur()) - key)]
+                    + m.query_advice(t12_c, Rotation::cur());
+                let c = m.query_advice(cln12, Rotation::cur());
+                vec![q * (m.query_advice(pk12, Rotation::cur()) - c * key)]
             });
         }
         {
-            let p_c = part3[0];
-            let p_a = part3[1];
-            meta.create_gate("pw: bag2 partition packed key", move |m| {
+            meta.create_gate("pw: bag2 masked separator key", move |m| {
                 let q = m.query_selector(q_pk3);
-                let key = m.query_advice(p_a, Rotation::cur())
+                let key = m.query_advice(t3_a, Rotation::cur())
                     * Expression::Constant(F::from(PACK_SHIFT))
-                    + m.query_advice(p_c, Rotation::cur());
-                vec![q * (m.query_advice(pk3, Rotation::cur()) - key)]
+                    + m.query_advice(t3_c, Rotation::cur());
+                let c = m.query_advice(cln3, Rotation::cur());
+                vec![q * (m.query_advice(pk3, Rotation::cur()) - c * key)]
             });
         }
 
-        // One complex selector per group, enabled over exactly the clean block
-        // [0, n_cln) of that group. Each one is the input selector of one
-        // direction and the table selector of the other, so the two containments
-        // hold between the two clean key columns themselves. An earlier version
-        // routed each direction through an intermediate advice column holding
-        // the deduplicated key set, but nothing in the circuit bound those
-        // columns to the relation they claimed to enumerate: setting each table
-        // to the key column that looks into it satisfies both lookups for an
-        // arbitrary partition, which made condition (3) vacuous. There is no
-        // free advice left here, so there is nothing to forge. The selectors
-        // must stay complex, since a simple selector may not appear in a lookup
-        // expression, so they are fresh rather than the q_cln_flag pair.
-        //
-        // A lookup input is 0 on every row where its selector is off, and the
-        // table side is 0 on those rows too, so 0 is always in the table and the
-        // gated-off rows cost nothing. Node IDs are SHIFT_ID-shifted, so a real
-        // packed key is at least PACK_SHIFT + 1 and the containment is over the
-        // real keys only.
         let q_pw_in_12 = meta.complex_selector();
         let q_pw_in_3 = meta.complex_selector();
 
@@ -1853,12 +1811,9 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
             q_cln3_bind,
             iz_t12_pad,
             iz_t3_pad,
-            part12,
-            part3,
-            perm_bag1,
-            perm_bag2,
-            q_cln_flag,
-            q_res_flag,
+            row_idx,
+            cons_bag1,
+            cons_bag2,
             pk12,
             pk3,
             q_pk12,
@@ -2036,11 +1991,9 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     cfg.q_t3_lookup.enable(&mut region, i)?;
                     cfg.q_t3_msg_in.enable(&mut region, i)?;
 
-                    // clean indicator and the input side of Bag2's Conservation
-                    // Check, both over the same rows as the bag itself
+                    // the selector bit and its binding gate, over the same
+                    // rows as the bag itself
                     cfg.q_cln3_bind.enable(&mut region, i)?;
-                    cfg.perm_bag2.q_perm1.enable(&mut region, i)?;
-                    cfg.perm_bag2.q_perm2.enable(&mut region, i)?;
                     region.assign_advice(
                         || "cln3",
                         cfg.cln3,
@@ -2141,11 +2094,9 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     cfg.q_order.enable(&mut region, i)?;
                     cfg.q_contrib.enable(&mut region, i)?;
 
-                    // clean indicator, the input side of Bag1's Conservation
-                    // Check and the two root multiplicities of condition (4)
+                    // the selector bit, its binding gate, and the two root
+                    // multiplicities of the Cardinality Preservation Check
                     cfg.q_cln12_bind.enable(&mut region, i)?;
-                    cfg.perm_bag1.q_perm1.enable(&mut region, i)?;
-                    cfg.perm_bag1.q_perm2.enable(&mut region, i)?;
                     cfg.q_cp_mu.enable(&mut region, i)?;
                     region.assign_advice(
                         || "cln12",
@@ -2311,133 +2262,59 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     )?;
                 }
 
-                // ---- Conservation Check: the partition side of both bags ----
-                // [clean rows | residual rows | pad rows]. The pad rows are the
-                // all-zero tuple the bags already pad with, and SHIFT_ID keeps 0
-                // out of the real tuples, so the two multisets agree exactly.
-                let mut part12_rows: Vec<[u64; 8]> = Vec::with_capacity(n12);
-                for i in 0..real12 {
-                    if cln12[i] == 1 {
-                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
-                        part12_rows.push([a, b, c, i_r1, j_r2, r1_eid, r2_eid, 1]);
-                    }
-                }
-                let n_cln12 = part12_rows.len();
-                for i in 0..real12 {
-                    if cln12[i] == 0 {
-                        let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
-                        part12_rows.push([a, b, c, i_r1, j_r2, r1_eid, r2_eid, 0]);
-                    }
-                }
-                let n_res12 = part12_rows.len() - n_cln12;
-                while part12_rows.len() < n12 {
-                    part12_rows.push([0u64; 8]);
-                }
+                // ===================== (1) CONSERVATION CHECK =====================
+                assign_row_index(&mut region, &cfg.row_idx, n12.max(n3))?;
+                {
+                    let rows12: Vec<Vec<u64>> = (0..n12)
+                        .map(|i| {
+                            if i < real12 {
+                                let (a, b, c, i_r1, j_r2, r1_eid, r2_eid) = t12[i];
+                                vec![a, b, c, i_r1, j_r2, r1_eid, r2_eid]
+                            } else {
+                                vec![0u64; 7]
+                            }
+                        })
+                        .collect();
+                    assign_conserve(&mut region, &cfg.cons_bag1, &rows12, &cln12)?;
 
-                let mut part3_rows: Vec<[u64; 5]> = Vec::with_capacity(n3);
-                for i in 0..real3 {
-                    if cln3[i] == 1 {
-                        let (c, a, j_r3, r3_eid) = t3[i];
-                        part3_rows.push([c, a, j_r3, r3_eid, 1]);
-                    }
-                }
-                let n_cln3 = part3_rows.len();
-                for i in 0..real3 {
-                    if cln3[i] == 0 {
-                        let (c, a, j_r3, r3_eid) = t3[i];
-                        part3_rows.push([c, a, j_r3, r3_eid, 0]);
-                    }
-                }
-                let n_res3 = part3_rows.len() - n_cln3;
-                while part3_rows.len() < n3 {
-                    part3_rows.push([0u64; 5]);
-                }
-
-                for i in 0..n12 {
-                    for j in 0..8 {
-                        region.assign_advice(
-                            || "part12",
-                            cfg.part12[j],
-                            i,
-                            || Value::known(F::from(part12_rows[i][j])),
-                        )?;
-                    }
-                }
-                for i in 0..n3 {
-                    for j in 0..5 {
-                        region.assign_advice(
-                            || "part3",
-                            cfg.part3[j],
-                            i,
-                            || Value::known(F::from(part3_rows[i][j])),
-                        )?;
-                    }
-                }
-
-                // KNOWN LIMITATION, not a per-proof soundness hole. The four
-                // block extents below are witness-derived and appear in the
-                // circuit only as selector enable ranges, i.e. as fixed columns
-                // materialized at keygen. Under the standard soundness game the
-                // vk is fixed, so a prover cannot move or shrink them; what they
-                // do cost is (i) a trusted-keygen dependency, since a vk
-                // generated from tampered data certifies nothing, and (ii)
-                // obliviousness, since n_cln12 and n_cln3 are exactly |Bag1^c|
-                // and |Bag2^c| and so leak the clean/residual ratio the paper
-                // claims never to reveal. Both need the extents to become
-                // public inputs or padded to a data-independent bound, which is
-                // an instance-vector change outside this file.
-                for i in 0..n_cln12 {
-                    cfg.q_cln_flag[0].enable(&mut region, i)?;
-                }
-                for i in n_cln12..(n_cln12 + n_res12) {
-                    cfg.q_res_flag[0].enable(&mut region, i)?;
-                }
-                for i in 0..n_cln3 {
-                    cfg.q_cln_flag[1].enable(&mut region, i)?;
-                }
-                for i in n_cln3..(n_cln3 + n_res3) {
-                    cfg.q_res_flag[1].enable(&mut region, i)?;
+                    let rows3: Vec<Vec<u64>> = (0..n3)
+                        .map(|i| {
+                            if i < real3 {
+                                let (c, a, j_r3, r3_eid) = t3[i];
+                                vec![c, a, j_r3, r3_eid]
+                            } else {
+                                vec![0u64; 4]
+                            }
+                        })
+                        .collect();
+                    assign_conserve(&mut region, &cfg.cons_bag2, &rows3, &cln3)?;
                 }
 
                 // ===================== PAIRWISE CONSISTENCY =====================
-                // condition (3): pi_K(Bag1^c) == pi_K(Bag2^c) on the packed (A,C)
-                // separator, as two mutual Membership Checks over the clean block
-                // of the two partition groups.
-                //
-                // The packed key of a group is derived from that group's own A
-                // and C columns by the gates "pw: bag1/bag2 partition packed
-                // key", enabled on every row of the group, so it is pinned on the
-                // clean rows and defined everywhere else.
+                // pi_K(Bag1^c) == pi_K(Bag2^c) on the packed (A,C) separator.
+                // Each side is the bag's own masked key column, so the row set
+                // the containments range over is the selector bit and the two
+                // lookup selectors cover the bag's whole capacity. A deselected
+                // or padding row masks to 0, which every table contains.
                 for i in 0..n12 {
                     cfg.q_pk12.enable(&mut region, i)?;
-                    region.assign_advice(
-                        || "pk12",
-                        cfg.pk12,
-                        i,
-                        || Value::known(F::from(pack2(part12_rows[i][0], part12_rows[i][2]))),
-                    )?;
+                    cfg.q_pw_in_12.enable(&mut region, i)?;
+                    let key = if cln12[i] == 1 && i < real12 {
+                        pack2(t12[i].0, t12[i].2)
+                    } else {
+                        0
+                    };
+                    region.assign_advice(|| "pk12", cfg.pk12, i, || Value::known(F::from(key)))?;
                 }
                 for i in 0..n3 {
                     cfg.q_pk3.enable(&mut region, i)?;
-                    region.assign_advice(
-                        || "pk3",
-                        cfg.pk3,
-                        i,
-                        || Value::known(F::from(pack2(part3_rows[i][1], part3_rows[i][0]))),
-                    )?;
-                }
-
-                // Rows [0, n_cln) of each group are exactly pi_K(R^c), because
-                // the flag gate pins flag == 1 there and the group's tuple
-                // columns are tied to the bag by its Conservation Check. One
-                // selector per group serves as the input selector of its own
-                // direction and as the table selector of the other, so the two
-                // containments run directly between the two clean key columns.
-                for i in 0..n_cln12 {
-                    cfg.q_pw_in_12.enable(&mut region, i)?;
-                }
-                for i in 0..n_cln3 {
                     cfg.q_pw_in_3.enable(&mut region, i)?;
+                    let key = if cln3[i] == 1 && i < real3 {
+                        pack2(t3[i].1, t3[i].0)
+                    } else {
+                        0
+                    };
+                    region.assign_advice(|| "pk3", cfg.pk3, i, || Value::known(F::from(key)))?;
                 }
 
                 // ===================== CARDINALITY PRESERVATION CHECK =====================
@@ -2733,7 +2610,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = &crate::paths::proof_file("last_proof_q3_dp");
+            let proof_path = &crate::paths::proof_file("last_proof_q3_new");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }

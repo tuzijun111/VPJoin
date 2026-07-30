@@ -1,4 +1,4 @@
-//! SCRATCH AUDIT PROBE -- standalone copy of src/graph_sql/g_sql2_obj_new.rs
+//! SCRATCH AUDIT PROBE -- standalone copy of src/graph_sql/g_sql2_obj.rs
 //! with r4 fed a DIFFERENT relation from r1..r3. Delete after use.
 #![allow(dead_code, unused_variables, unused_mut, clippy::all)]
 

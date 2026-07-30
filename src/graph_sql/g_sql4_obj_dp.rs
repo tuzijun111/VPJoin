@@ -8,6 +8,10 @@ use crate::circuits::card_preserve::{
     assign_cp_agg, build_cp_stage, configure_cp_agg, cp_gap_witness, wire_cp_edge, CpAggConfig,
     CpJoinConfig, CpStage,
 };
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve_laned, configure_row_index,
+    ConserveConfig, RowIndexConfig,
+};
 use crate::data::graph_data_processing::Edge;
 
 // One shared definition of the PAD / packing conventions, the two chips whose
@@ -289,6 +293,12 @@ struct WLaneRows<F: Field + Ord> {
     // child side of the bag tree edge over the ROLE-2 reading: per key,
     // (sum keep2, sum ceff2)
     cp: CpAggConfig<F, NUM_BYTES>,
+
+    /// condition (1) for this lane's share of W, once per ROLE. The two clean
+    /// SETS differ (a row can be role-2 clean and role-1 dangling), so the two
+    /// permutations stay separate even though they conserve the same tuples.
+    cons_role1: ConserveConfig,
+    cons_role2: ConserveConfig,
 }
 
 /// One lane: everything in [`WLaneRows`], plus one parent probe per lane, the
@@ -325,6 +335,9 @@ pub struct WLaneConfig<F: Field + Ord> {
     lt_oid: LtConfig<F, NUM_BYTES>,
 
     cp: CpAggConfig<F, NUM_BYTES>,
+
+    cons_role1: ConserveConfig,
+    cons_role2: ConserveConfig,
 
     // membership-or-gap probe of the child table, ONE PER LANE, including this
     // lane's own. Counts add across a partition, so the row's two
@@ -373,6 +386,10 @@ pub struct Gq4DpConfig<F: Field + Ord> {
     /// region per distinct u8 column, and that must not grow with the lane
     /// count.
     lane_u8: Column<Fixed>,
+
+    /// The committed row index of condition (1), pinned to the row number and
+    /// shared by every lane and both roles.
+    row_idx: RowIndexConfig,
 
     // ---------------- the lanes -------------------------------------------
     // Lanes 0..c-1 are active on the SAME rows 0..lane_rows, so one selector of
@@ -598,6 +615,7 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         in_by_dst: &IndexedViewConfig<F>,
         out_by_src: &IndexedViewConfig<F>,
         lane_u8: Column<Fixed>,
+        row_idx: &RowIndexConfig,
         sel: &WSelectors,
     ) -> WLaneRows<F> {
         let WSelectors {
@@ -605,6 +623,10 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             q_w_lookup,
             q_w_row,
             q_oid_step,
+            q_perm_in,
+            q_perm_out,
+            q_part,
+            q_part_mono,
             ..
         } = *sel;
 
@@ -776,6 +798,40 @@ impl<F: Field + Ord> Gq4DpChip<F> {
 
         let cp = configure_cp_agg::<F, NUM_BYTES>(meta, lane_u8, key2, keep2, ceff2, PAD_U64);
 
+        // ---- condition (1): this lane's share of W, once per role ----
+        // The index is LANE-LOCAL, which is enough: the lanes tile the released
+        // capacity by `lane_live_rows`, so a per-lane permutation over
+        // lane-local indices places every occurrence of that lane on exactly one
+        // side, and the union over lanes is the relation-level statement. This
+        // is the laned variant, so it is a raw `meta.shuffle` with no
+        // `enable_equality`: a copy-constrainable permutation would add a
+        // permutation column per W attribute per lane.
+        //
+        // Both roles conserve the same seven tuple columns but carry a DIFFERENT
+        // indicator, which is the point. `cflag2` is the (C,D,A) reading's clean
+        // bit and `cflag1` the (A,B,C) reading's; a row can be clean under one
+        // and dangling under the other, so one permutation cannot stand for both.
+        let cons_role1 = configure_conserve_laned::<F>(
+            meta,
+            row_idx,
+            &[w_x, w_y, w_z, w_i, w_j, w_e1, w_e2],
+            cflag1,
+            q_perm_in,
+            q_perm_out,
+            q_part,
+            q_part_mono,
+        );
+        let cons_role2 = configure_conserve_laned::<F>(
+            meta,
+            row_idx,
+            &[w_x, w_y, w_z, w_i, w_j, w_e1, w_e2],
+            cflag2,
+            q_perm_in,
+            q_perm_out,
+            q_part,
+            q_part_mono,
+        );
+
         WLaneRows {
             w_x,
             w_y,
@@ -800,6 +856,8 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             iz_oid_pad,
             lt_oid,
             cp,
+            cons_role1,
+            cons_role2,
         }
     }
 
@@ -844,6 +902,8 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             iz_oid_pad,
             lt_oid,
             cp,
+            cons_role1,
+            cons_role2,
         } = rows;
 
         let probes: Vec<CpJoinConfig<F, NUM_BYTES>> = lane_cps
@@ -996,6 +1056,8 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             iz_oid_pad,
             lt_oid,
             cp,
+            cons_role1,
+            cons_role2,
             probes,
             host,
             mu_all,
@@ -1066,6 +1128,11 @@ impl<F: Field + Ord> Gq4DpChip<F> {
 
         let lane_u8 = meta.fixed_column();
 
+        // The committed row index `l` of condition (1), shared by every lane and
+        // both roles: the lanes are replicated column-wise on the same rows, so
+        // one pinned index column serves all of them.
+        let row_idx = configure_row_index::<F>(meta);
+
         let full = WSelectors {
             q_view_tbl,
             q_w_lookup: meta.complex_selector(),
@@ -1079,6 +1146,14 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             // the last is live on rows 0..lane_rows, so one step selector drives
             // all of them.
             q_oid_step: meta.selector(),
+            // Fresh selectors rather than aliases of the ones above: the two
+            // sides of a `meta.shuffle` must be gated independently of the
+            // lookups that share this height, and four selectors per height is a
+            // constant the lane count never touches.
+            q_perm_in: meta.complex_selector(),
+            q_perm_out: meta.complex_selector(),
+            q_part: meta.selector(),
+            q_part_mono: meta.selector(),
         };
 
         let q_last_row = meta.selector();
@@ -1095,6 +1170,10 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             q_sum0: full.q_sum0,
             q_sum: q_last_sum,
             q_oid_step: q_last_step,
+            q_perm_in: meta.complex_selector(),
+            q_perm_out: meta.complex_selector(),
+            q_part: meta.selector(),
+            q_part_mono: meta.selector(),
         };
         let sel_of = |l: usize| if l + 1 == num_lanes { &last } else { &full };
 
@@ -1102,7 +1181,16 @@ impl<F: Field + Ord> Gq4DpChip<F> {
         // stage: pass 1 lays out the rows of all c lanes and their child stages,
         // pass 2 adds each lane's c probes, its host bits and its merge path.
         let stage1: Vec<WLaneRows<F>> = (0..num_lanes)
-            .map(|l| Self::configure_w_lane_rows(meta, &in_by_dst, &out_by_src, lane_u8, sel_of(l)))
+            .map(|l| {
+                Self::configure_w_lane_rows(
+                    meta,
+                    &in_by_dst,
+                    &out_by_src,
+                    lane_u8,
+                    &row_idx,
+                    sel_of(l),
+                )
+            })
             .collect();
         let lane_cps: Vec<CpAggConfig<F, NUM_BYTES>> =
             stage1.iter().map(|s| s.cp.clone()).collect();
@@ -1193,6 +1281,7 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             perm_edge_out,
             perm_edge_in,
             lane_u8,
+            row_idx,
             lanes,
             full,
             last,
@@ -1220,6 +1309,14 @@ struct WSelectors {
     q_sum0: Selector,
     q_sum: Selector,
     q_oid_step: Selector,
+    // condition (1). One set of four serves BOTH roles of EVERY lane on this
+    // height: the conserved groups all span the lane's own rows, so sharing the
+    // selectors keeps the selector count off the lane count, which is the rule
+    // the rest of this file follows. Only the `part` columns replicate.
+    q_perm_in: Selector,
+    q_perm_out: Selector,
+    q_part: Selector,
+    q_part_mono: Selector,
 }
 
 struct WWitness {
@@ -1543,6 +1640,23 @@ impl<F: Field + Ord> Gq4DpChip<F> {
             )?);
         }
 
+        // ---- condition (1), this lane's share of W, once per role ----
+        // Lane-local indices over the lane's own live rows; the lanes tile the
+        // released capacity, so their union is the relation. The two roles
+        // conserve the same tuples under their own indicator.
+        {
+            let rows: Vec<Vec<u64>> = (0..live_rows)
+                .map(|r| {
+                    let row = w.rows[base + r];
+                    vec![row[0], row[1], row[2], row[3], row[4], row[5], row[6]]
+                })
+                .collect();
+            let cln1: Vec<u64> = (0..live_rows).map(|r| w.cflag1[base + r]).collect();
+            let cln2: Vec<u64> = (0..live_rows).map(|r| w.cflag2[base + r]).collect();
+            assign_conserve(region, &lane.cons_role1, &rows, &cln1)?;
+            assign_conserve(region, &lane.cons_role2, &rows, &cln2)?;
+        }
+
         // The two ends the seam stage reads and the drain into the totals stage
         // are the cells at rows 0 and `live_rows - 1`, which in the last lane is
         // now the last row of the RELEASED capacity rather than the last row of
@@ -1852,6 +1966,15 @@ impl<F: Field + Ord> Gq4DpChip<F> {
                     w.keep2.iter().sum::<u64>(),
                     "the lane-local child tables must partition the kept role-2 multiset"
                 );
+
+                // The committed row index of condition (1), assigned ONCE over
+                // the tallest lane: every lane's permutation reads the same
+                // column on its own rows, so a lane-local index needs no more.
+                assign_row_index(
+                    &mut region,
+                    &cfg.row_idx,
+                    (0..c).map(live).max().unwrap_or(0),
+                )?;
 
                 let mut lanes_out: Vec<WLaneOut<F>> = Vec::with_capacity(c);
                 for (l, lane) in cfg.lanes.iter().enumerate() {
@@ -2877,12 +3000,14 @@ mod tests {
         );
         assert!(b[ADVICE] > 0, "a lane must cost");
         // Shuffles: the two view sorts and the two edge-conservation shuffles,
-        // plus the two a lane's child stage owns. Nothing else may shuffle, and
-        // in particular no cross-lane column group may appear.
+        // plus, per lane, the two its child stage owns and the two of condition
+        // (1), one per role. Nothing else may shuffle, and in particular no
+        // cross-lane column group may appear: the c^2 assertion above is what
+        // pins the two Conservation Checks to their own lane's rows.
         assert_eq!(
             (a[SHUF], b[SHUF], q[SHUF]),
-            (4, 2, 0),
-            "the shuffle count must be exactly 4 + 2c"
+            (4, 4, 0),
+            "the shuffle count must be exactly 4 + 4c"
         );
 
         assert!(
@@ -3005,6 +3130,33 @@ mod tests {
             failed_on(&failures, "cp: root multiplicities")
                 || failed_on(&failures, "cp: lane sums"),
             "expected the root or prefix-sum gate to reject: {:?}",
+            failures
+        );
+    }
+
+    /// Condition (1) is wired and not vacuous. The hook moves one occurrence
+    /// across the clean/residual boundary of every conserved group WITHOUT
+    /// touching the flag pattern, so the partition side still reads `1` over its
+    /// first block and `0` after it while holding a residual occurrence tagged
+    /// clean. Only a Conservation permutation can see that, so a Shuffle failure
+    /// is what proves the two per-lane, per-role checks reach the witness.
+    #[test]
+    fn mock_reject_misplaced_conserved_occurrence() {
+        let (circuit, c) = three_lane_circuit(Tamper::None);
+        set_config_lanes(c);
+
+        crate::circuits::conserve_idx::set_misplace_one_occurrence(true);
+        let tampered = MockProver::run(11, &circuit, vec![vec![Fp::from(SYNTH_CNT)]]).unwrap();
+        let verdict = tampered.verify();
+        crate::circuits::conserve_idx::set_misplace_one_occurrence(false);
+
+        let failures = verdict.expect_err("the Conservation Check accepted a misplaced occurrence");
+        report_failing_constraints("misplaced conserved occurrence", &failures);
+        assert!(
+            failures
+                .iter()
+                .any(|f| matches!(f, VerifyFailure::Shuffle { .. })),
+            "the circuit rejected, but not through a Conservation permutation: {:?}",
             failures
         );
     }

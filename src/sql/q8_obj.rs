@@ -1,26 +1,3 @@
-// Halo2 “object-style” circuit for TPC-H Query 8 (simplified):
-//
-// - We treat `o_year` as a preprocessed integer input (you said we may simplify/ignore extract()).
-// - Date filter is approximated by `o_year ∈ {1995, 1996}`.
-// - volume is computed in scaled integers: vol = l_extendedprice * (SCALE - l_discount)
-//   (both extprice and discount are expected pre-scaled by SCALE=1000).
-// - mkt_share is proved as a field fraction: share * den == num
-//   (no fixed-point conversion; ratio is still correct because both sums share the same scaling).
-//
-// Tables expected (as Vec<Vec<u64>>):
-// region   : [r_regionkey, r_name_hash]
-// nation   : [n_nationkey, n_regionkey, n_name_hash]
-// customer : [c_custkey, c_nationkey]
-// orders   : [o_orderkey, o_custkey, o_year]
-// part     : [p_partkey, p_type_hash]
-// supplier : [s_suppkey, s_nationkey]
-// lineitem : [l_orderkey, l_partkey, l_suppkey, l_extendedprice_scaled, l_discount_scaled]
-//
-// Parameter inputs:
-// - cond_nation_hash        (':1' in query)
-// - const_region_name_hash  (hash("MIDDLE EAST"))
-// - const_part_type_hash    (hash("PROMO BRUSHED COPPER"))
-
 use halo2_proofs::{halo2curves::ff::PrimeField, plonk::Expression};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
@@ -29,6 +6,10 @@ use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 use crate::circuits::card_preserve::{
     assign_cp_agg, assign_cp_join, assign_cp_root, build_cp_stage, configure_cp_agg,
     configure_cp_join, configure_cp_root, wire_cp_edge, CpAggConfig, CpJoinConfig, CpRootConfig,
+};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
 };
 
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -139,14 +120,22 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     //  lineitem]
     cflag: Vec<Column<Advice>>, // 8
 
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED relation, one permutation per
+    // node of the join tree, in the same order as `cflag`
+    row_idx: RowIndexConfig,
+    cons: Vec<ConserveConfig>, // 8
+
+    // one complex selector per node of the join tree over its committed rows,
+    // in the same order as `cflag`. It gates both sides of every lookup and the
+    // Selector Check gates; a simple selector may appear on neither side of a
+    // lookup, which is why it is complex. Its extent is |R_i|, a public size.
+    q_row: Vec<Selector>, // 8
+
     // ---------- part type filter (PROMO BRUSHED COPPER) ----------
     q_part_pred: Selector,
-    q_part_link: Selector,
     p_keep: Column<Advice>,
     iz_part_type: IsZeroConfig<F>,
-    p_filt_pad: Vec<Column<Advice>>, // 3 (the last column is keep * c)
-    p_join_pad: Vec<Column<Advice>>, // 3 ([clean | residual | pad] rows)
-    perm_part: PermAnyConfig,
     q_emit: Selector,
     q_emit_last: Selector,
 
@@ -169,25 +158,13 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     iz_year_keep: IsZeroConfig<F>,
     o_keep: Column<Advice>,       // o_keep = year_keep * o_c_keep
     q_orders_keep_gate: Selector, // enforces o_keep
-    // filtered orders table used for lineitem lookup
-    q_orders_filt_gate: Selector,
-    o_filt_pad: Vec<Column<Advice>>, // 4 (keep? [okey,oyear,ckey,c] : PAD)
-    o_join_pad: Vec<Column<Advice>>, // 4 ([clean | residual | pad]) length=orders.len()
-    perm_orders: PermAnyConfig,
 
-    // ---------- lineitem reorder: clean rows then residual then PAD ----------
-    l_join_pad: Vec<Column<Advice>>, // 6, length=lineitem.len()
-    perm_lineitem: PermAnyConfig,
-
-    // ---------- join lookups (only enabled on join prefix rows) ----------
-    q_lkp_partkey: Selector,  // l_partkey ∈ p_join_pad
-    q_tbl_partf: Selector,    // table enable for p_join_pad
-    q_lkp_orders: Selector,   // (l_orderkey, l_year) ∈ o_join_pad
-    q_tbl_ordersf: Selector,  // table enable for o_join_pad
-    q_lkp_supplier: Selector, // (l_suppkey, l_s_nationkey) ∈ supplier
+    // ---------- join lookups, over the committed relations ----------
+    q_lkp_orders: Selector,   // (l_orderkey, l_year) in the selected orders
+    q_lkp_supplier: Selector, // (l_suppkey, l_s_nationkey) in the selected suppliers
     q_tbl_supplier: Selector,
-    q_lkp_nation2: Selector, // (l_s_nationkey, l_nation_hash) ∈ nation (n2)
-    // attached on join rows
+    q_lkp_nation2: Selector, // (l_s_nationkey, l_nation_hash) in the selected nations
+    // attached on the committed lineitem rows
     l_year: Column<Advice>,
     l_s_nationkey: Column<Advice>,
     l_nation_hash: Column<Advice>,
@@ -199,7 +176,6 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     all_nations: Vec<Column<Advice>>, // 3 [year, volume, nation_hash], len=lineitem.len()
     all_nations_sorted: Vec<Column<Advice>>, // 3
     perm_all_nations: PermAnyConfig,
-    q_an_pad: Selector, // rows past the clean section carry the PAD triple
 
     // ORDER BY year ASC on all_nations_sorted
     q_sort_year: Selector,
@@ -236,45 +212,11 @@ pub struct TestCircuitConfig<F: Field + Ord> {
     q_share: Selector,
     iz_res_den: IsZeroConfig<F>,
 
-    // ---------------- Conservation Checks of the introduced partition ----------------
-    // region also gets its in-relation predicate here, r_name == MIDDLE EAST,
-    // because the input channel of condition (4) has to apply it.
+    // ---------------- region's in-relation predicate ----------------
+    // r_name == MIDDLE EAST, because the input channel of (3) has to apply it
     q_region_pred: Selector,
     r_keep: Column<Advice>,
     iz_r_keep: IsZeroConfig<F>,
-    r_filt_pad: Vec<Column<Advice>>, // 3
-    r_part_pad: Vec<Column<Advice>>, // 3
-    perm_region: PermAnyConfig,
-
-    // the relations that carry no predicate need no filt/pad link gate: their
-    // base rows plus the raw indicator are the input side of the shuffle
-    n1_part_pad: Vec<Column<Advice>>, // 4
-    perm_nation1: PermAnyConfig,
-    n2_part_pad: Vec<Column<Advice>>, // 4
-    perm_nation2: PermAnyConfig,
-    c_part_pad: Vec<Column<Advice>>, // 3
-    perm_customer: PermAnyConfig,
-    s_part_pad: Vec<Column<Advice>>, // 3
-    perm_supplier: PermAnyConfig,
-
-    // clean/residual flag on the partition side of every Conservation Check
-    q_cln_flag: Vec<Selector>, // 8, rows of R^c: flag == 1
-    q_res_flag: Vec<Selector>, // 8, rows of R^r: flag == 0
-    // the three relations whose partition group has a pad section past R^r
-    q_pad_region: Selector,
-    q_pad_orders: Selector,
-    q_pad_part: Selector,
-
-    // ---------------- Pairwise Consistency (condition (3)) ----------------
-    // Two mutual Membership Checks per join-tree edge, both over the clean
-    // sections of the two partition groups. One input selector per relation,
-    // enabled over the rows [0, n_cln) of its partition group, in the same
-    // relation order as q_cln_flag: [region, n1, n2, customer, orders, part,
-    // supplier, lineitem].
-    // The same eight selectors are also the table selectors: a direction of an
-    // edge reads the input out of one relation's clean section and the table out
-    // of the other's, so there is no separate key table and nothing to forge.
-    q_pw_in: Vec<Selector>, // 8
 
     // ---------------- Cardinality Preservation Check (condition (4)) ----------------
     // shifted copies of the two keys that can be 0
@@ -424,6 +366,53 @@ impl<F: Field + Ord> TestChip<F> {
         // tree: [region, nation as n1, nation as n2, customer, orders, part,
         // supplier, lineitem]
         let cflag = (0..8).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        for &c in cflag.iter() {
+            meta.enable_equality(c);
+        }
+
+        // ---------- (1) Conservation Check ----------
+        // One permutation argument per node of the join tree, between the
+        // indexed relation R^_i and the concatenation of its two parts. The
+        // indices are distinct, so R^_i is a set even though the relation is a
+        // bag, and the single permutation rules out an occurrence being
+        // fabricated, lost, duplicated or counted on both sides: no
+        // Non-Membership Check. `nation` appears twice in the tree, as n1 and
+        // as n2, so its rows are conserved twice, once per occurrence, each
+        // against its own indicator.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons: Vec<ConserveConfig> = vec![
+            configure_conserve::<F>(meta, &row_idx, &region, cflag[0]),
+            configure_conserve::<F>(meta, &row_idx, &nation, cflag[1]),
+            configure_conserve::<F>(meta, &row_idx, &nation, cflag[2]),
+            configure_conserve::<F>(meta, &row_idx, &customer, cflag[3]),
+            configure_conserve::<F>(meta, &row_idx, &orders, cflag[4]),
+            configure_conserve::<F>(meta, &row_idx, &part, cflag[5]),
+            configure_conserve::<F>(meta, &row_idx, &supplier, cflag[6]),
+            configure_conserve::<F>(meta, &row_idx, &lineitem, cflag[7]),
+        ];
+
+        // ---------- Selector Check, booleanity half ----------
+        // The prover supplies one bit per committed row per node of the join
+        // tree. Selection is by position, so no row can be fabricated, dropped
+        // or placed on both sides and there is nothing for a Conservation or
+        // Non-Membership Check to compare against.
+        //
+        // Booleanity used to come free: the Conservation shuffle matched each
+        // input row against a partition row whose flag column was pinned to 1
+        // or 0. With no partition it needs its own gate, and it is load-bearing,
+        // because the clean channel of the propagation multiplies by the bit at
+        // every node. The predicate half, c(t)(1 - b(t)) = 0, is written below
+        // next to each of the three predicates that exist (region, orders,
+        // part); the other five nodes have b == 1.
+        let q_row = (0..8).map(|_| meta.complex_selector()).collect::<Vec<_>>();
+        for (idx, &c) in cflag.iter().enumerate() {
+            let q = q_row[idx];
+            meta.create_gate("selector is a bit", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                vec![q * c.clone() * (Expression::Constant(F::ONE) - c)]
+            });
+        }
 
         // ---------- region membership lookup for target_rkey ----------
         let q_tbl_region = meta.complex_selector();
@@ -476,52 +465,17 @@ impl<F: Field + Ord> TestChip<F> {
             ]
         });
 
-        // filtered padded and join padded, one column wider than in q8_obj.rs:
-        // the last column carries the clean indicator, so this Conservation
-        // Check binds it
-        let p_filt_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let p_join_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        for &c in p_filt_pad.iter().chain(p_join_pad.iter()) {
-            meta.enable_equality(c);
+        // the predicate half of the Selector Check on part
+        {
+            let q = q_row[5];
+            let c = cflag[5];
+            meta.create_gate("selected part row satisfies its predicate", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                let b = m.query_advice(p_keep, Rotation::cur());
+                vec![q * c * (Expression::Constant(F::ONE) - b)]
+            });
         }
-
-        let q_perm_p1 = meta.complex_selector();
-        let q_perm_p2 = meta.complex_selector();
-        let perm_part = PermAnyChip::configure(
-            meta,
-            q_perm_p1,
-            q_perm_p2,
-            p_filt_pad.clone(),
-            p_join_pad.clone(),
-        );
-
-        // link p_filt_pad = keep? part : PAD
-        let q_part_link = meta.selector();
-        meta.create_gate("p_filt_pad = keep? part : PAD", |m| {
-            let q = m.query_selector(q_part_link);
-            let keep = m.query_advice(p_keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let dropv = one.clone() - keep.clone();
-
-            let pad0 = Expression::Constant(F::from(PAD_PKEY));
-            let pad1 = Expression::Constant(F::from(PAD_PTYPE));
-
-            let b0 = m.query_advice(part[0], Rotation::cur());
-            let b1 = m.query_advice(part[1], Rotation::cur());
-            // the indicator pads with 0, so a row dropped by the predicate is
-            // never clean and contributes to neither channel of condition (4)
-            let b2 = m.query_advice(cflag[5], Rotation::cur());
-
-            let f0 = m.query_advice(p_filt_pad[0], Rotation::cur());
-            let f1 = m.query_advice(p_filt_pad[1], Rotation::cur());
-            let f2 = m.query_advice(p_filt_pad[2], Rotation::cur());
-
-            vec![
-                q.clone() * (f0 - (keep.clone() * b0 + dropv.clone() * pad0)),
-                q.clone() * (f1 - (keep.clone() * b1 + dropv * pad1)),
-                q * (f2 - keep * b2),
-            ]
-        });
 
         // ---------- customer attach: (c_nationkey, c_regionkey) in nation ----------
         let q_tbl_nation = meta.complex_selector();
@@ -686,102 +640,50 @@ impl<F: Field + Ord> TestChip<F> {
             vec![q * (ok - yk * ck)]
         });
 
-        // filtered orders tables (okey, oyear, ckey, keep*c) for lookup. o_custkey
-        // is carried on the partition side because the orders -> customer edge of
-        // condition (3) has to read that key out of the clean section.
-        let q_orders_filt_gate = meta.selector();
-        let o_filt_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let o_join_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        for &c in o_filt_pad.iter().chain(o_join_pad.iter()) {
-            meta.enable_equality(c);
+        // the predicate half of the Selector Check on orders. `q8_obj.rs` got
+        // this structurally, from the link gate that padded the indicator away
+        // wherever `o_keep` was 0; here it is one constraint, and it is what
+        // makes the input channel of (3) count the join of the
+        // predicate-filtered relations.
+        {
+            let q = q_row[4];
+            let c = cflag[4];
+            meta.create_gate("selected orders row satisfies its predicate", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                let b = m.query_advice(o_keep, Rotation::cur());
+                vec![q * c * (Expression::Constant(F::ONE) - b)]
+            });
         }
 
-        // o_filt_pad = keep? [o_orderkey, o_year, o_custkey, c] : PAD
-        meta.create_gate("o_filt_pad = keep? order : PAD", |m| {
-            let q = m.query_selector(q_orders_filt_gate);
-            let keep = m.query_advice(o_keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let dropv = one.clone() - keep.clone();
-
-            let pad0 = Expression::Constant(F::from(PAD_OKEY));
-            let pad1 = Expression::Constant(F::from(PAD_OYEAR));
-            let pad2 = Expression::Constant(F::from(PAD_OCUST));
-
-            let b0 = m.query_advice(orders[0], Rotation::cur());
-            let b1 = m.query_advice(orders[2], Rotation::cur());
-            let b2 = m.query_advice(orders[1], Rotation::cur());
-            let b3 = m.query_advice(cflag[4], Rotation::cur());
-
-            let f0 = m.query_advice(o_filt_pad[0], Rotation::cur());
-            let f1 = m.query_advice(o_filt_pad[1], Rotation::cur());
-            let f2 = m.query_advice(o_filt_pad[2], Rotation::cur());
-            let f3 = m.query_advice(o_filt_pad[3], Rotation::cur());
-
-            vec![
-                q.clone() * (f0 - (keep.clone() * b0 + dropv.clone() * pad0)),
-                q.clone() * (f1 - (keep.clone() * b1 + dropv.clone() * pad1)),
-                q.clone() * (f2 - (keep.clone() * b2 + dropv * pad2)),
-                q * (f3 - keep * b3),
-            ]
-        });
-
-        // perm o_filt_pad -> o_join_pad
-        let q_perm_o1 = meta.complex_selector();
-        let q_perm_o2 = meta.complex_selector();
-        let perm_orders = PermAnyChip::configure(
-            meta,
-            q_perm_o1,
-            q_perm_o2,
-            o_filt_pad.clone(),
-            o_join_pad.clone(),
-        );
-
-        // ---------- lineitem permutation to l_join_pad (clean rows first) ----------
-        // One column wider than in q8_obj.rs: lineitem carries no predicate, so
-        // the raw indicator is itself the input side of this Conservation Check
-        // and the extra column of l_join_pad is its partition side.
-        let l_join_pad = (0..6).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        for &c in l_join_pad.iter() {
-            meta.enable_equality(c);
-        }
-        let mut l_base = lineitem.clone();
-        l_base.push(cflag[7]);
-        let q_perm_l1 = meta.complex_selector();
-        let q_perm_l2 = meta.complex_selector();
-        let perm_lineitem =
-            PermAnyChip::configure(meta, q_perm_l1, q_perm_l2, l_base, l_join_pad.clone());
-
-        // ---------- join lookups for lineitem join prefix ----------
-        let q_lkp_partkey = meta.complex_selector();
-        let q_tbl_partf = meta.complex_selector();
-
-        // membership: l_partkey ∈ p_join_pad[0]
-        meta.lookup_any("l.partkey in filtered part table", |m| {
-            let q_in = m.query_selector(q_lkp_partkey);
-            let q_t = m.query_selector(q_tbl_partf);
-            vec![(
-                q_in * m.query_advice(l_join_pad[1], Rotation::cur()),
-                q_t * m.query_advice(p_join_pad[0], Rotation::cur()),
-            )]
-        });
-
+        // ---------- join lookups, over the committed relations ----------
+        // Every one runs between committed columns with both sides gated by the
+        // selector: a deselected row and a row past the relation both
+        // contribute the all-zero tuple, which is what a gated-off input row
+        // reads, and the shift by one keeps that dummy away from any real
+        // tuple. `q8_obj.rs` read them off the `*_join_pad` groups, which
+        // needed a Conservation Check each to mean anything.
+        //
+        // The part membership lookup `q8_obj.rs` runs here is gone: with both
+        // sides on the committed relations it is character for character the
+        // `pw: lineitem^c partkey in part^c` lookup below.
         let q_lkp_orders = meta.complex_selector();
-        let q_tbl_ordersf = meta.complex_selector();
         let l_year = meta.advice_column();
         meta.enable_equality(l_year);
 
-        // (l_orderkey, l_year) ∈ o_join_pad
+        // (l_orderkey, l_year) in the selected orders
         meta.lookup_any("attach year from filtered orders", |m| {
-            let q_in = m.query_selector(q_lkp_orders);
-            let q_t = m.query_selector(q_tbl_ordersf);
+            let one = Expression::Constant(F::ONE);
+            let q_in = m.query_selector(q_lkp_orders) * m.query_advice(cflag[7], Rotation::cur());
+            let q_t = m.query_selector(q_row[4]) * m.query_advice(cflag[4], Rotation::cur());
             vec![
                 (
-                    q_in.clone() * m.query_advice(l_join_pad[0], Rotation::cur()),
-                    q_t.clone() * m.query_advice(o_join_pad[0], Rotation::cur()),
+                    q_in.clone() * (m.query_advice(lineitem[0], Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(orders[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    q_in * m.query_advice(l_year, Rotation::cur()),
-                    q_t * m.query_advice(o_join_pad[1], Rotation::cur()),
+                    q_in * (m.query_advice(l_year, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(orders[2], Rotation::cur()) + one),
                 ),
             ]
         });
@@ -791,18 +693,19 @@ impl<F: Field + Ord> TestChip<F> {
         let l_s_nationkey = meta.advice_column();
         meta.enable_equality(l_s_nationkey);
 
-        // (l_suppkey, l_s_nationkey) ∈ supplier
+        // (l_suppkey, l_s_nationkey) in the selected suppliers
         meta.lookup_any("attach supplier nationkey", |m| {
-            let q_in = m.query_selector(q_lkp_supplier);
-            let q_t = m.query_selector(q_tbl_supplier);
+            let one = Expression::Constant(F::ONE);
+            let q_in = m.query_selector(q_lkp_supplier) * m.query_advice(cflag[7], Rotation::cur());
+            let q_t = m.query_selector(q_row[6]) * m.query_advice(cflag[6], Rotation::cur());
             vec![
                 (
-                    q_in.clone() * m.query_advice(l_join_pad[2], Rotation::cur()),
-                    q_t.clone() * m.query_advice(supplier[0], Rotation::cur()),
+                    q_in.clone() * (m.query_advice(lineitem[2], Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(supplier[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    q_in * m.query_advice(l_s_nationkey, Rotation::cur()),
-                    q_t * m.query_advice(supplier[1], Rotation::cur()),
+                    q_in * (m.query_advice(l_s_nationkey, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(supplier[1], Rotation::cur()) + one),
                 ),
             ]
         });
@@ -811,18 +714,20 @@ impl<F: Field + Ord> TestChip<F> {
         let l_nation_hash = meta.advice_column();
         meta.enable_equality(l_nation_hash);
 
-        // (l_s_nationkey, l_nation_hash) ∈ nation (n2: supplier nation -> nation name hash)
+        // (l_s_nationkey, l_nation_hash) in the selected nations, read in the
+        // n2 role, which is the occurrence supplier hangs under
         meta.lookup_any("attach nation namehash for supplier nation", |m| {
-            let q_in = m.query_selector(q_lkp_nation2);
-            let q_t = m.query_selector(q_tbl_nation);
+            let one = Expression::Constant(F::ONE);
+            let q_in = m.query_selector(q_lkp_nation2) * m.query_advice(cflag[7], Rotation::cur());
+            let q_t = m.query_selector(q_row[2]) * m.query_advice(cflag[2], Rotation::cur());
             vec![
                 (
-                    q_in.clone() * m.query_advice(l_s_nationkey, Rotation::cur()),
-                    q_t.clone() * m.query_advice(nation[0], Rotation::cur()),
+                    q_in.clone() * (m.query_advice(l_s_nationkey, Rotation::cur()) + one.clone()),
+                    q_t.clone() * (m.query_advice(nation[0], Rotation::cur()) + one.clone()),
                 ),
                 (
-                    q_in * m.query_advice(l_nation_hash, Rotation::cur()),
-                    q_t * m.query_advice(nation[2], Rotation::cur()),
+                    q_in * (m.query_advice(l_nation_hash, Rotation::cur()) + one.clone()),
+                    q_t * (m.query_advice(nation[2], Rotation::cur()) + one),
                 ),
             ]
         });
@@ -834,8 +739,8 @@ impl<F: Field + Ord> TestChip<F> {
 
         meta.create_gate("volume = ext*(SCALE - disc)", |m| {
             let q = m.query_selector(q_volume);
-            let ext = m.query_advice(l_join_pad[3], Rotation::cur());
-            let disc = m.query_advice(l_join_pad[4], Rotation::cur());
+            let ext = m.query_advice(lineitem[3], Rotation::cur());
+            let disc = m.query_advice(lineitem[4], Rotation::cur());
             let v = m.query_advice(volume, Rotation::cur());
             let scale = Expression::Constant(F::from(SCALE));
             vec![q * (v - ext * (scale - disc))]
@@ -856,57 +761,39 @@ impl<F: Field + Ord> TestChip<F> {
             meta.enable_equality(c);
         }
 
-        // tie all_nations on join rows
-        meta.create_gate("all_nations = (year, volume, nation)", |m| {
-            let q = m.query_selector(q_volume); // same enable as join rows
+        // The all_nations triple of a SELECTED row is its attached
+        // (year, volume, nation); of a deselected row it is the canonical PAD
+        // triple. That one masked gate does the work `q8_obj.rs` split between
+        // "all_nations = (year, volume, nation)" over the join prefix and
+        // "all_nations rows past the clean section are PAD" over the
+        // complement, and it no longer depends on the clean rows being laid out
+        // first. Without a pin on the deselected rows the shuffle would carry
+        // free advice into the per-year running sums, where an injected triple
+        // with a fresh year forms its own group and one with an existing year
+        // and nation ':1' moves that year's numerator.
+        //
+        // The three attach columns and `volume` stay free on a deselected row,
+        // which is safe for the same reason as before: nothing else reads them,
+        // and the triple the shuffle carries is pinned.
+        meta.create_gate("all_nations row: selected? attached : PAD", |m| {
+            let q = m.query_selector(q_volume);
+            let c = m.query_advice(cflag[7], Rotation::cur());
+            let one = Expression::Constant(F::ONE);
+            let drop = one - c.clone();
             vec![
                 q.clone()
                     * (m.query_advice(all_nations[0], Rotation::cur())
-                        - m.query_advice(l_year, Rotation::cur())),
+                        - (c.clone() * m.query_advice(l_year, Rotation::cur())
+                            + drop.clone() * Expression::Constant(F::from(PAD_AN_YEAR)))),
                 q.clone()
                     * (m.query_advice(all_nations[1], Rotation::cur())
-                        - m.query_advice(volume, Rotation::cur())),
+                        - (c.clone() * m.query_advice(volume, Rotation::cur())
+                            + drop.clone() * Expression::Constant(F::from(PAD_AN_VOL)))),
                 q * (m.query_advice(all_nations[2], Rotation::cur())
-                    - m.query_advice(l_nation_hash, Rotation::cur())),
+                    - (c * m.query_advice(l_nation_hash, Rotation::cur())
+                        + drop * Expression::Constant(F::from(PAD_AN_NAT)))),
             ]
         });
-
-        // The gate above is the ONLY gate on all_nations, and q_volume is enabled
-        // on exactly the clean section [0, join_len) of l_join_pad. The shuffle
-        // below is enabled on every row of the group, so it carries rows
-        // [join_len, lineitem.len()) into all_nations_sorted, from where they go
-        // straight into the per-year running sums with no range check on the
-        // volume. Those rows were pure advice, so the prover could inject
-        // arbitrary (year, volume, nation) triples and forge the market share:
-        // an injected row with a fresh year forms its own group, and an injected
-        // row with an existing year and a nation equal to ':1' moves that year's
-        // numerator.
-        //
-        // Pin them to the canonical PAD triple rather than gating them out of the
-        // shuffle. The shuffle is what makes all_nations_sorted a permutation of
-        // all_nations, so restricting it to the clean prefix would let the prover
-        // simply forget real join rows, which is a weaker statement than the one
-        // the aggregate needs.
-        let q_an_pad = meta.selector();
-        {
-            let (a0, a1, a2) = (all_nations[0], all_nations[1], all_nations[2]);
-            meta.create_gate(
-                "all_nations rows past the clean section are PAD",
-                move |m| {
-                    let q = m.query_selector(q_an_pad);
-                    vec![
-                        q.clone()
-                            * (m.query_advice(a0, Rotation::cur())
-                                - Expression::Constant(F::from(PAD_AN_YEAR))),
-                        q.clone()
-                            * (m.query_advice(a1, Rotation::cur())
-                                - Expression::Constant(F::from(PAD_AN_VOL))),
-                        q * (m.query_advice(a2, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_AN_NAT))),
-                    ]
-                },
-            );
-        }
 
         // perm all_nations -> all_nations_sorted
         let q_perm_an1 = meta.complex_selector();
@@ -1215,221 +1102,52 @@ impl<F: Field + Ord> TestChip<F> {
             ]
         });
 
-        let r_filt_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let r_part_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        for &c in r_filt_pad.iter().chain(r_part_pad.iter()) {
-            meta.enable_equality(c);
-        }
-        meta.create_gate("r_filt_pad = keep? region : PAD", |m| {
-            let q = m.query_selector(q_region_pred);
-            let keep = m.query_advice(r_keep, Rotation::cur());
-            let one = Expression::Constant(F::ONE);
-            let dropv = one - keep.clone();
-
-            let pad0 = Expression::Constant(F::from(PAD_RKEY));
-            let pad1 = Expression::Constant(F::from(PAD_RNAME));
-
-            let b0 = m.query_advice(region[0], Rotation::cur());
-            let b1 = m.query_advice(region[1], Rotation::cur());
-            let b2 = m.query_advice(cflag[0], Rotation::cur());
-
-            let f0 = m.query_advice(r_filt_pad[0], Rotation::cur());
-            let f1 = m.query_advice(r_filt_pad[1], Rotation::cur());
-            let f2 = m.query_advice(r_filt_pad[2], Rotation::cur());
-
-            vec![
-                q.clone() * (f0 - (keep.clone() * b0 + dropv.clone() * pad0)),
-                q.clone() * (f1 - (keep.clone() * b1 + dropv * pad1)),
-                q * (f2 - keep * b2),
-            ]
-        });
-        let q_perm_rg1 = meta.complex_selector();
-        let q_perm_rg2 = meta.complex_selector();
-        let perm_region = PermAnyChip::configure(
-            meta,
-            q_perm_rg1,
-            q_perm_rg2,
-            r_filt_pad.clone(),
-            r_part_pad.clone(),
-        );
-
-        // nation, customer, supplier and lineitem carry no predicate, so their
-        // base rows plus the raw indicator are the input side of the shuffle and
-        // no link gate is needed: keep is 1 everywhere.
-        let n1_part_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let n2_part_pad = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let c_part_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-        let s_part_pad = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
-
-        let mut n1_base = nation.clone();
-        n1_base.push(cflag[1]);
-        let mut n2_base = nation.clone();
-        n2_base.push(cflag[2]);
-        let mut c_base = customer.clone();
-        c_base.push(cflag[3]);
-        let mut s_base = supplier.clone();
-        s_base.push(cflag[6]);
-
-        let q_perm_n11 = meta.complex_selector();
-        let q_perm_n12 = meta.complex_selector();
-        let perm_nation1 =
-            PermAnyChip::configure(meta, q_perm_n11, q_perm_n12, n1_base, n1_part_pad.clone());
-        let q_perm_n21 = meta.complex_selector();
-        let q_perm_n22 = meta.complex_selector();
-        let perm_nation2 =
-            PermAnyChip::configure(meta, q_perm_n21, q_perm_n22, n2_base, n2_part_pad.clone());
-        let q_perm_c1 = meta.complex_selector();
-        let q_perm_c2 = meta.complex_selector();
-        let perm_customer =
-            PermAnyChip::configure(meta, q_perm_c1, q_perm_c2, c_base, c_part_pad.clone());
-        let q_perm_s1 = meta.complex_selector();
-        let q_perm_s2 = meta.complex_selector();
-        let perm_supplier =
-            PermAnyChip::configure(meta, q_perm_s1, q_perm_s2, s_base, s_part_pad.clone());
-
-        // -------- partition side of the indicator: 1 on R^c rows, 0 on R^r --------
-        // Without these the prover could mark a residual row clean and inflate
-        // the clean channel of the check below.
-        let q_cln_flag = (0..8).map(|_| meta.selector()).collect::<Vec<_>>();
-        let q_res_flag = (0..8).map(|_| meta.selector()).collect::<Vec<_>>();
-
-        for (idx, part_group) in [
-            r_part_pad.clone(),
-            n1_part_pad.clone(),
-            n2_part_pad.clone(),
-            c_part_pad.clone(),
-            o_join_pad.clone(),
-            p_join_pad.clone(),
-            s_part_pad.clone(),
-            l_join_pad.clone(),
-        ]
-        .iter()
-        .enumerate()
+        // the predicate half of the Selector Check on region
         {
-            let flag_col = *part_group.last().unwrap();
-            let q_c = q_cln_flag[idx];
-            let q_r = q_res_flag[idx];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
+            let q = q_row[0];
+            let c = cflag[0];
+            meta.create_gate("selected region row satisfies its predicate", move |m| {
+                let q = m.query_selector(q);
+                let c = m.query_advice(c, Rotation::cur());
+                let b = m.query_advice(r_keep, Rotation::cur());
+                vec![q * c * (Expression::Constant(F::ONE) - b)]
             });
         }
 
-        // -------- pad section of the partition side is the canonical PAD tuple --------
-        // The two gates above cover [0, n_cln) and [n_cln, n_cln + n_res) only.
-        // For the five relations without an in-relation predicate that is the
-        // whole group, but region, orders and part drop rows, so their partition
-        // group has a third section of slack rows past the residual one, and
-        // those were free advice.
+        // ============ (2) Pairwise Consistency ============
+        // pi_K_ij(R_i^c) == pi_K_ij(R_j^c) on every edge of the join tree, as
+        // two mutual Membership Checks. Both sides read the COMMITTED key
+        // column gated by that node's selector bit:
         //
-        // The old comment claimed the shuffle pins them because the link gates
-        // pad the indicator with 0. That is wrong: the shuffle is a multiset
-        // equality with no order and no per-row copy. Nothing in the file
-        // bool-checks cflag[0], cflag[4] or cflag[5] on the base rows either --
-        // the link gates only assert f2 = keep * cflag -- so a kept row could
-        // carry an indicator of 2, its filt tuple could be absorbed by a slack
-        // slot, and one PAD tuple could move into the residual section instead.
-        // Every section size and the whole multiset still match, and that 2 then
-        // reaches the clean channel of condition (10) through r_filt_pad[2],
-        // o_filt_pad[3] or p_filt_pad[2], where the gadget applies no boolean or
-        // range check.
+        //     q_row * c(t) * (t[K] + SHIFT_ID),
         //
-        // Pinning the slack closes it and makes the indicator boolean on every
-        // kept row for free: the only slots a kept row's tuple can occupy are the
-        // ones the two gates above pin to 1 or 0. Three degree-1 gates, no advice
-        // column. The indicator on a DROPPED row stays free, which is harmless,
-        // since the link gate multiplies it by keep = 0.
-        let q_pad_region = meta.selector();
-        {
-            let (c0, c1, c2) = (r_part_pad[0], r_part_pad[1], r_part_pad[2]);
-            meta.create_gate("region partition pad rows are the PAD tuple", move |m| {
-                let q = m.query_selector(q_pad_region);
-                vec![
-                    q.clone()
-                        * (m.query_advice(c0, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_RKEY))),
-                    q.clone()
-                        * (m.query_advice(c1, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_RNAME))),
-                    q * m.query_advice(c2, Rotation::cur()),
-                ]
-            });
-        }
-        let q_pad_orders = meta.selector();
-        {
-            let (c0, c1, c2, c3) = (o_join_pad[0], o_join_pad[1], o_join_pad[2], o_join_pad[3]);
-            meta.create_gate("orders partition pad rows are the PAD tuple", move |m| {
-                let q = m.query_selector(q_pad_orders);
-                vec![
-                    q.clone()
-                        * (m.query_advice(c0, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_OKEY))),
-                    q.clone()
-                        * (m.query_advice(c1, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_OYEAR))),
-                    q.clone()
-                        * (m.query_advice(c2, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_OCUST))),
-                    q * m.query_advice(c3, Rotation::cur()),
-                ]
-            });
-        }
-        let q_pad_part = meta.selector();
-        {
-            let (c0, c1, c2) = (p_join_pad[0], p_join_pad[1], p_join_pad[2]);
-            meta.create_gate("part partition pad rows are the PAD tuple", move |m| {
-                let q = m.query_selector(q_pad_part);
-                vec![
-                    q.clone()
-                        * (m.query_advice(c0, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_PKEY))),
-                    q.clone()
-                        * (m.query_advice(c1, Rotation::cur())
-                            - Expression::Constant(F::from(PAD_PTYPE))),
-                    q * m.query_advice(c2, Rotation::cur()),
-                ]
-            });
-        }
-
-        // ============ Pairwise Consistency (condition (3)) ============
-        // pi_K_ij(R_i^c) == pi_K_ij(R_j^c) on every edge of the join tree, as two
-        // mutual Membership Checks. Both sides read the key out of the relation's
-        // partition group restricted to its clean section, which the Conservation
-        // Check above ties to the base relation, so this really is a statement
-        // about R^c and not about R.
+        // so a deselected row and a row past the relation both read 0, 0 is in
+        // every table, and the containment is over the selected keys only.
+        // n_nationkey and r_regionkey start at 0 in TPC-H, which is why the
+        // shift is there: without it a genuine key 0 would be accepted whether
+        // or not it is in R_j^c.
         //
-        // The selectors have to be complex: a simple selector may not appear in a
-        // lookup expression, so the q_cln_flag selectors of the block above cannot
-        // be reused. One per relation is enough, since every lookup out of a
-        // relation runs over the same clean row range, and the same selector then
-        // serves as the table selector of the opposite direction.
+        // `q8_obj.rs` read these off the clean prefix of a materialized
+        // partition group, which meant pi_K(R^c) only because a Conservation
+        // Check tied the group to the base rows, and which baked |R_i^c| into
+        // the fixed columns. Here the gating factor is the committed bit, the
+        // same one the propagation reads on the same rows, and the selectors
+        // mark nothing but each relation's real rows.
         //
-        // There is no intermediate key table any more. Routing each direction
-        // through a pw_tbl advice column holding the deduplicated key set left
-        // that column unbound to the relation it claimed to enumerate: a prover
-        // could store pi_K(R_i^c) in the table R_i^c looks into and pi_K(R_j^c)
-        // in the other, and both directions would pass for an arbitrary
-        // partition. Looking the two clean key columns up in each other leaves no
-        // free advice, and the two containments are the set equality.
-        let q_pw_in = (0..8).map(|_| meta.complex_selector()).collect::<Vec<_>>();
-
-        // Every key is shifted by SHIFT_ID on both sides of every lookup, which
-        // preserves the containment. A lookup_any expression is evaluated on every
-        // row of the circuit and both sides are 0 wherever their selector is off,
-        // so 0 is always a member of the table; without the shift a genuine key 0
-        // (n_nationkey and r_regionkey start at 0 in TPC-H) would be accepted
-        // whether or not it is in R_j^c.
+        // nation appears twice in the tree, as n1 under region and as n2 under
+        // supplier, so the two occurrences read the SAME committed columns
+        // through their own bits, cflag[1] and cflag[2].
         let mut pw_edge = |name: &'static str,
                            q_in: Selector,
+                           c_in: Column<Advice>,
                            key_col: Column<Advice>,
                            q_t: Selector,
+                           c_t: Column<Advice>,
                            tbl_col: Column<Advice>| {
             meta.lookup_any(name, move |m| {
-                let q_in = m.query_selector(q_in);
-                let q_t = m.query_selector(q_t);
                 let shift = Expression::Constant(F::from(SHIFT_ID));
+                let q_in = m.query_selector(q_in) * m.query_advice(c_in, Rotation::cur());
+                let q_t = m.query_selector(q_t) * m.query_advice(c_t, Rotation::cur());
                 vec![(
                     q_in * (m.query_advice(key_col, Rotation::cur()) + shift.clone()),
                     q_t * (m.query_advice(tbl_col, Rotation::cur()) + shift),
@@ -1440,113 +1158,141 @@ impl<F: Field + Ord> TestChip<F> {
         // edge lineitem -- part on l_partkey = p_partkey
         pw_edge(
             "pw: lineitem^c partkey in part^c",
-            q_pw_in[7],
-            l_join_pad[1],
-            q_pw_in[5],
-            p_join_pad[0],
+            q_row[7],
+            cflag[7],
+            lineitem[1],
+            q_row[5],
+            cflag[5],
+            part[0],
         );
         pw_edge(
             "pw: part^c partkey in lineitem^c",
-            q_pw_in[5],
-            p_join_pad[0],
-            q_pw_in[7],
-            l_join_pad[1],
+            q_row[5],
+            cflag[5],
+            part[0],
+            q_row[7],
+            cflag[7],
+            lineitem[1],
         );
 
         // edge lineitem -- orders on l_orderkey = o_orderkey
         pw_edge(
             "pw: lineitem^c orderkey in orders^c",
-            q_pw_in[7],
-            l_join_pad[0],
-            q_pw_in[4],
-            o_join_pad[0],
+            q_row[7],
+            cflag[7],
+            lineitem[0],
+            q_row[4],
+            cflag[4],
+            orders[0],
         );
         pw_edge(
             "pw: orders^c orderkey in lineitem^c",
-            q_pw_in[4],
-            o_join_pad[0],
-            q_pw_in[7],
-            l_join_pad[0],
+            q_row[4],
+            cflag[4],
+            orders[0],
+            q_row[7],
+            cflag[7],
+            lineitem[0],
         );
 
         // edge lineitem -- supplier on l_suppkey = s_suppkey
         pw_edge(
             "pw: lineitem^c suppkey in supplier^c",
-            q_pw_in[7],
-            l_join_pad[2],
-            q_pw_in[6],
-            s_part_pad[0],
+            q_row[7],
+            cflag[7],
+            lineitem[2],
+            q_row[6],
+            cflag[6],
+            supplier[0],
         );
         pw_edge(
             "pw: supplier^c suppkey in lineitem^c",
-            q_pw_in[6],
-            s_part_pad[0],
-            q_pw_in[7],
-            l_join_pad[2],
+            q_row[6],
+            cflag[6],
+            supplier[0],
+            q_row[7],
+            cflag[7],
+            lineitem[2],
         );
 
         // edge supplier -- nation as n2 on s_nationkey = n_nationkey
         pw_edge(
             "pw: supplier^c nationkey in nation2^c",
-            q_pw_in[6],
-            s_part_pad[1],
-            q_pw_in[2],
-            n2_part_pad[0],
+            q_row[6],
+            cflag[6],
+            supplier[1],
+            q_row[2],
+            cflag[2],
+            nation[0],
         );
         pw_edge(
             "pw: nation2^c nationkey in supplier^c",
-            q_pw_in[2],
-            n2_part_pad[0],
-            q_pw_in[6],
-            s_part_pad[1],
+            q_row[2],
+            cflag[2],
+            nation[0],
+            q_row[6],
+            cflag[6],
+            supplier[1],
         );
 
         // edge orders -- customer on o_custkey = c_custkey
         pw_edge(
             "pw: orders^c custkey in customer^c",
-            q_pw_in[4],
-            o_join_pad[2],
-            q_pw_in[3],
-            c_part_pad[0],
+            q_row[4],
+            cflag[4],
+            orders[1],
+            q_row[3],
+            cflag[3],
+            customer[0],
         );
         pw_edge(
             "pw: customer^c custkey in orders^c",
-            q_pw_in[3],
-            c_part_pad[0],
-            q_pw_in[4],
-            o_join_pad[2],
+            q_row[3],
+            cflag[3],
+            customer[0],
+            q_row[4],
+            cflag[4],
+            orders[1],
         );
 
         // edge customer -- nation as n1 on c_nationkey = n_nationkey
         pw_edge(
             "pw: customer^c nationkey in nation1^c",
-            q_pw_in[3],
-            c_part_pad[1],
-            q_pw_in[1],
-            n1_part_pad[0],
+            q_row[3],
+            cflag[3],
+            customer[1],
+            q_row[1],
+            cflag[1],
+            nation[0],
         );
         pw_edge(
             "pw: nation1^c nationkey in customer^c",
-            q_pw_in[1],
-            n1_part_pad[0],
-            q_pw_in[3],
-            c_part_pad[1],
+            q_row[1],
+            cflag[1],
+            nation[0],
+            q_row[3],
+            cflag[3],
+            customer[1],
         );
 
         // edge nation as n1 -- region on n_regionkey = r_regionkey
         pw_edge(
             "pw: nation1^c regionkey in region^c",
-            q_pw_in[1],
-            n1_part_pad[1],
-            q_pw_in[0],
-            r_part_pad[0],
+            q_row[1],
+            cflag[1],
+            nation[1],
+            q_row[0],
+            cflag[0],
+            region[0],
         );
         pw_edge(
             "pw: region^c regionkey in nation1^c",
-            q_pw_in[0],
-            r_part_pad[0],
-            q_pw_in[1],
-            n1_part_pad[1],
+            q_row[0],
+            cflag[0],
+            region[0],
+            q_row[1],
+            cflag[1],
+            nation[1],
         );
 
         // ============ Cardinality Preservation Check (condition (4)) ============
@@ -1625,14 +1371,8 @@ impl<F: Field + Ord> TestChip<F> {
         // ---- the branch region <- nation as n1 <- customer <- orders ----
         // region is a leaf: the input channel is its predicate bit and the clean
         // channel is the bound keep * c column of its Conservation Check.
-        let cp_agg_region = configure_cp_agg::<F, NUM_BYTES>(
-            meta,
-            cp_u8,
-            rk_shift,
-            r_keep,
-            r_filt_pad[2],
-            MAX_SENTINEL,
-        );
+        let cp_agg_region =
+            configure_cp_agg::<F, NUM_BYTES>(meta, cp_u8, rk_shift, r_keep, cflag[0], MAX_SENTINEL);
         let cp_join_region = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, n_rk_shift);
         wire_cp_edge(meta, &cp_join_region, &cp_agg_region, n_rk_shift);
 
@@ -1697,7 +1437,7 @@ impl<F: Field + Ord> TestChip<F> {
             let (mu_all, mu_cln) = (cp_mu_ord[0], cp_mu_ord[1]);
             let (s_all, s_cln) = (cp_join_cust.s_all, cp_join_cust.s_cln);
             let pred = o_keep;
-            let cln = o_filt_pad[3];
+            let cln = cflag[4];
             meta.create_gate("cp: multiplicities of orders", move |m| {
                 let q = m.query_selector(q_cp_ord);
                 vec![
@@ -1756,14 +1496,8 @@ impl<F: Field + Ord> TestChip<F> {
         wire_cp_edge(meta, &cp_join_supp, &cp_agg_supp, lineitem[2]);
 
         // ---- the part leaf ----
-        let cp_agg_part = configure_cp_agg::<F, NUM_BYTES>(
-            meta,
-            cp_u8,
-            part[0],
-            p_keep,
-            p_filt_pad[2],
-            MAX_SENTINEL,
-        );
+        let cp_agg_part =
+            configure_cp_agg::<F, NUM_BYTES>(meta, cp_u8, part[0], p_keep, cflag[5], MAX_SENTINEL);
         let cp_join_part = configure_cp_join::<F, NUM_BYTES>(meta, cp_u8, lineitem[1]);
         wire_cp_edge(meta, &cp_join_part, &cp_agg_part, lineitem[1]);
 
@@ -1826,12 +1560,12 @@ impl<F: Field + Ord> TestChip<F> {
             q_tbl_region,
             q_lkp_target_region,
 
+            row_idx,
+            cons,
+            q_row,
             q_part_pred,
             p_keep,
             iz_part_type,
-            p_filt_pad,
-            p_join_pad,
-            perm_part,
 
             q_tbl_nation,
             q_tbl_customer,
@@ -1850,18 +1584,8 @@ impl<F: Field + Ord> TestChip<F> {
             iz_year_keep,
             o_keep,
             q_orders_keep_gate,
-            q_orders_filt_gate,
-            o_filt_pad,
-            o_join_pad,
-            perm_orders,
 
-            l_join_pad,
-            perm_lineitem,
-
-            q_lkp_partkey,
-            q_tbl_partf,
             q_lkp_orders,
-            q_tbl_ordersf,
             q_lkp_supplier,
             q_tbl_supplier,
             q_lkp_nation2,
@@ -1875,7 +1599,6 @@ impl<F: Field + Ord> TestChip<F> {
             all_nations,
             all_nations_sorted,
             perm_all_nations,
-            q_an_pad,
 
             q_sort_year,
             lt_year_cur_next,
@@ -1903,7 +1626,6 @@ impl<F: Field + Ord> TestChip<F> {
 
             q_share,
             iz_res_den,
-            q_part_link,
             q_emit,
             q_emit_last,
 
@@ -1912,26 +1634,6 @@ impl<F: Field + Ord> TestChip<F> {
             q_region_pred,
             r_keep,
             iz_r_keep,
-            r_filt_pad,
-            r_part_pad,
-            perm_region,
-
-            n1_part_pad,
-            perm_nation1,
-            n2_part_pad,
-            perm_nation2,
-            c_part_pad,
-            perm_customer,
-            s_part_pad,
-            perm_supplier,
-
-            q_cln_flag,
-            q_res_flag,
-            q_pad_region,
-            q_pad_orders,
-            q_pad_part,
-
-            q_pw_in,
 
             q_nation_cp,
             q_cust_cp,
@@ -2240,85 +1942,48 @@ impl<F: Field + Ord> TestChip<F> {
 
         let ones = |n: usize| vec![1u64; n];
 
-        // part and orders keep their filter-and-pad projection, one column wider
-        let pad_p = vec![PAD_PKEY, PAD_PTYPE, 0];
-        let p_filt_pad_u64 = filt_side(&part_t, &p_keep_u64, &cln_p, &pad_p);
-        let (p_join_pad_u64, p_n_cln, p_n_res) = part_side(&part_t, &p_keep_u64, &cln_p, &pad_p);
-
-        // [o_orderkey, o_year, o_custkey]: the custkey rides along so that the
-        // orders -> customer edge of condition (3) can read it out of the clean
-        // section of this partition group.
-        let orders_proj: Vec<Vec<u64>> = orders_t.iter().map(|r| vec![r[0], r[2], r[1]]).collect();
-        let pad_o = vec![PAD_OKEY, PAD_OYEAR, PAD_OCUST, 0];
-        let o_filt_pad_u64 = filt_side(&orders_proj, &o_keep_u64, &cln_o, &pad_o);
-        let (o_join_pad_u64, o_n_cln, o_n_res) =
-            part_side(&orders_proj, &o_keep_u64, &cln_o, &pad_o);
-
-        // the relations without a predicate: every row is clean or residual, so
-        // the partition side has no pad section at all
-        let pad_r = vec![PAD_RKEY, PAD_RNAME, 0];
-        let r_filt_pad_u64 = filt_side(&region_t, &r_keep_u64, &cln_r, &pad_r);
-        let (r_part_pad_u64, r_n_cln, r_n_res) = part_side(&region_t, &r_keep_u64, &cln_r, &pad_r);
-
-        let pad_n = vec![MAX_SENTINEL, MAX_SENTINEL, MAX_SENTINEL, 0];
-        let (n1_part_pad_u64, n1_n_cln, n1_n_res) =
-            part_side(&nation_t, &ones(nation_t.len()), &cln_n1, &pad_n);
-        let (n2_part_pad_u64, n2_n_cln, n2_n_res) =
-            part_side(&nation_t, &ones(nation_t.len()), &cln_n2, &pad_n);
-
-        let pad_c = vec![MAX_SENTINEL, MAX_SENTINEL, 0];
-        let (c_part_pad_u64, c_n_cln, c_n_res) =
-            part_side(&customer_t, &ones(customer_t.len()), &cln_c, &pad_c);
-        let (s_part_pad_u64, s_n_cln, s_n_res) =
-            part_side(&supplier_t, &ones(supplier_t.len()), &cln_s, &pad_c);
-
-        // the root: l_join_pad is already laid out as [clean | residual | pad],
-        // so the clean prefix the join lookups run over IS the clean section
-        let pad_l = vec![PAD_LOKEY, PAD_LPKEY, PAD_LSKEY, PAD_LEXT, PAD_LDISC, 0];
-        let (l_join_pad_u64, join_len, _l_n_res) =
-            part_side(&lineitem_t, &ones(lineitem_t.len()), &cln_l, &pad_l);
-
-        // Pairwise Consistency needs no host-side key table: each direction looks
-        // one clean key column up directly in the adjacent clean key column, so
-        // the only witness it consumes is the partition groups already built
-        // above and the q_pw_in row ranges enabled over their clean sections.
-
-        // build all_nations (aligned to l_join_pad rows): join rows real, others PAD
-        let mut all_nations_u64: Vec<[u64; 3]> =
-            vec![[PAD_AN_YEAR, PAD_AN_VOL, PAD_AN_NAT]; lineitem_t.len()];
+        // The Selector Check and Pairwise Consistency consume no host-side
+        // witness beyond the bits themselves: the fourteen lookups run between
+        // the committed key columns, gated by those bits, and the propagation
+        // reads the same columns on the same rows. `q8_obj.rs` built eight
+        // partition groups, eight filtered views and their section boundaries
+        // here; none of that exists any more.
 
         // maps for quick attach:
         let orders_year: HashMap<u64, u64> = orders_t.iter().map(|r| (r[0], r[2])).collect();
 
-        for i in 0..join_len {
-            let r = &l_join_pad_u64[i];
-            let okey = r[0];
-            let skey = r[2];
-            let ext = r[3];
-            let disc = r[4];
+        // all_nations, on the committed lineitem rows: a selected row carries
+        // its attached (year, volume, nation), a deselected row the canonical
+        // PAD triple. The multiset is the same one `q8_obj.rs` produced from its
+        // clean prefix plus pad section, so the sorted view and every per-year
+        // sum below are unchanged; only the row a triple sits on has moved.
+        let mut all_nations_u64: Vec<[u64; 3]> =
+            vec![[PAD_AN_YEAR, PAD_AN_VOL, PAD_AN_NAT]; lineitem_t.len()];
 
-            // Under the MARK_ALL_CLEAN hook the clean section holds every lineitem
-            // row, so these attaches can miss; on the honest witness they never
-            // do, because a clean row is joinable by construction.
+        for i in 0..lineitem_t.len() {
+            if cln_l[i] != 1 {
+                continue;
+            }
+            let okey = lineitem_t[i][0];
+            let skey = lineitem_t[i][2];
+            let ext = lineitem_t[i][3];
+            let disc = lineitem_t[i][4];
+
+            // Under the MARK_ALL_CLEAN hook every lineitem row is selected, so
+            // these attaches can miss; on the honest witness they never do,
+            // because a selected row is joinable by construction.
             let year = *orders_year.get(&okey).unwrap_or(&PAD_YEAR);
             let nkey = *supp_nat.get(&skey).unwrap_or(&PAD_YEAR);
             let nname = *nat_name.get(&nkey).unwrap_or(&PAD_AN_NAT);
 
-            // Two latent host-side bugs, neither of them a soundness hole. The
-            // reduction is modulo u64::MAX rather than 2^64 or the field order,
-            // and SCALE - disc underflows if a discount ever exceeds SCALE. Both
-            // only ever break the HONEST prover: the volume gate below reads
-            // v - ext * (SCALE - disc) over the field, so a witness the reduction
-            // has mangled simply fails to satisfy it. Left alone on purpose;
-            // widening the witness type here is not a constraint change.
-            //
-            // Note also that nothing range-checks volume, run_num or run_den, so
-            // the per-year sums are field sums. That is a completeness limit of
-            // the same kind: an honest TPC-H instance never comes near the
-            // modulus, and adding 5-byte range checks on three columns would cost
-            // three more Lt tables for no soundness gain, since the volume gate
-            // already pins each summand to a product of two witnessed lineitem
-            // fields.
+            // Two latent host-side limits, neither a soundness hole. SCALE-disc
+            // underflows if a discount ever exceeds SCALE, and the product is
+            // reduced here but computed in the field by the gate. Both only ever
+            // break the HONEST prover: a witness the host mangles simply fails
+            // the volume gate. Nothing range-checks volume, run_num or run_den
+            // either, so the per-year sums are field sums; an honest TPC-H
+            // instance never comes near the modulus, and range-checking three
+            // columns would cost three Lt tables for no soundness gain.
             let vol_u64 = ((ext as u128) * ((SCALE - disc) as u128) % (u64::MAX as u128)) as u64;
 
             all_nations_u64[i] = [year, vol_u64, nname];
@@ -2448,22 +2113,7 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(region_t[i][0] + SHIFT_ID)),
                     )?;
-                    self.config.perm_region.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_region.q_perm2.enable(&mut region, i)?;
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "r_filt_pad",
-                            self.config.r_filt_pad[j],
-                            i,
-                            || Value::known(F::from(r_filt_pad_u64[i][j])),
-                        )?;
-                        region.assign_advice(
-                            || "r_part_pad",
-                            self.config.r_part_pad[j],
-                            i,
-                            || Value::known(F::from(r_part_pad_u64[i][j])),
-                        )?;
-                    }
+                    self.config.q_row[0].enable(&mut region, i)?;
                 }
 
                 for i in 0..nation_t.len() {
@@ -2521,24 +2171,8 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_n2[i])),
                     )?;
-                    self.config.perm_nation1.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_nation1.q_perm2.enable(&mut region, i)?;
-                    self.config.perm_nation2.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_nation2.q_perm2.enable(&mut region, i)?;
-                    for j in 0..4 {
-                        region.assign_advice(
-                            || "n1_part_pad",
-                            self.config.n1_part_pad[j],
-                            i,
-                            || Value::known(F::from(n1_part_pad_u64[i][j])),
-                        )?;
-                        region.assign_advice(
-                            || "n2_part_pad",
-                            self.config.n2_part_pad[j],
-                            i,
-                            || Value::known(F::from(n2_part_pad_u64[i][j])),
-                        )?;
-                    }
+                    self.config.q_row[1].enable(&mut region, i)?;
+                    self.config.q_row[2].enable(&mut region, i)?;
                 }
 
                 for i in 0..customer_t.len() {
@@ -2569,16 +2203,7 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_c[i])),
                     )?;
-                    self.config.perm_customer.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_customer.q_perm2.enable(&mut region, i)?;
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "c_part_pad",
-                            self.config.c_part_pad[j],
-                            i,
-                            || Value::known(F::from(c_part_pad_u64[i][j])),
-                        )?;
-                    }
+                    self.config.q_row[3].enable(&mut region, i)?;
                 }
 
                 for i in 0..orders_t.len() {
@@ -2645,16 +2270,7 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_s[i])),
                     )?;
-                    self.config.perm_supplier.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_supplier.q_perm2.enable(&mut region, i)?;
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "s_part_pad",
-                            self.config.s_part_pad[j],
-                            i,
-                            || Value::known(F::from(s_part_pad_u64[i][j])),
-                        )?;
-                    }
+                    self.config.q_row[6].enable(&mut region, i)?;
                 }
 
                 for i in 0..lineitem_t.len() {
@@ -2729,14 +2345,7 @@ impl<F: Field + Ord> TestChip<F> {
                 // ---- part predicate + p_keep + p_filt_pad + p_join_pad + perm selectors ----
                 for i in 0..part_t.len() {
                     self.config.q_part_pred.enable(&mut region, i)?;
-                    self.config.q_part_link.enable(&mut region, i)?;
-                    self.config.perm_part.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_part.q_perm2.enable(&mut region, i)?;
-                    self.config.q_tbl_partf.enable(&mut region, i)?;
-                    // link gate
-                    // enable part-link selector on all part rows
-                    // (we used q_part_link = selector created in configure but not stored;
-                    //  simplest: just reuse q_part_pred for iz assignment and separately assign p_filt_pad by witness.)
+                    self.config.q_row[5].enable(&mut region, i)?;
                     iz_part_chip.assign(
                         &mut region,
                         i,
@@ -2755,22 +2364,6 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_p[i])),
                     )?;
-
-                    // p_filt_pad + p_join_pad, the last column being keep * c
-                    for j in 0..3 {
-                        region.assign_advice(
-                            || "p_filt",
-                            self.config.p_filt_pad[j],
-                            i,
-                            || Value::known(F::from(p_filt_pad_u64[i][j])),
-                        )?;
-                        region.assign_advice(
-                            || "p_join",
-                            self.config.p_join_pad[j],
-                            i,
-                            || Value::known(F::from(p_join_pad_u64[i][j])),
-                        )?;
-                    }
                 }
 
                 // ---- customer attach c_regionkey, c_keep ----
@@ -2800,11 +2393,7 @@ impl<F: Field + Ord> TestChip<F> {
                     self.config.q_orders_attach_c.enable(&mut region, i)?;
                     self.config.q_orders_attach_r.enable(&mut region, i)?;
                     self.config.q_orders_keep_gate.enable(&mut region, i)?;
-                    self.config.q_orders_filt_gate.enable(&mut region, i)?;
-
-                    self.config.perm_orders.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_orders.q_perm2.enable(&mut region, i)?;
-                    self.config.q_tbl_ordersf.enable(&mut region, i)?;
+                    self.config.q_row[4].enable(&mut region, i)?;
 
                     // attached fields
                     region.assign_advice(
@@ -2854,197 +2443,127 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(cln_o[i])),
                     )?;
-
-                    // filtered orders tables, the last column being keep * c
-                    for j in 0..4 {
-                        region.assign_advice(
-                            || "o_filt",
-                            self.config.o_filt_pad[j],
-                            i,
-                            || Value::known(F::from(o_filt_pad_u64[i][j])),
-                        )?;
-                        region.assign_advice(
-                            || "o_join",
-                            self.config.o_join_pad[j],
-                            i,
-                            || Value::known(F::from(o_join_pad_u64[i][j])),
-                        )?;
-                    }
                 }
 
-                // ---- lineitem permutation to l_join_pad ----
+                // ---- the lineitem selector bit, on the committed rows ----
                 for i in 0..lineitem_t.len() {
-                    self.config.perm_lineitem.q_perm1.enable(&mut region, i)?;
-                    self.config.perm_lineitem.q_perm2.enable(&mut region, i)?;
-                    for j in 0..6 {
-                        region.assign_advice(
-                            || "l_join_pad",
-                            self.config.l_join_pad[j],
-                            i,
-                            || Value::known(F::from(l_join_pad_u64[i][j])),
-                        )?;
-                    }
+                    self.config.q_row[7].enable(&mut region, i)?;
+                    region.assign_advice(
+                        || "cflag lineitem",
+                        self.config.cflag[7],
+                        i,
+                        || Value::known(F::from(cln_l[i])),
+                    )?;
                 }
 
-                // ---- clean indicator on the partition side of every Conservation Check ----
-                // 1 on the rows of R^c, 0 on the rows of R^r; the pad rows are
-                // pinned by the shuffle itself.
-                for (idx, (n_cln, n_res)) in [
-                    (r_n_cln, r_n_res),
-                    (n1_n_cln, n1_n_res),
-                    (n2_n_cln, n2_n_res),
-                    (c_n_cln, c_n_res),
-                    (o_n_cln, o_n_res),
-                    (p_n_cln, p_n_res),
-                    (s_n_cln, s_n_res),
-                    (join_len, lineitem_t.len() - join_len),
+                // ---- (1) Conservation Check ----
+                assign_row_index(
+                    &mut region,
+                    &self.config.row_idx,
+                    [
+                        region_t.len(),
+                        nation_t.len(),
+                        customer_t.len(),
+                        orders_t.len(),
+                        part_t.len(),
+                        supplier_t.len(),
+                        lineitem_t.len(),
+                    ]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0),
+                )?;
+                for (idx, (rows, flags)) in [
+                    (&region_t, &cln_r),
+                    (&nation_t, &cln_n1),
+                    (&nation_t, &cln_n2),
+                    (&customer_t, &cln_c),
+                    (&orders_t, &cln_o),
+                    (&part_t, &cln_p),
+                    (&supplier_t, &cln_s),
+                    (&lineitem_t, &cln_l),
                 ]
-                .iter()
+                .into_iter()
                 .enumerate()
                 {
-                    for i in 0..*n_cln {
-                        self.config.q_cln_flag[idx].enable(&mut region, i)?;
-                    }
-                    for i in *n_cln..(*n_cln + *n_res) {
-                        self.config.q_res_flag[idx].enable(&mut region, i)?;
-                    }
-                    // Pairwise Consistency: the clean rows of this relation, and
-                    // only those. The same selector is the input side of every
-                    // lookup out of this relation and the table side of every
-                    // lookup into it.
-                    for i in 0..*n_cln {
-                        self.config.q_pw_in[idx].enable(&mut region, i)?;
-                    }
+                    assign_conserve(&mut region, &self.config.cons[idx], rows, flags)?;
                 }
 
-                // The three relations with an in-relation predicate are the only
-                // ones whose partition group has rows past the residual section.
-                // Pin that slack to the canonical PAD tuple, which is what
-                // part_side already writes there; without it a kept row with a
-                // non-boolean indicator can hide in the slack while a PAD tuple
-                // takes its place in the residual section, and the shuffle and
-                // every section size still agree.
-                for i in (r_n_cln + r_n_res)..region_t.len() {
-                    self.config.q_pad_region.enable(&mut region, i)?;
-                }
-                for i in (o_n_cln + o_n_res)..orders_t.len() {
-                    self.config.q_pad_orders.enable(&mut region, i)?;
-                }
-                for i in (p_n_cln + p_n_res)..part_t.len() {
-                    self.config.q_pad_part.enable(&mut region, i)?;
-                }
+                // Selector Check and Pairwise Consistency need no witness of
+                // their own beyond the bits assigned with the base rows above:
+                // the fourteen lookups run between the committed key columns,
+                // gated by those bits, and the fixed selectors mark nothing but
+                // each relation's real rows.
 
-                // ---- enable join-only selectors on prefix join_len ----
-                for i in 0..join_len {
-                    self.config.q_lkp_partkey.enable(&mut region, i)?;
+                // The join lookups and the volume gate cover every committed
+                // lineitem row now, not a clean prefix: a deselected row reads
+                // the all-zero tuple on both sides of each lookup and its
+                // all_nations triple is masked to PAD.
+                for i in 0..lineitem_t.len() {
                     self.config.q_lkp_orders.enable(&mut region, i)?;
                     self.config.q_lkp_supplier.enable(&mut region, i)?;
                     self.config.q_lkp_nation2.enable(&mut region, i)?;
                     self.config.q_volume.enable(&mut region, i)?;
                 }
 
-                // ---- assign attached fields + volume + all_nations (join rows real; others pad) ----
+                // ---- attached fields, volume and all_nations, in place ----
+                // A selected row carries its attached (year, nationkey, name),
+                // its volume and the real triple; a deselected row carries
+                // zeros in the attach columns, the volume its own gate then
+                // forces, and the canonical PAD triple, which is what the
+                // masked gate demands. `volume` and the attach columns stay
+                // free on a deselected row as far as the gate is concerned, so
+                // writing 0 there just satisfies the volume gate.
                 for i in 0..lineitem_t.len() {
-                    if i < join_len {
-                        let r = &l_join_pad_u64[i];
-                        let okey = r[0];
-                        let skey = r[2];
+                    let selected = cln_l[i] == 1;
+                    let (year, nkey, nname) = if selected {
+                        let okey = lineitem_t[i][0];
+                        let skey = lineitem_t[i][2];
                         let year = *orders_year.get(&okey).unwrap_or(&PAD_YEAR);
                         let nkey = *supp_nat.get(&skey).unwrap_or(&PAD_YEAR);
-                        let nname = *nat_name.get(&nkey).unwrap_or(&PAD_AN_NAT);
-
-                        region.assign_advice(
-                            || "l_year",
-                            self.config.l_year,
-                            i,
-                            || Value::known(F::from(year)),
-                        )?;
-                        region.assign_advice(
-                            || "l_s_nationkey",
-                            self.config.l_s_nationkey,
-                            i,
-                            || Value::known(F::from(nkey)),
-                        )?;
-                        region.assign_advice(
-                            || "l_nation_hash",
-                            self.config.l_nation_hash,
-                            i,
-                            || Value::known(F::from(nname)),
-                        )?;
-
-                        let v = all_nations_u64[i][1];
-                        region.assign_advice(
-                            || "volume",
-                            self.config.volume,
-                            i,
-                            || Value::known(F::from(v)),
-                        )?;
-
-                        region.assign_advice(
-                            || "an_year",
-                            self.config.all_nations[0],
-                            i,
-                            || Value::known(F::from(all_nations_u64[i][0])),
-                        )?;
-                        region.assign_advice(
-                            || "an_vol",
-                            self.config.all_nations[1],
-                            i,
-                            || Value::known(F::from(all_nations_u64[i][1])),
-                        )?;
-                        region.assign_advice(
-                            || "an_nat",
-                            self.config.all_nations[2],
-                            i,
-                            || Value::known(F::from(all_nations_u64[i][2])),
-                        )?;
+                        (year, nkey, *nat_name.get(&nkey).unwrap_or(&PAD_AN_NAT))
                     } else {
-                        // no join tuple on this row, so the all_nations triple is
-                        // pinned to PAD instead of being left free for the shuffle
-                        // to carry into the per-year sums
-                        self.config.q_an_pad.enable(&mut region, i)?;
-                        region.assign_advice(
-                            || "l_year",
-                            self.config.l_year,
-                            i,
-                            || Value::known(F::from(PAD_YEAR)),
-                        )?;
-                        region.assign_advice(
-                            || "l_s_nationkey",
-                            self.config.l_s_nationkey,
-                            i,
-                            || Value::known(F::from(PAD_YEAR)),
-                        )?;
-                        region.assign_advice(
-                            || "l_nation_hash",
-                            self.config.l_nation_hash,
-                            i,
-                            || Value::known(F::from(PAD_AN_NAT)),
-                        )?;
-                        region.assign_advice(
-                            || "volume",
-                            self.config.volume,
-                            i,
-                            || Value::known(F::ZERO),
-                        )?;
+                        (0, 0, 0)
+                    };
+                    // the volume gate runs on every row, so it always has to hold
+                    let vol =
+                        (lineitem_t[i][3] as u128) * ((SCALE as u128) - (lineitem_t[i][4] as u128));
+                    let an = if selected {
+                        [year, vol as u64, nname]
+                    } else {
+                        [PAD_AN_YEAR, PAD_AN_VOL, PAD_AN_NAT]
+                    };
 
+                    region.assign_advice(
+                        || "l_year",
+                        self.config.l_year,
+                        i,
+                        || Value::known(F::from(year)),
+                    )?;
+                    region.assign_advice(
+                        || "l_s_nationkey",
+                        self.config.l_s_nationkey,
+                        i,
+                        || Value::known(F::from(nkey)),
+                    )?;
+                    region.assign_advice(
+                        || "l_nation_hash",
+                        self.config.l_nation_hash,
+                        i,
+                        || Value::known(F::from(nname)),
+                    )?;
+                    region.assign_advice(
+                        || "volume",
+                        self.config.volume,
+                        i,
+                        || Value::known(F::from(vol as u64)),
+                    )?;
+                    for j in 0..3 {
                         region.assign_advice(
-                            || "an_year",
-                            self.config.all_nations[0],
+                            || "all_nations",
+                            self.config.all_nations[j],
                             i,
-                            || Value::known(F::from(PAD_AN_YEAR)),
-                        )?;
-                        region.assign_advice(
-                            || "an_vol",
-                            self.config.all_nations[1],
-                            i,
-                            || Value::known(F::from(PAD_AN_VOL)),
-                        )?;
-                        region.assign_advice(
-                            || "an_nat",
-                            self.config.all_nations[2],
-                            i,
-                            || Value::known(F::from(PAD_AN_NAT)),
+                            || Value::known(F::from(an[j])),
                         )?;
                     }
                 }
@@ -3305,13 +2824,7 @@ impl<F: Field + Ord> TestChip<F> {
 
                 // ---- region leaf: [key, pred, keep * c] ----
                 let cp_rows_r: Vec<[u64; 3]> = (0..region_t.len())
-                    .map(|i| {
-                        [
-                            region_t[i][0] + SHIFT_ID,
-                            r_keep_u64[i],
-                            r_filt_pad_u64[i][2],
-                        ]
-                    })
+                    .map(|i| [region_t[i][0] + SHIFT_ID, r_keep_u64[i], cln_r[i]])
                     .collect();
                 let cp_stage_r = build_cp_stage(&cp_rows_r, MAX_SENTINEL);
                 assign_cp_agg(
@@ -3405,7 +2918,7 @@ impl<F: Field + Ord> TestChip<F> {
                         [
                             orders_t[i][0],
                             o_keep_u64[i] * fetched_c[i].0,
-                            o_filt_pad_u64[i][3] * fetched_c[i].1,
+                            cln_o[i] * fetched_c[i].1,
                         ]
                     })
                     .collect();
@@ -3481,7 +2994,7 @@ impl<F: Field + Ord> TestChip<F> {
 
                 // ---- part leaf: [key, pred, keep * c] ----
                 let cp_rows_p: Vec<[u64; 3]> = (0..part_t.len())
-                    .map(|i| [part_t[i][0], p_keep_u64[i], p_filt_pad_u64[i][2]])
+                    .map(|i| [part_t[i][0], p_keep_u64[i], cln_p[i]])
                     .collect();
                 let cp_stage_p = build_cp_stage(&cp_rows_p, MAX_SENTINEL);
                 assign_cp_agg(
@@ -3552,8 +3065,9 @@ impl<F: Field + Ord> TestChip<F> {
                         "cardinality preservation: |R^c join| != |R join|"
                     );
                     debug_assert_eq!(
-                        cp_cln as usize, join_len,
-                        "the clean channel must count the clean lineitem rows"
+                        cp_cln as usize,
+                        cln_l.iter().filter(|&&f| f == 1).count(),
+                        "the clean channel must count the selected lineitem rows"
                     );
                 }
 
@@ -3874,7 +3388,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = &crate::paths::proof_file("proof_obj_q8");
+            let proof_path = &crate::paths::proof_file("proof_obj_q8_new");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }
@@ -3930,6 +3444,15 @@ mod tests {
             "cs.degree() = {}, max over pre-existing gates = {}, max over added gates = {}",
             degree, rest_max, added_max
         );
+        println!(
+            "COST advice={} fixed={} selectors={} gates={} lookups={} shuffles={}",
+            cs.num_advice_columns(),
+            cs.num_fixed_columns(),
+            cs.num_selectors(),
+            cs.gates().len(),
+            cs.lookups().len(),
+            cs.shuffles().len(),
+        );
         assert!(
             added_max <= rest_max,
             "an added soundness gate has degree {} against a pre-existing maximum \
@@ -3937,7 +3460,16 @@ mod tests {
             added_max,
             rest_max
         );
-        assert_eq!(degree, 7, "cs.degree() moved off its pre-fix value of 7");
+        // 8, one above the 7 of `q8_obj.rs`: gating both sides of a lookup by
+        // the selector COLUMN rather than by a selector RANGE costs one degree
+        // on each side. It buys no FFT, which is the number that matters: halo2
+        // sizes the extended domain at the next power of two above degree - 1,
+        // so 7, 8 and 9 all run on an 8x domain and only 10 doubles it.
+        assert!(
+            degree <= 9,
+            "cs.degree() rose to {}, which would double every FFT the prover runs",
+            degree
+        );
     }
 
     /// Fast correctness check of the Cardinality Preservation Check: a truncated

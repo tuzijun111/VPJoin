@@ -27,7 +27,7 @@ src/
   sql/            # TPC-H query circuits (Q3, Q5, Q8, Q9, Q18)
   graph_sql/      # Graph pattern query circuits (GQ1--GQ4)
   circuits/card_preserve.rs  # Cardinality Preservation Check
-  circuits/conserve_idx.rs   # indexed Conservation Check (revised One-Pass OBJ)
+  circuits/conserve_idx.rs   # indexed Conservation Check (One-Pass OBJ)
   data/           # TPC-H dataset files and parsing utilities
   graph_data/     # Network dataset files and parsing
   proof/          # Persisted public parameters (param15..param19) and some proof artifacts
@@ -81,30 +81,31 @@ cargo build --release
 ## Running the Benchmarks
 
 
-`VPJOIN_OBJ=new` selects the three-condition One-Pass OBJ above
-(`src/sql/*_obj_new.rs`, `src/graph_sql/*_obj_new.rs`), which is what the
-commands below measure; rows proved with it carry `+new` in the `config` column.
-Dropping the variable falls back to the earlier four-condition realization
-(`*_obj.rs`), which is kept runnable so the two can be compared at the same `k`
-on the same inputs.
+The three-condition One-Pass OBJ is the only realization each query ships.
+`src/sql/*_obj.rs` and `src/graph_sql/*_obj.rs`, and the DP-padded
+`*_obj_dp.rs` variants, all certify (7) Conservation, (9) Pairwise Consistency
+and (10) Cardinality Preservation as selector bits on the committed rows, and
+every command below proves that. The earlier four-condition circuits that
+materialized a partition are gone, so no environment variable selects between
+realizations and the `config` column no longer carries a `+new` tag.
 
 **1. VPJoin proving time**, 5 TPC-H queries plus 4 graph queries on 3 datasets without
 the database-commitment layer:
 
 ```bash
-VPJOIN_OBJ=new cargo vpjoin simplification
+cargo vpjoin simplification
 ```
 
 Cyclic queries by revealing the true join results size.
 ```bash
-VPJOIN_OBJ=new VPJOIN_PRIVACY=rjs cargo vpjoin simplification q5 gq3 gq4
+VPJOIN_PRIVACY=rjs cargo vpjoin simplification q5 gq3 gq4
 ```
 
 The same harness proves the **full** system, query circuit plus the complete
 database-commitment layer:
 
 ```bash
-VPJOIN_OBJ=new cargo vpjoin full
+cargo vpjoin full
 ```
 
 Prefix any of these with `VPJOIN_PLAN_ONLY=1` to print the planned degrees and
@@ -121,22 +122,21 @@ cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
 VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
 ```
 
-These two are the exception: `commit_diff` builds its own paired circuits
-(`inline_bind::tpch_paired` / `graph_paired`) rather than going through the
-shared query dispatch, so it measures the binding cost against the `*_obj.rs`
-circuits and ignores `VPJOIN_OBJ`. Moving it onto the revised gate needs a bound
-variant per query, not just the switch.
+`commit_diff` builds its own paired circuits (`inline_bind::tpch_paired` /
+`graph_paired`) rather than going through the shared query dispatch. The bound
+wrappers in `*_bound.rs` delegate to the `*_obj.rs` chips, so each pair is the
+One-Pass circuit with and without the binding gates, over the same circuit the
+commands above prove.
 
-**3. DP-guided padding** for the three cyclic queries. The lane geometry and every
-released capacity are the same under either realization, so the switch isolates the
-gate rather than the padding:
+**3. DP-guided padding** for the three cyclic queries. Each has one DP circuit
+(`q5_obj_dp.rs`, `g_sql3_obj_dp.rs`, `g_sql4_obj_dp.rs`), and all three realize
+the same three conditions over the lane rows, with one Conservation Check per
+lane per relation role. The lane geometry and every released capacity are set by
+the padding layer, independently of the gate:
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
 ```
-
-GQ4 runs the same circuit either way: `g_sql4_obj_dp.rs` never materialized a
-partition, so it already realizes the three conditions and has no `_new` sibling.
 
 
 **4. Scaling every table, not only `lineitem`.** `src/new_data/` holds two dataset families:
@@ -145,27 +145,27 @@ only `lineitem` and holds the dimension tables at the base size, so the pair iso
 the dimension tables cost:
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/all_scaled/60K/data       VPJOIN_LABEL=all-60K       VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/all_scaled/60K/data       VPJOIN_LABEL=all-60K       VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/all_scaled/120K/data      VPJOIN_LABEL=all-120K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/all_scaled/120K/data      VPJOIN_LABEL=all-120K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/all_scaled/240K/data      VPJOIN_LABEL=all-240K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/all_scaled/240K/data      VPJOIN_LABEL=all-240K      VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/60K/data  VPJOIN_LABEL=lineitem-60K  VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/60K/data  VPJOIN_LABEL=lineitem-60K  VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-120K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/120K/data VPJOIN_LABEL=lineitem-120K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
+VPJOIN_TABLES=$PWD/src/new_data/lineitem_scaled/240K/data VPJOIN_LABEL=lineitem-240K VPJOIN_PRIVACY=rjs cargo vpjoin simplification q3 q5 q8 q9 q18
 ```
 
 
@@ -188,18 +188,9 @@ row count.
 largest, reaches 79%). GQ3/GQ4 derive `k=17` from the capped data on their own.
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=65520 VPJOIN_K=16 cargo vpjoin simplification anchors_gq12.csv gq1:wiki gq2:wiki
+VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=65520 VPJOIN_K=16 cargo vpjoin simplification gq1:wiki gq2:wiki
 ```
 
 ```bash
-VPJOIN_OBJ=new VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=21403 cargo vpjoin simplification anchors_gq34.csv gq3:lastfm gq4:lastfm
+VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=21403 cargo vpjoin simplification gq3:lastfm gq4:lastfm
 ```
-
-Transcribe `wall_s` and `k` from the two CSVs into `dp/time_combined.py`
-(`r_gq1`..`r_gq4`) and into `dp/dp_para_gq3.py` / `dp/dp_para_gq4.py` (`rate`).
-`wall_s` rather than `prove_s`: key generation is 21-32% of the total here, and
-its commitment work also tracks the assigned rows, so it scales with a padded
-domain like the rest.
-
-Drop the `.csv` argument to print the rows without writing a file. Prefix with
-`VPJOIN_PLAN_ONLY=1` to confirm the degrees before spending the ~8 minutes.

@@ -4,6 +4,10 @@ use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
 
 use crate::chips::is_zero::{IsZeroChip, IsZeroConfig};
 use crate::chips::less_than::{LtChip, LtConfig, LtInstruction};
+use crate::circuits::conserve_idx::{
+    assign_conserve, assign_row_index, configure_conserve, configure_row_index, ConserveConfig,
+    RowIndexConfig,
+};
 use crate::chips::permutation_any::{PermAnyChip, PermAnyConfig};
 
 // IMPORTANT: use the real dataset Edge type
@@ -148,27 +152,23 @@ pub struct Path3OrdConfig<F: Field + Ord> {
     // aggregators: agg[0]=r3->T3, agg[1]=r2->T2
     agg: [AggConfig<F>; 2],
 
-    // ---------------- Cardinality Preservation Check ----------------
-    // clean indicator per base row of r1, r2, r3
+    // ---------------- (1) Conservation Check ----------------
+    // R^_i == R^_i^c U+ R^_i^r over the INDEXED relation. r1, r2 and r3 are
+    // three occurrences of ONE Edge table, so the shared rows are conserved
+    // three times, once per node, each against that node's own indicator.
+    row_idx: RowIndexConfig,
+    cons: [ConserveConfig; 3],
     cflag: [Column<Advice>; 3],
+    q_bit: Selector, // c(1-c) = 0 on all three columns
 
-    // partition side of each Conservation Check: (src, dst, flag), laid out
-    // as [R^c rows | R^r rows]
-    part: [[Column<Advice>; 3]; 3],
-    perm_cons: [PermAnyConfig; 3],
-    q_cln_flag: [Selector; 3], // rows of R^c: flag == 1
-    q_res_flag: [Selector; 3], // rows of R^r: flag == 0
+    // one complex selector per relation over its committed rows, the gate of
+    // both sides of every Pairwise Consistency lookup. A simple selector may
+    // appear on neither side of a lookup, which is why it is complex; its
+    // enabled range is |R|, a public size.
+    q_row: [Selector; 3],
 
-    // ---------------- condition (3), Pairwise Consistency ----------------
-    // one complex selector per relation, enabled over exactly the clean rows
-    // [0, |R^c|) of that relation's partition group. These are the lookup input
-    // gates, so they cannot be the simple q_cln_flag selectors above, and the
-    // same selector serves as the table gate of the opposite direction: the four
-    // lookups run between the partition key columns themselves, with no
-    // intermediate key table to forge.
-    q_pw_cln: [Selector; 3],
-
-    // the clean indicator of r1 / r2 must satisfy the query's local predicate
+    // the second half of the Selector Check: a selected r1 / r2 occurrence must
+    // satisfy the query's local predicate
     q_cln_pred: Selector,
 
     // ordering checks
@@ -859,87 +859,66 @@ impl<F: Field + Ord> Path3OrdChip<F> {
         // r1, r2, r3 are three occurrences of the same Edge table, so each gets
         // its own indicator and its own partition.
         let cflag: [Column<Advice>; 3] = std::array::from_fn(|_| meta.advice_column());
-        let part: [[Column<Advice>; 3]; 3] = std::array::from_fn(|_| {
-            [
-                meta.advice_column(),
-                meta.advice_column(),
-                meta.advice_column(),
-            ]
-        });
-        let perm_cons: [PermAnyConfig; 3] = std::array::from_fn(|i| {
-            let q_in = meta.complex_selector();
-            let q_out = meta.complex_selector();
-            PermAnyChip::configure(
-                meta,
-                q_in,
-                q_out,
-                vec![r[i][0], r[i][1], cflag[i]],
-                part[i].to_vec(),
-            )
-        });
-        let q_cln_flag: [Selector; 3] = std::array::from_fn(|_| meta.selector());
-        let q_res_flag: [Selector; 3] = std::array::from_fn(|_| meta.selector());
-        for i in 0..3 {
-            let q_c = q_cln_flag[i];
-            let q_r = q_res_flag[i];
-            let flag_col = part[i][2];
-            meta.create_gate("clean indicator on the partition side", move |m| {
-                let qc = m.query_selector(q_c);
-                let qr = m.query_selector(q_r);
-                let f = m.query_advice(flag_col, Rotation::cur());
-                vec![qc * (f.clone() - Expression::Constant(F::ONE)), qr * f]
+        let q_row: [Selector; 3] = std::array::from_fn(|_| meta.complex_selector());
+
+        // ---------------- (1) Conservation Check ----------------
+        // One permutation per node, between the indexed relation R^_i and the
+        // concatenation of its two parts. The indices are distinct, so R^_i is
+        // a set even though Edge is a bag, and the single permutation rules out
+        // an occurrence being fabricated, lost, duplicated or counted on both
+        // sides: no Non-Membership Check.
+        let row_idx = configure_row_index::<F>(meta);
+        let cons: [ConserveConfig; 3] =
+            std::array::from_fn(|i| configure_conserve::<F>(meta, &row_idx, &r[i], cflag[i]));
+
+        // Booleanity is a gate here rather than a consequence of a shuffle.
+        // `g_sql1_obj.rs` got it for free: the Conservation Check matched each
+        // base row against a partition row whose flag column was pinned to 1 or
+        // 0, so the multiset equality forced the base indicator into {0, 1}.
+        // With no partition to match against, the bit needs its own constraint,
+        // and it needs one: the clean channel of the propagation multiplies by
+        // `c` at every node, so a `c` of 7 would scale that node's clean
+        // multiplicity by 7 and let the root equality absorb a real deficit.
+        let q_bit = meta.selector();
+        {
+            let cf = cflag;
+            meta.create_gate("selector is a bit", move |m| {
+                let q = m.query_selector(q_bit);
+                let one = Expression::Constant(F::ONE);
+                cf.iter()
+                    .map(|&c| {
+                        let c = m.query_advice(c, Rotation::cur());
+                        q.clone() * c.clone() * (one.clone() - c)
+                    })
+                    .collect::<Vec<_>>()
             });
         }
 
-        // ---------------- Pairwise Consistency, condition (3) ----------------
+        // ---------------- (2) Pairwise Consistency ----------------
         // pi_K_ij(R_i^c) == pi_K_ij(R_j^c) on every join-tree edge, as two
-        // mutual Membership Checks per edge over the CLEAN sections of the two
-        // partition groups. Conservation already ties those tuples to the base
-        // relation, so part[i][key] restricted to rows [0, |R_i^c|) is exactly
-        // pi_K(R_i^c); reading the base column r[i][key] instead would only
-        // prove membership in R_i, which is not condition (3).
+        // mutual Membership Checks per edge. `g_sql1_obj.rs` read these off the
+        // clean prefix of a materialized partition group, which only meant
+        // pi_K(R^c) because a Conservation Check tied the group to the base
+        // rows. Here the split IS the bit column, so the lookups read the
+        // committed key columns directly and the bit does the gating.
         //
-        // The input gates are fresh COMPLEX selectors: a simple selector may not
-        // appear in a lookup expression, so q_cln_flag cannot be reused here.
-        // Each one is also the table gate of the opposite direction on its edge.
-        //
-        // Earlier versions of this file routed every direction through an
-        // intermediate advice column holding the deduplicated key set of the
-        // relation on the other end. Nothing in the circuit bound such a column
-        // to the relation it claimed to enumerate, so a prover could set the
-        // table r1 looks into to pi_dst(R1^c) and the table r2 looks into to
-        // pi_src(R2^c) and satisfy both directions for an ARBITRARY partition:
-        // condition (3) was vacuous, and the all-clean escape it exists to close
-        // was still open. Looking the two clean key columns up in each other
-        // leaves no free advice, so there is nothing left to forge, and the two
-        // containments together are the set equality condition (3) asks for.
-        //
-        // A lookup input is 0 on every row where its selector is off, and the
-        // table side is 0 on those rows too, so a bare one-column containment
-        // has 0 in the table unconditionally. The comment this replaces argued
-        // that SHIFT_ID makes every real key nonzero, but that shift is host
-        // side: no gate constrains part[i][*] or r[i][*] to be nonzero, so a
-        // prover could smuggle ONE 0-keyed tuple into R_i^c and have both
-        // directions of condition (9) accept it vacuously, without re-running
-        // any fixpoint and without changing the declared block sizes.
-        //
-        // The fix is to carry the gate itself as the first component of the
-        // looked-up tuple. A gated-off input row is then (0, 0), which the
-        // gated-off table rows still supply for free, while an ENABLED input row
-        // is (1, key) and can only be matched by an ENABLED table row (1, key).
-        // Containment is now over exactly the real clean keys, whatever their
-        // value, and it costs no advice column: the extra component is the
-        // selector expression that was already in the argument.
-        let q_pw_cln: [Selector; 3] = std::array::from_fn(|_| meta.complex_selector());
-
+        // The gate travels as the first component of the looked-up tuple, which
+        // is what makes the containment hold for a key of 0 as well. A
+        // deselected row and a row past the relation both read (0, 0), which
+        // the gated-off table rows supply for free; a SELECTED row reads
+        // (1, key) and can only be matched by a selected table row with the
+        // same key. No shift and no advice column: the extra component is the
+        // gating expression that was already in the argument.
         let mut pw_edge = |name: &'static str,
                            q_in: Selector,
+                           c_in: Column<Advice>,
                            in_col: Column<Advice>,
                            q_t: Selector,
+                           c_t: Column<Advice>,
                            tbl_col: Column<Advice>| {
             meta.lookup_any(name, move |m| {
-                let qi = m.query_selector(q_in);
-                let qt = m.query_selector(q_t);
+                let qi = m.query_selector(q_in) * m.query_advice(c_in, Rotation::cur());
+                let qt = m.query_selector(q_t) * m.query_advice(c_t, Rotation::cur());
                 let lhs = qi.clone() * m.query_advice(in_col, Rotation::cur());
                 let rhs = qt.clone() * m.query_advice(tbl_col, Rotation::cur());
                 vec![(qi, qt), (lhs, rhs)]
@@ -949,33 +928,25 @@ impl<F: Field + Ord> Path3OrdChip<F> {
         // edge r1.dst = r2.src
         pw_edge(
             "pw: r1^c dst in r2^c src",
-            q_pw_cln[0],
-            part[0][1],
-            q_pw_cln[1],
-            part[1][0],
+            q_row[0], cflag[0], r[0][1],
+            q_row[1], cflag[1], r[1][0],
         );
         pw_edge(
             "pw: r2^c src in r1^c dst",
-            q_pw_cln[1],
-            part[1][0],
-            q_pw_cln[0],
-            part[0][1],
+            q_row[1], cflag[1], r[1][0],
+            q_row[0], cflag[0], r[0][1],
         );
 
         // edge r2.dst = r3.src
         pw_edge(
             "pw: r2^c dst in r3^c src",
-            q_pw_cln[1],
-            part[1][1],
-            q_pw_cln[2],
-            part[2][0],
+            q_row[1], cflag[1], r[1][1],
+            q_row[2], cflag[2], r[2][0],
         );
         pw_edge(
             "pw: r3^c src in r2^c dst",
-            q_pw_cln[2],
-            part[2][0],
-            q_pw_cln[1],
-            part[1][1],
+            q_row[2], cflag[2], r[2][0],
+            q_row[1], cflag[1], r[1][1],
         );
 
         // Ordering checks
@@ -1181,11 +1152,10 @@ impl<F: Field + Ord> Path3OrdChip<F> {
             join,
             agg,
             cflag,
-            part,
-            perm_cons,
-            q_cln_flag,
-            q_res_flag,
-            q_pw_cln,
+            row_idx,
+            cons,
+            q_bit,
+            q_row,
             q_cln_pred,
             q_ord1,
             q_ord2,
@@ -1736,18 +1706,11 @@ impl<F: Field + Ord> Path3OrdChip<F> {
                     )?;
                 }
 
-                // ---- Conservation Check per tree node: R == R^c U R^r ----
-                // The base row carries the clean indicator, the partition side
-                // carries the same rows as [R^c | R^r] with the flag pinned to
-                // 1 then 0, and the shuffle ties the two together. This is what
-                // binds the indicator used by the clean channel below.
-                let cons: [(&Vec<u64>, &Vec<[u64; 3]>, usize); 3] = [
-                    (&cln1, &part_r1, n_cln1),
-                    (&cln2, &part_r2, n_cln2),
-                    (&cln3, &part_r3, n_cln3),
-                ];
-                for idx in 0..3 {
-                    let (flags, part_rows, n_cln) = cons[idx];
+                // ---- the selector bits, one column per tree node ----
+                // Selection is by position, so there is nothing to conserve:
+                // the bit rides on the committed row and the four Pairwise
+                // Consistency lookups read the same rows, gated by it.
+                for (idx, flags) in [&cln1, &cln2, &cln3].into_iter().enumerate() {
                     for i in 0..n {
                         region.assign_advice(
                             || "cflag",
@@ -1755,28 +1718,21 @@ impl<F: Field + Ord> Path3OrdChip<F> {
                             i,
                             || Value::known(F::from(flags[i])),
                         )?;
-                        for j in 0..3 {
-                            region.assign_advice(
-                                || "part",
-                                cfg.part[idx][j],
-                                i,
-                                || Value::known(F::from(part_rows[i][j])),
-                            )?;
-                        }
-                        cfg.perm_cons[idx].q_perm1.enable(&mut region, i)?;
-                        cfg.perm_cons[idx].q_perm2.enable(&mut region, i)?;
                     }
-                    for i in 0..n_cln {
-                        cfg.q_cln_flag[idx].enable(&mut region, i)?;
-                        // the gate of the Pairwise Consistency lookups of this
-                        // relation, over exactly the same clean row range: input
-                        // side of its own directions, table side of the opposite
-                        // ones
-                        cfg.q_pw_cln[idx].enable(&mut region, i)?;
+                }
+                for i in 0..n {
+                    cfg.q_bit.enable(&mut region, i)?;
+                    for idx in 0..3 {
+                        cfg.q_row[idx].enable(&mut region, i)?;
                     }
-                    for i in n_cln..n {
-                        cfg.q_res_flag[idx].enable(&mut region, i)?;
-                    }
+                }
+
+                // ---- (1) Conservation Check, one permutation per node ----
+                let edge_rows: Vec<Vec<u64>> =
+                    edges.iter().map(|&(s, d)| vec![s, d]).collect();
+                assign_row_index(&mut region, &cfg.row_idx, n)?;
+                for (idx, flags) in [&cln1, &cln2, &cln3].into_iter().enumerate() {
+                    assign_conserve(&mut region, &cfg.cons[idx], &edge_rows, flags)?;
                 }
 
                 // join[1] for r2 -> T3
@@ -2307,7 +2263,7 @@ mod tests {
             let prover = MockProver::run(k, &circuit, vec![public_input]).unwrap();
             prover.assert_satisfied();
         } else {
-            let proof_path = &crate::paths::proof_file("wiki_proof_q1");
+            let proof_path = &crate::paths::proof_file("wiki_proof_q1_new");
             generate_and_verify_proof(circuit, &public_input, proof_path);
         }
     }
@@ -2344,10 +2300,16 @@ mod tests {
             cs.lookups().len(),
             cs.shuffles().len(),
         );
+        // 8, one above the 7 of `g_sql1_obj.rs`: gating both sides of a
+        // Pairwise Consistency lookup by the selector COLUMN rather than by a
+        // selector RANGE costs one degree on each side. It buys no FFT, which
+        // is the number that matters: halo2 sizes the extended domain at the
+        // next power of two above degree - 1, so 7, 8 and 9 all run on an 8x
+        // domain and only 10 doubles it.
         assert!(
-            degree <= 7,
-            "the maximum gate degree rose to {}, so a soundness patch is costing \
-             more than the argument it protects",
+            degree <= 9,
+            "the maximum gate degree rose to {}, which would double every FFT \
+             the prover runs",
             degree
         );
     }

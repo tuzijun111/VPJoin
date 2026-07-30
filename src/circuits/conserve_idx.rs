@@ -1,4 +1,4 @@
-//! Condition (1) of the revised One-Pass OBJ: the indexed Conservation Check.
+//! Condition (1) of the One-Pass OBJ: the indexed Conservation Check.
 //!
 //! The gate certifies a prover-supplied clean/residual split of every relation.
 //! Following `letter.tex` (subsec:output_certification and subsubsec:opt_semijoin),
@@ -44,7 +44,7 @@
 //! circuit, shared by every relation, since each relation occupies rows
 //! `[0, |R_i|)` of the same region.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 
 use halo2_proofs::halo2curves::ff::PrimeField;
 use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
@@ -114,13 +114,27 @@ pub fn assign_row_index<F: Field + Ord>(
     Ok(())
 }
 
+thread_local! {
+    static MISPLACE_ONE_OCCURRENCE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Test hook, off in every benchmark path: when set, [`assign_conserve`] moves
 /// one occurrence across the clean/residual boundary WITHOUT changing the flag
 /// pattern, so the partition side still reads `1` over its first block and `0`
 /// after it while holding a residual occurrence tagged clean. Only the
 /// permutation argument can see that, which is what shows the Conservation
 /// Check is wired and not vacuous.
-pub static MISPLACE_ONE_OCCURRENCE: AtomicBool = AtomicBool::new(false);
+///
+/// THREAD-LOCAL, because `cargo test` runs the modules in parallel threads and
+/// synthesis is single-threaded: a process-wide flag would corrupt every other
+/// circuit being assigned at the same moment, not just the caller's.
+pub fn set_misplace_one_occurrence(on: bool) {
+    MISPLACE_ONE_OCCURRENCE.with(|c| c.set(on));
+}
+
+fn misplace_one_occurrence() -> bool {
+    MISPLACE_ONE_OCCURRENCE.with(|c| c.get())
+}
 
 /// One relation's Conservation Check.
 #[derive(Clone, Debug)]
@@ -308,7 +322,7 @@ pub fn assign_conserve<F: Field + Ord>(
     // test hook only: swap the last clean entry with the first residual one and
     // leave the two flags where they were, so the blocks keep their shape and
     // only the conserved multiset changes
-    if MISPLACE_ONE_OCCURRENCE.load(Ordering::Relaxed) && n_cln > 0 && n_cln < n {
+    if misplace_one_occurrence() && n_cln > 0 && n_cln < n {
         let last = part_rows[n_cln - 1].clone();
         let first = part_rows[n_cln].clone();
         let w = last.len() - 1;
