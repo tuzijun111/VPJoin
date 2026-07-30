@@ -1,3 +1,0 @@
-query,dataset,k,input_rows,n_columns,public_output,profile,load_s,vk_s,pk_s,keygen_s,prove_s,verify_s,proof_bytes,commit_k,commit_setup_s,published_bytes,bind_keygen_s,bind_prove_s,bind_verify_s,bind_proof_bytes,open_prove_s,open_verify_s,open_bytes,total_prove_s,total_proof_bytes,wall_s,config,status
-gq1,wiki,16,65520,2,24893262,release,0.004,9.061,13.264,22.325,46.843,0.028,42784,0,0.000,0,0.000,0.000,0.000,0,0.000,0.000,0,46.843,42784,70.213,oblivious+new,ok
-gq2,wiki,16,65520,2,389136502,release,0.000,13.323,17.536,30.860,66.241,0.036,62464,0,0.000,0,0.000,0.000,0.000,0,0.000,0.000,0,66.241,62464,97.941,oblivious+new,ok
