@@ -128,11 +128,7 @@ wrappers in `*_bound.rs` delegate to the `*_obj.rs` chips, so each pair is the
 One-Pass circuit with and without the binding gates, over the same circuit the
 commands above prove.
 
-**3. DP-guided padding** for the three cyclic queries. Each has one DP circuit
-(`q5_obj_dp.rs`, `g_sql3_obj_dp.rs`, `g_sql4_obj_dp.rs`), and all three realize
-the same three conditions over the lane rows, with one Conservation Check per
-lane per relation role. The lane geometry and every released capacity are set by
-the padding layer, independently of the gate:
+**3. DP-guided padding** for the three cyclic queries.
 
 ```bash
 VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4

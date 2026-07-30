@@ -2362,17 +2362,39 @@ impl<F: Field + Ord> Q5DpChip<F> {
                     &self.config.row_idx,
                     nr_total.max(co_total).max(lineitem.len()),
                 )?;
+                // NR and CO span their DP CAPACITY, not their input length: the
+                // loops above fill rows [n, *_total) with (PAD, PAD) and a zero
+                // indicator, and the conserved relation is that whole extent.
+                // So the witness handed over has to carry the same padding.
+                // Slicing the unpadded witness to `*_total` instead panics the
+                // moment a released capacity exceeds the input size, which for
+                // CO is every budget the sweep uses (eps=0.01 releases 39,060
+                // rows on top of |orders| = 15,000).
+                let pad_pair = |src: &[Vec<u64>], n: usize, total: usize| -> Vec<Vec<u64>> {
+                    (0..total)
+                        .map(|i| {
+                            if i < n {
+                                src[i].clone()
+                            } else {
+                                vec![PAD_U64, PAD_U64]
+                            }
+                        })
+                        .collect()
+                };
+                let pad_flag = |src: &[u64], n: usize, total: usize| -> Vec<u64> {
+                    (0..total).map(|i| if i < n { src[i] } else { 0 }).collect()
+                };
                 assign_conserve(
                     &mut region,
                     &self.config.cons_nr,
-                    &nr_pair_u64[..nr_total],
-                    &cln_nr[..nr_total],
+                    &pad_pair(&nr_pair_u64, nation.len(), nr_total),
+                    &pad_flag(&cln_nr, nation.len(), nr_total),
                 )?;
                 assign_conserve(
                     &mut region,
                     &self.config.cons_co,
-                    &co_pair_u64[..co_total],
-                    &cln_co[..co_total],
+                    &pad_pair(&co_pair_u64, orders.len(), co_total),
+                    &pad_flag(&cln_co, orders.len(), co_total),
                 )?;
                 assign_conserve(
                     &mut region,
