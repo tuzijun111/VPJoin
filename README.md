@@ -5,18 +5,6 @@ Built on the [Halo2](https://github.com/zcash/halo2) proving system with PLONKis
 arithmetization, it lets a data holder prove the correct execution of complex SQL queries
 over private data without revealing the underlying records.
 
-## Problem
-
-Existing ZK database systems decompose multi-way joins into sequential binary joins,
-materializing each intermediate result inside the proof circuit. Because circuit dimensions
-are public, intermediate sizes leak cardinality information, and padding them to worst-case
-sizes leads to **O(IN^k) circuit blowup** for a k-way join. For TPC-H Q8 (an 8-way join),
-that translates to an estimated proving time exceeding 10^19 seconds.
-
-VPJoin eliminates this bottleneck via **witness-guided verification**: the prover performs
-all join work offline and supplies a witness marking which input tuples participate in the
-result. The circuit only *verifies* the witness through lightweight structural checks, never
-materializing intermediate results.
 
 ## Project Structure
 
