@@ -15,6 +15,7 @@ Cargo.lock
 /target
 
 .DS_Store
+.vscode/
 
 src/proof/param20
 src/proof/param21
