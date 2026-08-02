@@ -33,7 +33,21 @@ const SHIFT_ID: u64 = 1;
 /// catch it. This is exactly the cheat a residual-side-only argument misses,
 /// so the negative test in this module is what shows the Cardinality
 /// Preservation Check is not vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover writes a
 /// DIFFERENT relation into the r4 copy than into r1..r3 -- a dense out-star on
@@ -52,7 +66,21 @@ pub static FORGE_R4_RELATION: AtomicBool = AtomicBool::new(false);
 /// condition (4) then agree trivially, so this is exactly the escape that
 /// Pairwise Consistency has to close, and the third direction of the test in
 /// this module is what shows condition (3) closes it.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -1241,11 +1269,19 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
     }
 
     // ---------------- assign ----------------
-    pub fn assign(
+    /// Assign the circuit. Returns the public output cell and, for the bound
+    /// wrapper, the committed Edge cells `r[0] = (src, dst)` per row, in the
+    /// order `bench_queries::edge_columns` publishes them.
+    ///
+    /// The returned vector is `[src_cells, dst_cells]`. Row `i` of each is the
+    /// cell holding edge `i` of the INPUT slice: this circuit writes the base
+    /// relation straight into `r[k]` at row `i` with no sort and no shift, so
+    /// the tie in `g_sql2_bound` is row-by-row against the raw ids.
+    pub fn assign_with_edge_cells(
         &self,
         layouter: &mut impl Layouter<F>,
         edges: &[Edge],
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         let cfg = &self.cfg;
         let n = edges.len();
 
@@ -1278,7 +1314,9 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     Ok(c)
                 },
             )?;
-            return Ok(cell);
+            // No base rows were witnessed, so there is nothing to tie; the
+            // wrapper's `tie_columns` skips empty witness columns.
+            return Ok((cell, vec![Vec::new(), Vec::new()]));
         }
 
         // -------- the partition, condition (1) --------
@@ -1294,8 +1332,8 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
 
         // The honest prover's R^c is the fully reduced instance: exactly the
         // tuples that extend to a full join result.
-        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
-        let mark_all = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let tamper = hide_one_clean_tuple();
+        let mark_all = mark_all_clean();
         let drop_r1 = if tamper {
             let honest = Self::reduce_clean(edges, None);
             (0..n).find(|&i| honest[0][i] == 1)
@@ -1513,9 +1551,15 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
         }
 
         // -------- assignment region --------
+        let mut edge_cells_out: Vec<Vec<AssignedCell<F, F>>> = Vec::new();
         let out_cell = layouter.assign_region(
             || "path4_order_witness",
             |mut region| {
+                // The committed Edge cells, collected in the same loop that
+                // writes them so there is one code path and no second copy for
+                // the binding to be tied to.
+                let mut edge_cells: Vec<Vec<AssignedCell<F, F>>> =
+                    vec![Vec::new(), Vec::new()];
                 // assign base edges into r1..r4 copies
                 //
                 // The self-join gate is enabled on exactly the rows that carry
@@ -1536,18 +1580,25 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                         } else {
                             (e.src, e.dst)
                         };
-                        region.assign_advice(
+                        let c_src = region.assign_advice(
                             || "src",
                             cfg.r[k][0],
                             i,
                             || Value::known(F::from(src)),
                         )?;
-                        region.assign_advice(
+                        let c_dst = region.assign_advice(
                             || "dst",
                             cfg.r[k][1],
                             i,
                             || Value::known(F::from(dst)),
                         )?;
+                        // r[0] is the copy the binding ties to. The self-join
+                        // gate pins r[1..4] to it row-wise, so binding this one
+                        // pins all four.
+                        if k == 0 {
+                            edge_cells[0].push(c_src);
+                            edge_cells[1].push(c_dst);
+                        }
                     }
                 }
 
@@ -2148,11 +2199,12 @@ impl<F: Field + Ord> GraphPath4OrderChip<F> {
                     || Value::known(F::from(answer)),
                 )?;
                 cfg.q_out.enable(&mut region, n - 1)?;
+                edge_cells_out = edge_cells;
                 Ok(out_cell)
             },
         )?;
 
-        Ok(out_cell)
+        Ok((out_cell, edge_cells_out))
     }
 }
 
@@ -2165,6 +2217,14 @@ pub fn configure_path4order_full<F: Field + Ord>(
     meta: &mut ConstraintSystem<F>,
 ) -> GraphPath4OrderConfig<F> {
     let mut cfg = GraphPath4OrderChip::<F>::configure(meta);
+    // The committed Edge relation lives in r[0]; equality-enable it so a bound
+    // wrapper can copy-constrain its binding columns to THESE cells
+    // (inline_bind::tie_columns). `GraphPath4OrderChip::configure` already
+    // enables equality on all four copies, and `enable_equality` is idempotent,
+    // so this is a no-op on the constraint system -- it is stated here because
+    // this is the function the bound wrapper calls, and the tie depends on it.
+    meta.enable_equality(cfg.r[0][0]);
+    meta.enable_equality(cfg.r[0][1]);
 
     // Tables:
     // T4 = cfg.agg[0]
@@ -2259,7 +2319,7 @@ impl<F: Field + Ord> Circuit<F> for GraphPath4OrderCircuit<F> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let chip = GraphPath4OrderChip::construct(config);
-        let out_cell = chip.assign(&mut layouter, &self.edges)?;
+        let (out_cell, _edge_cells) = chip.assign_with_edge_cells(&mut layouter, &self.edges)?;
         chip.expose_public(&mut layouter, out_cell, 0)?;
         Ok(())
     }
@@ -2585,10 +2645,10 @@ mod tests {
         // so the partition still satisfies Conservation and the clean
         // projections still agree on every tree edge. Only condition (4) can
         // see this, so the circuit must now reject.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
         {
@@ -2619,10 +2679,10 @@ mod tests {
         // Conservation still holds and both channels of condition (4) compute
         // the same number on every row, so condition (4) alone accepts this.
         // Pairwise Consistency is what must reject it, through a "pw: " lookup.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let all_clean = MockProver::run(k, &circuit, vec![public_input]).unwrap();
         let verdict = all_clean.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
         {

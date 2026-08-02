@@ -41,14 +41,42 @@ pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
 /// Consistency and only condition (4) can catch it. This is exactly the cheat
 /// a residual-side-only argument misses, so the negative test in this module is
 /// what shows the Cardinality Preservation Check is not vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and declares every real tuple clean in both
 /// roles, leaving the residual side empty. Conservation still holds and both
 /// channels of condition (4) then agree on every row, so this is exactly the
 /// escape that Pairwise Consistency has to close.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -2224,14 +2252,25 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         }
     }
 
+    /// Assign the circuit. Returns the public output cell and, for the bound
+    /// wrapper, the committed Edge cells `(e_src, e_dst)` per row, in the order
+    /// `bench_queries::edge_columns` publishes them.
+    ///
     /// `pad_extra` is a SINGLE knob: there is one materialized bag, so the two
     /// pad counts this used to take were always two names for the same number.
-    pub fn assign(
+    ///
+    /// The cells are the REAL edge rows only: base row 0 is the (0,0,0) dummy
+    /// the views and the bag lookups need, and it is not part of the committed
+    /// relation. Rows 1..=edges.len() carry `edges[i-1]` in input order, so the
+    /// returned vectors line up row-by-row with the committed columns. The
+    /// values are `src + SHIFT_ID` / `dst + SHIFT_ID`, so the committed columns
+    /// must carry the same shift for the copy constraints to hold.
+    pub fn assign_with_edge_cells(
         &self,
         layouter: &mut impl Layouter<F>,
         edges: Vec<Edge>,
         pad_extra: usize,
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         let cfg = self.cfg.clone();
 
         // Load all LT tables used
@@ -2251,9 +2290,16 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
         let out_view_chip = IndexedViewChip::<F>::construct(cfg.out_by_src.clone());
         let agg_msg_chip = AggSumByKeyChip::<F>::construct(cfg.agg_msg.clone());
 
-        layouter.assign_region(
+        // Filled by the region closure below. `assign_region` may run the
+        // closure more than once (shape pass, then assignment), so this is
+        // OVERWRITTEN rather than appended to.
+        let mut edge_cells_out: Vec<Vec<AssignedCell<F, F>>> = Vec::new();
+        let out_cell = layouter.assign_region(
             || "cycle4_ordered witness",
             |mut region| {
+                // [src_cells, dst_cells] of the committed Edge relation.
+                let mut edge_cells: Vec<Vec<AssignedCell<F, F>>> =
+                    vec![Vec::new(), Vec::new()];
                 // -------------------
                 // Base table with dummy row0 = (0,0,0)
                 // -------------------
@@ -2282,18 +2328,20 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                             i,
                             || Value::known(F::from(eid)),
                         )?;
-                        region.assign_advice(
+                        let c_src = region.assign_advice(
                             || "src",
                             cfg.e_src,
                             i,
                             || Value::known(F::from(src)),
                         )?;
-                        region.assign_advice(
+                        let c_dst = region.assign_advice(
                             || "dst",
                             cfg.e_dst,
                             i,
                             || Value::known(F::from(dst)),
                         )?;
+                        edge_cells[0].push(c_src);
+                        edge_cells[1].push(c_dst);
                     }
                 }
 
@@ -2366,7 +2414,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // side. `cln2` is recomputed from the reduced `cln1` just
                 // below, so the two partitions stay partitions and conditions
                 // (1)-(3) still hold: only condition (4) can see this.
-                let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+                let tamper = hide_one_clean_tuple();
                 if tamper {
                     if let Some(h) = (0..n).find(|&i| cln1[i] == 1) {
                         cln1[h] = 0;
@@ -2378,7 +2426,7 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                 // empty. Conservation still holds and both channels of
                 // condition (4) then agree on every row, so only Pairwise
                 // Consistency can see the dangling tuples.
-                let mark_all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+                let mark_all_clean = mark_all_clean();
                 if mark_all_clean {
                     cln1 = pred1.clone();
                 }
@@ -2731,9 +2779,11 @@ impl<F: Field + Ord> Cycle4OrderedChip<F> {
                     out_row,
                     || Value::known(F::from(running)),
                 )?;
+                edge_cells_out = edge_cells;
                 Ok(out_cell)
             },
-        )
+        )?;
+        Ok((out_cell, edge_cells_out))
     }
 
     pub fn expose_public(
@@ -2778,7 +2828,10 @@ impl<F: Field + Ord> Circuit<F> for MyCircuit<F> {
 
     fn synthesize(&self, cfg: Self::Config, mut layouter: impl Layouter<F>) -> Result<(), Error> {
         let chip = Cycle4OrderedChip::<F>::construct(cfg);
-        let out = chip.assign(&mut layouter, self.edges.clone(), self.pad_extra)?;
+        // The base circuit has no binding, so the Edge cells are dropped here;
+        // `g_sql4_bound` is what ties them to the committed columns.
+        let (out, _edge_cells) =
+            chip.assign_with_edge_cells(&mut layouter, self.edges.clone(), self.pad_extra)?;
         chip.expose_public(&mut layouter, out, 0)?;
         Ok(())
     }
@@ -3165,10 +3218,10 @@ mod tests {
         // hidden in the residual side, and role 2 re-reduced around it so that
         // Conservation, Non-Membership and Pairwise Consistency all still hold.
         // Only condition (4) can see this, so the circuit must now reject.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(cnt)]]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         // The tampered witness produces exactly one failure, the
         // "cp: cardinality preservation" gate at the last row: the two
@@ -3192,10 +3245,10 @@ mod tests {
         // condition (4) compute the same number on every row. Only condition
         // (3) can see the dangling tuples counted above, and it must, through a
         // "pw: " lookup.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let all_clean = MockProver::run(k, &circuit, vec![vec![Fp::from(cnt)]]).unwrap();
         let verdict = all_clean.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
         println!("[gq4 cp] all-clean failures: {}", failures.len());

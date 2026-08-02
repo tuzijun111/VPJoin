@@ -43,7 +43,21 @@ pub(crate) fn pack2(hi: u64, lo: u64) -> u64 {
 /// the clean side, and only condition (4) can catch it. This is exactly the
 /// cheat a residual-side-only argument misses, so the negative test in this
 /// module is what shows the Cardinality Preservation Check is not vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and declares every real tuple clean, so the
@@ -53,7 +67,21 @@ pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 /// free. This is exactly the escape Pairwise Consistency has to close, so the
 /// third direction of the test in this module is what shows condition (3) is
 /// not vacuous.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -807,6 +835,10 @@ impl<F: Field + Ord> IndexedViewChip<F> {
         let in_key = meta.advice_column();
         let in_val = meta.advice_column();
         let in_eid = meta.advice_column();
+        // Equality is required, not incidental: for `out_by_src` these two
+        // columns hold the committed Edge relation, and `g_sql3_bound` copy-
+        // constrains them to the binding's data columns so the exposed
+        // evaluation is an evaluation of THIS proof's witness.
         for c in [in_key, in_val, in_eid] {
             meta.enable_equality(c);
         }
@@ -900,12 +932,32 @@ impl<F: Field + Ord> IndexedViewChip<F> {
         }
     }
 
+    /// Assign the view without keeping its input cells.
+    ///
+    /// A thin wrapper over [`IndexedViewChip::assign_with_input_cells`] so there
+    /// is exactly one assignment path: call sites that do not bind their input
+    /// to a commitment (the base circuit, the DP lanes) keep this signature.
     pub fn assign(
         &self,
         region: &mut Region<'_, F>,
         n: usize,
         in_rows: &[(u64, u64, u64)],
     ) -> Result<(), Error> {
+        self.assign_with_input_cells(region, n, in_rows).map(|_| ())
+    }
+
+    /// Assign the view and return its `(in_key, in_val)` cells for rows
+    /// `[0, n)`, in the order `in_rows` supplies them.
+    ///
+    /// These are the cells the bound wrapper copy-constrains to the binding
+    /// columns: for `out_by_src` they hold `(src + SHIFT_ID, dst + SHIFT_ID)`
+    /// of the edge relation this proof actually witnesses.
+    pub fn assign_with_input_cells(
+        &self,
+        region: &mut Region<'_, F>,
+        n: usize,
+        in_rows: &[(u64, u64, u64)],
+    ) -> Result<(Vec<AssignedCell<F, F>>, Vec<AssignedCell<F, F>>), Error> {
         let cfg = &self.cfg;
 
         let lt_key_chip = LtChip::<F, NUM_BYTES>::construct(cfg.lt_key.clone());
@@ -921,19 +973,23 @@ impl<F: Field + Ord> IndexedViewChip<F> {
             cfg.q_tbl.enable(region, i)?;
         }
 
+        let mut key_cells: Vec<AssignedCell<F, F>> = Vec::with_capacity(n);
+        let mut val_cells: Vec<AssignedCell<F, F>> = Vec::with_capacity(n);
         for i in 0..n {
-            region.assign_advice(
+            let kc = region.assign_advice(
                 || "in_key",
                 cfg.in_key,
                 i,
                 || Value::known(F::from(in_rows[i].0)),
             )?;
-            region.assign_advice(
+            let vc = region.assign_advice(
                 || "in_val",
                 cfg.in_val,
                 i,
                 || Value::known(F::from(in_rows[i].1)),
             )?;
+            key_cells.push(kc);
+            val_cells.push(vc);
             region.assign_advice(
                 || "in_eid",
                 cfg.in_eid,
@@ -1029,7 +1085,7 @@ impl<F: Field + Ord> IndexedViewChip<F> {
             )?;
         }
 
-        Ok(())
+        Ok((key_cells, val_cells))
     }
 }
 
@@ -1827,6 +1883,10 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
         }
     }
 
+    /// Assign the circuit without keeping the committed Edge cells.
+    ///
+    /// A thin wrapper over [`TrianglePathCloserChip::assign_with_edge_cells`],
+    /// so the base circuit and the bound wrapper share one assignment path.
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
@@ -1834,6 +1894,31 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
         bag1_pad_extra: usize,
         bag2_pad_extra: usize,
     ) -> Result<AssignedCell<F, F>, Error> {
+        self.assign_with_edge_cells(layouter, edges, bag1_pad_extra, bag2_pad_extra)
+            .map(|(cell, _)| cell)
+    }
+
+    /// Assign the circuit. Returns the public output cell and, for the bound
+    /// wrapper, the committed Edge cells `[src_cells, dst_cells]` per input
+    /// edge, in the order `bench_queries::edge_columns` publishes them.
+    ///
+    /// The cells are the `in_key` / `in_val` columns of the `out_by_src` view,
+    /// which is keyed by src and valued by dst, minus its row 0: the derivation
+    /// prepends a `(0,0,0)` dummy edge there and the commitment does not cover
+    /// it. Everything after that row is the input edge list in input order, so
+    /// the tie is row-by-row with no permutation.
+    ///
+    /// ENCODING: the view holds `src + SHIFT_ID` and `dst + SHIFT_ID`, since
+    /// every graph circuit here shifts node ids to keep 0 free for its gadgets'
+    /// dummy rows. The committed columns must carry the same encoding or the
+    /// honest prover fails the tie.
+    pub fn assign_with_edge_cells(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        edges: Vec<Edge>,
+        bag1_pad_extra: usize,
+        bag2_pad_extra: usize,
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         let cfg = self.cfg.clone();
 
         // Load all LT tables used
@@ -1854,7 +1939,8 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
         let out_view_chip = IndexedViewChip::<F>::construct(cfg.out_by_src.clone());
         let agg_msg_chip = AggSumByKeyChip::<F>::construct(cfg.agg_msg.clone());
 
-        layouter.assign_region(
+        let mut edge_cells_out: Vec<Vec<AssignedCell<F, F>>> = Vec::new();
+        let out_cell = layouter.assign_region(
             || "triangle_path_closer witness",
             |mut region| {
                 // -------------------
@@ -1872,7 +1958,16 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 let n_base = in_rows.len();
 
                 in_view_chip.assign(&mut region, n_base, in_rows)?;
-                out_view_chip.assign(&mut region, n_base, out_rows)?;
+                // OutBySrc is keyed by src and valued by dst, so its two input
+                // columns ARE the committed Edge relation, row for row. Row 0
+                // is the (0,0,0) dummy the derivation prepends and is not part
+                // of `Commit(D)`, so it is dropped here; `n_base >= 1` always,
+                // and an empty edge list leaves two empty vectors, which
+                // `tie_columns` skips.
+                let (src_cells, dst_cells) =
+                    out_view_chip.assign_with_input_cells(&mut region, n_base, out_rows)?;
+                let edge_cells: Vec<Vec<AssignedCell<F, F>>> =
+                    vec![src_cells[1..].to_vec(), dst_cells[1..].to_vec()];
 
                 // -------------------
                 // Row counts of the two bags. The partition witness below is
@@ -1925,8 +2020,8 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                 // test hook only: hide one joinable Bag2 tuple in the residual
                 // side and re-reduce both bags around it, so Conservation still
                 // holds and the clean sides stay pairwise consistent
-                let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
-                let mark_all = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+                let tamper = hide_one_clean_tuple();
+                let mark_all = mark_all_clean();
                 if tamper {
                     if let Some(hidden) = (0..n3).find(|&i| cln3[i] == 1) {
                         cln3[hidden] = 0;
@@ -2356,9 +2451,11 @@ impl<F: Field + Ord> TrianglePathCloserChip<F> {
                     out_row,
                     || Value::known(F::from(running)),
                 )?;
+                edge_cells_out = edge_cells;
                 Ok(out_cell)
             },
-        )
+        )?;
+        Ok((out_cell, edge_cells_out))
     }
 
     pub fn expose_public(
@@ -2719,10 +2816,10 @@ mod tests {
         // Conservation still holds and the two clean sides still agree on the
         // separator key. Only condition (4) can see this, so the circuit must
         // now reject.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
         assert!(
@@ -2739,10 +2836,10 @@ mod tests {
         // number on every Bag1 row, so sum_cln == sum_all holds for free. Nothing
         // but Pairwise Consistency notices that the clean side is not the reduced
         // instance, so the circuit must reject through a "pw: " lookup.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let all_clean = MockProver::run(k, &circuit, vec![public_input]).unwrap();
         let verdict = all_clean.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         let failures = verdict.expect_err("the all-clean partition was accepted");
         assert!(

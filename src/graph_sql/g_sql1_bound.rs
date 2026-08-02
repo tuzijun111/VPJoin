@@ -8,7 +8,7 @@ use halo2curves::pasta::Fp;
 
 use super::g_sql1_obj;
 use crate::data::graph_data_processing::Edge;
-use crate::inline_bind::{assign_bind, configure_bind, BindConfig};
+use crate::inline_bind::{assign_bind_cells, configure_bind, tie_columns, BindConfig};
 
 /// Committed input columns: Edge(src, dst).
 pub const NC: usize = 2;
@@ -47,9 +47,15 @@ impl Circuit<Fp> for BoundGq1 {
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
         let chip = g_sql1_obj::Path3OrdChip::construct(config.0);
-        let out = chip.assign(&mut layouter, &self.edges)?;
+        let (out, edge_cells) = chip.assign_with_edge_cells(&mut layouter, &self.edges)?;
         chip.expose_public(&mut layouter, out, 0)?;
-        assign_bind(&mut layouter, &config.1, &self.columns, self.x)?;
+        // The binding evaluates its own columns at x, then those columns are
+        // copy-constrained cell-by-cell to the Edge cells THIS proof witnesses.
+        // Without the tie the binding would establish only that some columns
+        // match Commit(D); with it, the exposed evaluation is an evaluation of
+        // this proof's witness, which is what Appendix A requires.
+        let bind_cells = assign_bind_cells(&mut layouter, &config.1, &self.columns, self.x)?;
+        tie_columns(&mut layouter, &bind_cells, &edge_cells)?;
         Ok(())
     }
 }

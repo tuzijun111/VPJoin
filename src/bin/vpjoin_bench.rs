@@ -5,10 +5,16 @@
 //!
 //!   simplification -- the pure query circuit, i.e. exactly what
 //!               `cargo test ... sql::qN_obj::tests::test_1` proves.
-//!   full     -- the same circuits plus the complete commitment layer:
-//!               a published per-column Pedersen commitment to the dataset,
-//!               the in-circuit check that the query's witness columns equal
-//!               the committed data, and the column openings.
+//!   full     -- ONE proof carrying the query AND the binding, with the
+//!               binding copy-constrained to the query's own witness cells
+//!               (Appendix A), against a `Commit(D)` published once at Setup,
+//!               plus the column openings. The query is NOT proved separately:
+//!               the tied proof is the query proof. The Fiat--Shamir challenge
+//!               is derived from the publication and the query identity rather
+//!               than from a prior proof, because a separate base proof cannot
+//!               constrain the tied proof's witness and so bound nothing -- see
+//!               `column_commit::binding_challenge_public` for the ordering
+//!               assumption this leaves open.
 //!   commit   -- ONLY the commitment layer, in the corresponding query
 //!               circuit's own domain (same k). The query proof is not re-run,
 //!               so these numbers add to the matching `simplification` row. Much
@@ -347,7 +353,8 @@ fn main() {
     );
     println!(
         "prover: REAL Halo2 pipeline (keygen_vk / keygen_pk / create_proof / verify_proof, \
-         IPA over Pasta) -- MockProver is NOT used anywhere in this harness"
+         IPA over Pasta). MockProver runs ONLY under VPJOIN_MOCK=1, which replaces\n\
+         the real proof with a diagnostic pass and reports no timings."
     );
     println!(
         "params: {}/proof/param{{k}} (every load is logged per row on stderr; proofs are \

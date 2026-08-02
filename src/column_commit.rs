@@ -22,7 +22,13 @@ use halo2curves::group::Curve;
 use halo2curves::pasta::{vesta, EqAffine, Fp};
 use rand_core::RngCore;
 
-/// Published per-column commitments plus the prover-only blinders.
+/// A set of per-column commitments plus the prover-only blinders.
+///
+/// This is a VIEW, not a publication: the sound way to obtain one is
+/// [`DatabaseCommitment::view`], which selects the columns a query reads out of
+/// the single commitment published at Setup. Building one directly with
+/// [`commit_column_vectors`] draws fresh blinders and so produces a commitment
+/// that is only meaningful for the query at hand -- see that function's note.
 #[derive(Clone, Debug)]
 pub struct ColumnCommitments {
     /// One published commitment per column (public).
@@ -39,6 +45,120 @@ impl ColumnCommitments {
     /// Serialized size of the published commitments, in bytes.
     pub fn published_bytes(&self) -> usize {
         self.points.len() * 32
+    }
+}
+
+/// `Commit(D)`: the single commitment published during Setup, over EVERY column
+/// of the database, fixed before any query is issued.
+///
+/// This is the difference between binding each proof to one database and merely
+/// binding it to itself, and it is why the points and the blinders are drawn
+/// once, here. A query binds by SELECTING the columns it reads
+/// ([`DatabaseCommitment::view`]), never by committing again, so two queries
+/// that read the same column open the same published point under the same
+/// blinder. A prover therefore cannot answer one query from `D` and another
+/// from `D' != D`.
+///
+/// Re-committing per query with a fresh blinder gives up exactly that: the
+/// published points differ between queries, so nothing relates the two answers
+/// to one database, whatever each proof establishes internally.
+#[derive(Clone, Debug)]
+pub struct DatabaseCommitment {
+    /// One published commitment per column of `D`, in canonical layout order.
+    /// Public, and fixed for the lifetime of the database.
+    points: Vec<EqAffine>,
+    /// Per-column blinders (PRIVATE). Fixed together with the points: a query
+    /// reuses the blinder of every column it opens instead of drawing one.
+    blinders: Vec<Fp>,
+    /// One domain for the whole database, so a column's commitment does not
+    /// depend on which query happens to read it.
+    k: u32,
+    /// Committed length of each column, kept for the published record.
+    lens: Vec<usize>,
+}
+
+impl DatabaseCommitment {
+    pub fn points(&self) -> &[EqAffine] {
+        &self.points
+    }
+    pub fn cols(&self) -> usize {
+        self.points.len()
+    }
+    pub fn k(&self) -> u32 {
+        self.k
+    }
+    /// Bytes published ONCE at Setup, for the whole database. This is not a
+    /// per-query cost: a query publishes no commitment of its own.
+    pub fn published_bytes(&self) -> usize {
+        self.points.len() * 32
+    }
+
+    /// The columns query `Q` reads, as a view on the published commitment.
+    ///
+    /// Selects; never re-commits. The returned [`ColumnCommitments`] carries the
+    /// published points and their original blinders, so every downstream step
+    /// ([`open_column_vectors`], [`verify_column_openings`]) opens the
+    /// commitment that was fixed before any query ran.
+    pub fn view(&self, idx: &[usize]) -> ColumnCommitments {
+        let mut points = Vec::with_capacity(idx.len());
+        let mut blinders = Vec::with_capacity(idx.len());
+        let mut rows = 0usize;
+        for &j in idx {
+            assert!(
+                j < self.points.len(),
+                "column {} is outside the published database commitment ({} columns)",
+                j,
+                self.points.len()
+            );
+            points.push(self.points[j]);
+            blinders.push(self.blinders[j]);
+            rows = rows.max(self.lens[j]);
+        }
+        ColumnCommitments {
+            points,
+            blinders,
+            k: self.k,
+            rows,
+            cols: idx.len(),
+        }
+    }
+}
+
+/// Publish `Commit(D)`: one hiding commitment per column of the WHOLE database,
+/// drawn once, before any query is issued.
+///
+/// `cols` is the canonical column layout of `D`, so the index of a column here
+/// is the index a query passes to [`DatabaseCommitment::view`]. Every column
+/// shares one domain `k`, which must therefore hold the longest column.
+pub fn commit_database(
+    params: &ParamsIPA<vesta::Affine>,
+    cols: &[Vec<u64>],
+    k: u32,
+    mut rng: impl RngCore,
+) -> DatabaseCommitment {
+    assert_eq!(params.n(), 1u64 << k, "params.k must equal k");
+    let domain = EvaluationDomain::<Fp>::new(1, k);
+    let mut points = Vec::with_capacity(cols.len());
+    let mut blinders = Vec::with_capacity(cols.len());
+    let mut lens = Vec::with_capacity(cols.len());
+    for col in cols {
+        assert!(
+            col.len() <= 1usize << k,
+            "column of length {} does not fit the database domain 2^{}",
+            col.len(),
+            k
+        );
+        let poly = vec_poly(&domain, col, k);
+        let r = Fp::random(&mut rng);
+        points.push(params.commit(&poly, Blind(r)).to_affine());
+        blinders.push(r);
+        lens.push(col.len());
+    }
+    DatabaseCommitment {
+        points,
+        blinders,
+        k,
+        lens,
     }
 }
 
@@ -66,8 +186,15 @@ fn vec_poly(
 }
 
 /// Commit a set of column vectors (possibly from different tables, of
-/// different lengths) with fresh random blinders.  This is the per-QUERY
-/// entry point: pass exactly the columns the query reads.
+/// different lengths) with FRESH random blinders.
+///
+/// COST MEASUREMENT ONLY. Because the blinders are redrawn on every call, two
+/// invocations over the same column produce different published points, so a
+/// proof bound this way is tied to a commitment created for it rather than to a
+/// database fixed in advance. It measures what the binding layer costs, and
+/// nothing about cross-query consistency. Use [`commit_database`] once and
+/// [`DatabaseCommitment::view`] per query for the construction the paper
+/// describes.
 pub fn commit_column_vectors(
     params: &ParamsIPA<vesta::Affine>,
     cols: &[Vec<u64>],
@@ -179,10 +306,25 @@ pub fn commit_columns(
 
 /// Derive the public binding challenge `x` by Fiat--Shamir from the published
 /// commitments, the table shape, and the query proof.
+///
+/// ORDERING, which the random-point argument depends on: `x` must be
+/// unpredictable at the moment the witness polynomial it tests is fixed. That
+/// holds only when `query_proof` is a proof that ALREADY commits that witness.
+/// An empty transcript makes `x` a function of the commitments alone, i.e. a
+/// constant the prover knows before choosing its witness, and then agreement at
+/// `x` says nothing: a prover can pick any `W != D` with `W(x) = D(x)`. See
+/// [`binding_challenge_db`], which refuses that case outright.
 pub fn binding_challenge(
     commitments: &ColumnCommitments,
     query_proof: &[u8],
 ) -> Fp {
+    assert!(
+        !query_proof.is_empty(),
+        "binding challenge derived from an empty transcript: x would then be a \
+         function of the published commitments alone, i.e. a public constant \
+         known before the witness is chosen, and agreement at x would certify \
+         nothing. Bind to a real query proof."
+    );
     let mut transcript =
         Blake2bWrite::<Vec<u8>, EqAffine, Challenge255<EqAffine>>::init(vec![]);
     for p in &commitments.points {
@@ -203,6 +345,100 @@ pub fn binding_challenge(
     }
     transcript
         .common_scalar(Fp::from(query_proof.len() as u64))
+        .unwrap();
+    *transcript.squeeze_challenge_scalar::<()>()
+}
+
+/// Derive the binding challenge from the WHOLE published `Commit(D)`, the
+/// columns this query opens, and the query proof.
+///
+/// Absorbing every published point, not only the subset the query reads, is
+/// what ties the challenge to one database: a prover who republished the
+/// database would get a different `x` even for a query whose own columns were
+/// unchanged, so the challenge cannot be reused across two publications.
+///
+/// Panics if `query_proof` is empty. That is not defensive tidiness: `x` has to
+/// be unpredictable when the witness polynomial is fixed, so it must come from
+/// a proof that already commits that witness. Deriving it from nothing yields a
+/// public constant, and a prover can then choose any `W != D` agreeing with `D`
+/// at that one point.
+pub fn binding_challenge_db(db: &DatabaseCommitment, idx: &[usize], query_proof: &[u8]) -> Fp {
+    assert!(
+        !query_proof.is_empty(),
+        "the binding challenge must come from a query proof that already commits \
+         the witness being bound; an empty transcript makes x a public constant \
+         the prover can choose its witness against"
+    );
+    let mut transcript = Blake2bWrite::<Vec<u8>, EqAffine, Challenge255<EqAffine>>::init(vec![]);
+    // (1) the whole publication, in canonical order
+    for p in &db.points {
+        transcript.common_point(*p).unwrap();
+    }
+    transcript
+        .common_scalar(Fp::from(db.points.len() as u64))
+        .unwrap();
+    transcript.common_scalar(Fp::from(db.k as u64)).unwrap();
+    // (2) which columns this query opens
+    for &j in idx {
+        transcript.common_scalar(Fp::from(j as u64)).unwrap();
+    }
+    transcript
+        .common_scalar(Fp::from(idx.len() as u64))
+        .unwrap();
+    // (3) the query proof, which is what fixes the witness before x exists
+    for chunk in query_proof.chunks(16) {
+        let mut buf = [0u8; 16];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        transcript
+            .common_scalar(Fp::from_u128(u128::from_le_bytes(buf)))
+            .unwrap();
+    }
+    transcript
+        .common_scalar(Fp::from(query_proof.len() as u64))
+        .unwrap();
+    *transcript.squeeze_challenge_scalar::<()>()
+}
+
+/// Derive the binding challenge WITHOUT a prior proof, from the publication,
+/// the columns this query opens, and a query-identifying context.
+///
+/// ORDERING, stated plainly. `x` is then a public value the prover can compute
+/// before it commits the tied proof's witness, so the random-point argument
+/// does not hold on its own terms. That is NOT a regression from deriving `x`
+/// from a separate base proof: nothing constrains that proof's witness to equal
+/// the tied proof's, so it too left the prover free to choose its witness after
+/// learning `x`. The base proof was Fiat--Shamir entropy, never a binding, and
+/// charging a whole extra query proof for it obscured the gap rather than
+/// closing it.
+///
+/// Closing it requires a challenge drawn from the tied proof's OWN first-phase
+/// commitments, which this backend cannot express -- see the note on
+/// [`BoundColumnsCircuit`] for why the evaluations could then no longer be
+/// instance values.
+pub fn binding_challenge_public(db: &DatabaseCommitment, idx: &[usize], context: &[u8]) -> Fp {
+    let mut transcript = Blake2bWrite::<Vec<u8>, EqAffine, Challenge255<EqAffine>>::init(vec![]);
+    for p in &db.points {
+        transcript.common_point(*p).unwrap();
+    }
+    transcript
+        .common_scalar(Fp::from(db.points.len() as u64))
+        .unwrap();
+    transcript.common_scalar(Fp::from(db.k as u64)).unwrap();
+    for &j in idx {
+        transcript.common_scalar(Fp::from(j as u64)).unwrap();
+    }
+    transcript
+        .common_scalar(Fp::from(idx.len() as u64))
+        .unwrap();
+    for chunk in context.chunks(16) {
+        let mut buf = [0u8; 16];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        transcript
+            .common_scalar(Fp::from_u128(u128::from_le_bytes(buf)))
+            .unwrap();
+    }
+    transcript
+        .common_scalar(Fp::from(context.len() as u64))
         .unwrap();
     *transcript.squeeze_challenge_scalar::<()>()
 }
@@ -579,6 +815,29 @@ impl<const NC: usize> Circuit<Fp> for PlainColumnsCircuit<NC> {
 /// Bound per-query circuit: the same input columns plus one Horner
 /// accumulator per column at the public challenge `x`, exposing the
 /// evaluations as public outputs.  Instance layout: `[x, v_0, ..., v_{NC-1}]`.
+///
+/// KNOWN GAP, and why the obvious repair does not work. `x` arrives as an
+/// instance, so it is fixed before this proof commits its witness, and the
+/// random-point argument wants the opposite order. The natural fix is to make
+/// `x` a second-phase challenge (`ConstraintSystem::challenge_usable_after`,
+/// which this backend does provide) so that it is squeezed from the first-phase
+/// advice commitments. That cannot be completed here:
+///
+///  * the evaluations `v_j` would then depend on `x`, so they could no longer be
+///    instance values -- `create_proof` commits and absorbs the whole instance
+///    before it enters the phase loop, i.e. before any advice commitment exists
+///    and before any phase challenge is squeezed;
+///  * no API hands a squeezed challenge back to the caller, and the opening of
+///    the published column has to happen at that same `x`, outside the circuit;
+///  * binding against Halo2's own multiopen point instead (which is correctly
+///    ordered, after every advice commitment) fails on the blinding rows: an
+///    advice polynomial carries fresh randomness in its unusable rows, so it
+///    does not agree with the committed column polynomial at any point.
+///
+/// Closing this needs a commit-and-prove linkage between the published
+/// commitment and the circuit's witness, not a rearrangement of this circuit.
+/// [`binding_challenge_db`] enforces the half that is enforceable: the challenge
+/// must come from a proof that has already committed a witness.
 #[derive(Clone, Debug)]
 pub struct BoundColumnsCircuit<const NC: usize> {
     pub columns: Vec<Vec<u64>>,
@@ -745,6 +1004,112 @@ mod tests {
 
     fn tiny_table() -> Vec<Vec<u64>> {
         (0..40u64).map(|i| vec![i, i * 3 + 1, 7, i % 5]).collect()
+    }
+
+    /// Columns of one database, as `commit_database` takes them.
+    fn tiny_db() -> Vec<Vec<u64>> {
+        vec![
+            (0..40u64).collect(),
+            (0..40u64).map(|i| i * 3 + 1).collect(),
+            (0..40u64).map(|i| i % 5).collect(),
+            (0..25u64).map(|i| i * i).collect(),
+        ]
+    }
+
+    /// THE cross-query property, and the one a per-query commitment does not
+    /// have: two queries reading the same column must open the SAME published
+    /// point. Otherwise nothing stops a prover answering one from `D` and the
+    /// other from `D' != D`.
+    #[test]
+    fn two_queries_share_one_published_commitment() {
+        let cols = tiny_db();
+        let k = min_k_rows(cols.iter().map(|c| c.len()).max().unwrap());
+        let params = ParamsIPA::<vesta::Affine>::new(k);
+        let db = commit_database(&params, &cols, k, OsRng);
+
+        // Q_a reads columns {0, 2}; Q_b reads {2, 3}. Column 2 is shared, and
+        // it sits at a DIFFERENT offset in each view (last in `a`, first in
+        // `b`): a view is indexed by the query's own column order, so the
+        // published identity has to be compared through the database index.
+        let a = db.view(&[0, 2]);
+        let b = db.view(&[2, 3]);
+        assert_eq!(
+            a.points[1], b.points[0],
+            "the shared column must open to the same published point in both queries"
+        );
+        assert_ne!(
+            a.points[0], b.points[1],
+            "distinct columns must stay distinct"
+        );
+
+        // Re-committing per query is exactly what loses that.
+        let ca = commit_column_vectors(&params, &[cols[2].clone()], k, OsRng);
+        let cb = commit_column_vectors(&params, &[cols[2].clone()], k, OsRng);
+        assert_ne!(
+            ca.points[0], cb.points[0],
+            "fresh blinders must give different points -- this is the behaviour \
+             `commit_database` exists to replace, so if it ever stops holding the \
+             contrast this test documents is gone"
+        );
+    }
+
+    /// A view opens against the published commitment, with the blinder that was
+    /// drawn at Setup rather than a fresh one.
+    #[test]
+    fn a_view_opens_against_the_published_commitment() {
+        let cols = tiny_db();
+        let k = min_k_rows(cols.iter().map(|c| c.len()).max().unwrap());
+        let params = ParamsIPA::<vesta::Affine>::new(k);
+        let db = commit_database(&params, &cols, k, OsRng);
+
+        let idx = [1usize, 3];
+        let view = db.view(&idx);
+        let picked: Vec<Vec<u64>> = idx.iter().map(|&j| cols[j].clone()).collect();
+
+        let x = binding_challenge_db(&db, &idx, b"a query proof that commits the witness");
+        let evals = vector_evaluations(&picked, k, x);
+        let openings = open_column_vectors(&params, &view, &picked, x, OsRng);
+        assert!(
+            verify_column_openings(&params, &view.points, x, &evals, &openings),
+            "openings must verify against the points published at Setup"
+        );
+    }
+
+    /// The challenge is a function of the WHOLE publication, so a prover who
+    /// republishes the database cannot carry a challenge over to it.
+    #[test]
+    fn the_challenge_covers_the_whole_publication() {
+        let cols = tiny_db();
+        let k = min_k_rows(cols.iter().map(|c| c.len()).max().unwrap());
+        let params = ParamsIPA::<vesta::Affine>::new(k);
+        let proof = b"a query proof that commits the witness";
+
+        let db1 = commit_database(&params, &cols, k, OsRng);
+        // A different database, differing ONLY in a column this query never reads.
+        let mut other = cols.clone();
+        other[3][0] += 1;
+        let db2 = commit_database(&params, &other, k, OsRng);
+
+        let idx = [0usize, 1];
+        assert_ne!(
+            binding_challenge_db(&db1, &idx, proof),
+            binding_challenge_db(&db2, &idx, proof),
+            "the challenge must depend on every published column, not just the \
+             ones this query opens"
+        );
+    }
+
+    /// An empty transcript would make `x` a constant the prover knows before it
+    /// fixes its witness, which is precisely when the random-point argument
+    /// stops holding.
+    #[test]
+    #[should_panic(expected = "already commits the witness")]
+    fn a_challenge_from_nothing_is_refused() {
+        let cols = tiny_db();
+        let k = min_k_rows(cols.iter().map(|c| c.len()).max().unwrap());
+        let params = ParamsIPA::<vesta::Affine>::new(k);
+        let db = commit_database(&params, &cols, k, OsRng);
+        let _ = binding_challenge_db(&db, &[0], &[]);
     }
 
     #[test]

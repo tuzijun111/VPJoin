@@ -34,7 +34,21 @@ const PAD_VAL: u64 = 0;
 /// exactly the cheat a residual-side-only argument misses, so the negative
 /// test in this module is what shows the Cardinality Preservation Check is not
 /// vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and declares every real tuple clean, leaving the
@@ -42,7 +56,21 @@ pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 /// channels of condition (4) then agree trivially, so this is exactly the escape
 /// that Pairwise Consistency has to close, and the third direction of the test
 /// in this module is what shows condition (3) closes it.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -142,7 +170,11 @@ pub struct Path3OrdConfig<F: Field + Ord> {
     instance: Column<Instance>,
 
     // base edges r1,r2,r3: [src, dst] (all equal to Edge table)
-    r: [[Column<Advice>; 2]; 3],
+    /// `r[0]` is the committed Edge relation as (src, dst) at rows `0..|E|`,
+    /// in the same order `bench_queries::edge_columns` publishes it. Exposed so
+    /// the bound wrapper can run its Horner accumulation over THIS column
+    /// rather than over a private copy (see `inline_bind::configure_bind_on`).
+    pub(crate) r: [[Column<Advice>; 2]; 3],
     // r1, r2, r3 are three occurrences of ONE table: pin them row-wise equal
     q_self_join: Selector,
 
@@ -1482,11 +1514,14 @@ impl<F: Field + Ord> Path3OrdChip<F> {
         Ok(())
     }
 
-    pub fn assign(
+    /// Assign the circuit. Returns the public output cell and, for the bound
+    /// wrapper, the committed Edge cells `r[0] = (src, dst)` per row, in the
+    /// order `bench_queries::edge_columns` publishes them.
+    pub fn assign_with_edge_cells(
         &self,
         layouter: &mut impl Layouter<F>,
         edges_in: &[Edge],
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         let cfg = &self.cfg;
         let n = edges_in.len();
 
@@ -1514,7 +1549,7 @@ impl<F: Field + Ord> Path3OrdChip<F> {
                     Ok(c)
                 },
             )?;
-            return Ok(cell);
+            return Ok((cell, vec![Vec::new(), Vec::new()]));
         }
 
         // Shift IDs inside the circuit to reserve key=0 for dummy map row.
@@ -1533,8 +1568,8 @@ impl<F: Field + Ord> Path3OrdChip<F> {
         // The prover's partition of each tree node into R^c and R^r. Read the
         // test hook once, here, so the whole witness below is consistent with
         // whichever partition is used.
-        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
-        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let tamper = hide_one_clean_tuple();
+        let all_clean = mark_all_clean();
         let (cln1, cln2, cln3) = if all_clean {
             // no reduction at all: every real tuple is declared clean and the
             // residual section of every partition stays empty
@@ -1658,26 +1693,30 @@ impl<F: Field + Ord> Path3OrdChip<F> {
 
         // ---------------- circuit assignment ----------------
 
+        let mut edge_cells_out: Vec<Vec<AssignedCell<F, F>>> = Vec::new();
         let out_cell = layouter.assign_region(
             || "path3_ordered",
             |mut region| {
+                let mut edge_cells: Vec<Vec<AssignedCell<F, F>>> = vec![Vec::new(), Vec::new()];
                 // base tables r1,r2,r3 all equal to edges (self-join)
                 for (i, (s, d)) in edges.iter().enumerate() {
                     // the three copies are one relation, row by row
                     cfg.q_self_join.enable(&mut region, i)?;
                     // r1
-                    region.assign_advice(
+                    let c_src = region.assign_advice(
                         || "r1_src",
                         cfg.r[0][0],
                         i,
                         || Value::known(F::from(*s)),
                     )?;
-                    region.assign_advice(
+                    let c_dst = region.assign_advice(
                         || "r1_dst",
                         cfg.r[0][1],
                         i,
                         || Value::known(F::from(*d)),
                     )?;
+                    edge_cells[0].push(c_src);
+                    edge_cells[1].push(c_dst);
                     // r2
                     region.assign_advice(
                         || "r2_src",
@@ -1973,11 +2012,12 @@ impl<F: Field + Ord> Path3OrdChip<F> {
                     out_row,
                     || Value::known(F::from(running as u64)),
                 )?;
+                edge_cells_out = edge_cells;
                 Ok(out_cell)
             },
         )?;
 
-        Ok(out_cell)
+        Ok((out_cell, edge_cells_out))
     }
 }
 
@@ -1991,6 +2031,11 @@ pub fn configure_path3ord_full<F: Field + Ord>(
     meta: &mut ConstraintSystem<F>,
 ) -> Path3OrdConfig<F> {
     let cfg = Path3OrdChip::<F>::configure(meta);
+    // The committed Edge relation lives in r[0]; equality-enable it so a bound
+    // wrapper can copy-constrain its binding columns to THESE cells
+    // (inline_bind::tie_columns).
+    meta.enable_equality(cfg.r[0][0]);
+    meta.enable_equality(cfg.r[0][1]);
 
     // convenience
     let t3 = cfg.agg[0].clone(); // table from r3
@@ -2111,7 +2156,7 @@ impl<F: Field + Ord> Circuit<F> for Path3OrdCircuit<F> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let chip = Path3OrdChip::construct(config);
-        let out_cell = chip.assign(&mut layouter, &self.edges)?;
+        let (out_cell, _edge_cells) = chip.assign_with_edge_cells(&mut layouter, &self.edges)?;
         chip.expose_public(&mut layouter, out_cell, 0)?;
         Ok(())
     }
@@ -2389,10 +2434,10 @@ mod tests {
         // still hold and the input channel, hence the public COUNT, is
         // unchanged. Only condition (4) can see this, so the circuit must now
         // reject, and it must reject through the cardinality equality.
-        HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![public_input.clone()]).unwrap();
         let verdict = tampered.verify();
-        HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
         println!(
@@ -2427,10 +2472,10 @@ mod tests {
         // free and cannot see that the partition is not the reduced instance.
         // Pairwise Consistency does see it: the slice has tuples whose join key
         // has no partner, so the key sets of an edge differ.
-        MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let unreduced = MockProver::run(k, &circuit, vec![public_input]).unwrap();
         let verdict = unreduced.verify();
-        MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         let failures = verdict.expect_err("condition (3) accepted the all-clean partition");
         let names: Vec<String> = failures.iter().map(|f| format!("{:?}", f)).collect();

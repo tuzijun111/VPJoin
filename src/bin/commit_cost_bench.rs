@@ -224,8 +224,11 @@ fn main() {
         );
 
         // ---- bound: same inputs + in-circuit binding ---------------------
-        // The challenge is Fiat-Shamir-derived from the published commitments
-        // and the query proof (the baseline proof stands in for it here).
+        // COST ONLY. The transcript below is a constant stand-in, not a query
+        // proof, so this `x` binds nothing: it is a public constant, exactly the
+        // case `binding_challenge` rejects when the transcript is empty rather
+        // than merely fixed. The measurement is unaffected -- the circuit does
+        // the same work at any `x` -- but do not read this line as the protocol.
         let x = binding_challenge(&commitments, &[0u8; 32]);
         let evals = column_evaluations(&table, k, x);
         let mut instance = vec![x];

@@ -49,7 +49,21 @@ const R_LINE: usize = 5;
 /// Pairwise Consistency and only condition (4) can catch it. This is exactly
 /// the cheat a residual-side-only argument misses, so the negative test in this
 /// module is what shows the Cardinality Preservation Check is not vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and declares every real tuple clean, leaving the
@@ -58,7 +72,21 @@ pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 /// escape Pairwise Consistency has to close: a dangling tuple left in `R_i^c`
 /// has no partner in the clean part of the adjacent relation, so the key sets on
 /// that edge differ and a `pw: ` lookup must reject.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 // ----------------- paddings -----------------
 // Part: [p_partkey, p_name_hash]
@@ -189,6 +217,15 @@ pub struct TestCircuitConfig<F: Field + Ord> {
 
     instance: Column<Instance>,
     instance_test: Column<Advice>,
+    /// Pins ONE cell of `instance_test` (row 1) to zero.
+    ///
+    /// The six base relations have different lengths, but a commitment binding
+    /// covers `max_i |R_i|` rows and zero-extends every shorter column. Those
+    /// zero rows must be tied to something the circuit FORCES to zero: left
+    /// free, the prover could lie about a real row and cancel the difference in
+    /// the padding, which is exactly the substitution the tie exists to prevent.
+    /// One pinned cell suffices -- every padding row is copy-constrained to it.
+    q_zero: Selector,
 
     iz_part: IsZeroConfig<F>,
 
@@ -302,6 +339,15 @@ impl<F: Field + Ord> TestChip<F> {
         meta.enable_equality(instance);
         let instance_test = meta.advice_column();
         meta.enable_equality(instance_test);
+
+        // One cell of `instance_test` pinned to zero, for the binding's padding
+        // rows (see the field's comment). `instance_test` carries the public
+        // output at row 0 and nothing else, so row 1 is free.
+        let q_zero = meta.selector();
+        meta.create_gate("bind padding anchor is zero", |m| {
+            let q = m.query_selector(q_zero);
+            vec![q * m.query_advice(instance_test, Rotation::cur())]
+        });
 
         // base tables
         let part = vec![meta.advice_column(), meta.advice_column()];
@@ -1280,6 +1326,7 @@ impl<F: Field + Ord> TestChip<F> {
 
             instance,
             instance_test,
+            q_zero,
 
             iz_part,
 
@@ -1314,6 +1361,10 @@ impl<F: Field + Ord> TestChip<F> {
         }
     }
 
+    /// The query alone, exactly as the baseline circuit runs it.
+    ///
+    /// Kept as a thin delegation so existing callers (`MyCircuit::synthesize`)
+    /// are untouched; the bound wrapper calls [`Self::assign_with_input_cells`].
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
@@ -1325,6 +1376,73 @@ impl<F: Field + Ord> TestChip<F> {
         lineitem: Vec<Vec<u64>>, // [l_orderkey,l_partkey,l_suppkey,l_qty,l_ext,l_disc]
         cond_hash: u64,          // :1 (simplified)
     ) -> Result<AssignedCell<F, F>, Error> {
+        self.assign_inner(
+            layouter, part, supplier, nation, orders, partsupp, lineitem, cond_hash, false,
+        )
+        .map(|(out, _)| out)
+    }
+
+    /// The same assignment, plus the cells holding this proof's copy of the
+    /// COMMITTED input columns, in the order `TpchInput::Q9::columns()` publishes
+    /// them:
+    ///
+    /// ```text
+    ///  0,1  part     [p_partkey, hash(p_name)]
+    ///  2,3  supplier [s_suppkey, s_nationkey]
+    ///  4,5  nation   [n_nationkey, hash(n_name)]
+    ///  6,7  orders   [o_orderkey, year(o_orderdate)]
+    ///  8,9  partsupp [ps_partkey * PS_SHIFT + ps_suppkey, 1000 * ps_supplycost]
+    /// 10..15 lineitem [l_orderkey, l_partkey, l_suppkey, l_quantity,
+    ///                  1000 * l_extendedprice, 1000 * l_discount]
+    /// ```
+    ///
+    /// Row `i` of column `j` is the cell of base relation row `i`: this circuit
+    /// assigns every base relation in input order and never re-orders it, and it
+    /// stores each attribute VERBATIM (the packing of `partsupp[0]` and the
+    /// 1000x scaling are done by the loader, so the committed value and the
+    /// witnessed value are the same field element).
+    ///
+    /// Relations shorter than the longest one are padded with the circuit's
+    /// zero-pinned anchor cell, matching the zero-extension the binding applies
+    /// to the committed columns.
+    pub fn assign_with_input_cells(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        part: Vec<Vec<u64>>,
+        supplier: Vec<Vec<u64>>,
+        nation: Vec<Vec<u64>>,
+        orders: Vec<Vec<u64>>,
+        partsupp: Vec<Vec<u64>>,
+        lineitem: Vec<Vec<u64>>,
+        cond_hash: u64,
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
+        self.assign_inner(
+            layouter, part, supplier, nation, orders, partsupp, lineitem, cond_hash, true,
+        )
+    }
+
+    fn assign_inner(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        part: Vec<Vec<u64>>,     // [p_partkey, p_name_hash]
+        supplier: Vec<Vec<u64>>, // [s_suppkey, s_nationkey]
+        nation: Vec<Vec<u64>>,   // [n_nationkey, n_name_hash]
+        orders: Vec<Vec<u64>>,   // [o_orderkey, o_year]
+        partsupp: Vec<Vec<u64>>, // [ps_key, ps_supplycost]
+        lineitem: Vec<Vec<u64>>, // [l_orderkey,l_partkey,l_suppkey,l_qty,l_ext,l_disc]
+        cond_hash: u64,          // :1 (simplified)
+        collect_inputs: bool,
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
+        // The binding covers max_i |R_i| rows and zero-extends the shorter
+        // committed columns, so the returned witness has to reach the same
+        // height.
+        let bind_rows = part
+            .len()
+            .max(supplier.len())
+            .max(nation.len())
+            .max(orders.len())
+            .max(partsupp.len())
+            .max(lineitem.len());
         // chips
         // let iz_part_chip = IsZeroChip::construct(self.config.iz_part.clone());
         // let iz_part_chip2 = iz_part_chip.clone();
@@ -1413,7 +1531,7 @@ impl<F: Field + Ord> TestChip<F> {
         // clean parts of the other five relations are derived from l_join below,
         // so the neighbours are re-reduced around the hidden tuple and the
         // partition still satisfies conditions (1)-(3).
-        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+        let tamper = hide_one_clean_tuple();
         if tamper && !l_join.is_empty() {
             let hidden = l_join.remove(0);
             l_dis.push(hidden);
@@ -1429,7 +1547,7 @@ impl<F: Field + Ord> TestChip<F> {
         // still holds, and with c == pred on every row the clean channel of
         // condition (4) equals its input channel row by row, so the two root
         // sums agree for free. Only condition (3) can see this.
-        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let all_clean = mark_all_clean();
         if all_clean {
             for f in l_cln.iter_mut() {
                 *f = 1;
@@ -1635,6 +1753,10 @@ impl<F: Field + Ord> TestChip<F> {
             || "Q9 witness",
             |mut region| {
                 let iz_part_chip = IsZeroChip::construct(self.config.iz_part.clone());
+                // The committed columns, in `TpchInput::Q9::columns()` order:
+                // part | supplier | nation | orders | partsupp | lineitem.
+                // Filled below from the very cells the base-table gates read.
+                let mut input_cells: Vec<Vec<AssignedCell<F, F>>> = vec![Vec::new(); 16];
                 // base tables
                 for i in 0..part.len() {
                     self.config.q_part_pred.enable(&mut region, i)?;
@@ -1644,12 +1766,15 @@ impl<F: Field + Ord> TestChip<F> {
                         Value::known(F::from(part[i][1]) - F::from(cond_hash)),
                     )?;
                     for j in 0..2 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "part",
                             self.config.part[j],
                             i,
                             || Value::known(F::from(part[i][j])),
                         )?;
+                        if collect_inputs {
+                            input_cells[j].push(cell);
+                        }
                     }
                     region.assign_advice(
                         || "cond",
@@ -1672,52 +1797,87 @@ impl<F: Field + Ord> TestChip<F> {
 
                 for i in 0..supplier.len() {
                     for j in 0..2 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "supplier",
                             self.config.supplier[j],
                             i,
                             || Value::known(F::from(supplier[i][j])),
                         )?;
+                        if collect_inputs {
+                            input_cells[2 + j].push(cell);
+                        }
                     }
                 }
                 for i in 0..nation.len() {
                     for j in 0..2 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "nation",
                             self.config.nation[j],
                             i,
                             || Value::known(F::from(nation[i][j])),
                         )?;
+                        if collect_inputs {
+                            input_cells[4 + j].push(cell);
+                        }
                     }
                 }
                 for i in 0..orders.len() {
                     for j in 0..2 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "orders",
                             self.config.orders[j],
                             i,
                             || Value::known(F::from(orders[i][j])),
                         )?;
+                        if collect_inputs {
+                            input_cells[6 + j].push(cell);
+                        }
                     }
                 }
                 for i in 0..partsupp.len() {
                     for j in 0..2 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "partsupp",
                             self.config.partsupp[j],
                             i,
                             || Value::known(F::from(partsupp[i][j])),
                         )?;
+                        if collect_inputs {
+                            input_cells[8 + j].push(cell);
+                        }
                     }
                 }
                 for i in 0..lineitem.len() {
                     for j in 0..6 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "lineitem",
                             self.config.lineitem[j],
                             i,
                             || Value::known(F::from(lineitem[i][j])),
                         )?;
+                        if collect_inputs {
+                            input_cells[10 + j].push(cell);
+                        }
+                    }
+                }
+
+                // The zero anchor for the binding's padding rows. The gate
+                // `bind padding anchor is zero` forces this one cell to 0, so a
+                // padding row copy-constrained to it cannot be used to cancel a
+                // lie told on a real row. Assigned unconditionally, so the
+                // baseline and the bound circuit lay out the same witness.
+                self.config.q_zero.enable(&mut region, 1)?;
+                let zero_anchor = region.assign_advice(
+                    || "bind padding anchor",
+                    self.config.instance_test,
+                    1,
+                    || Value::known(F::ZERO),
+                )?;
+                if collect_inputs {
+                    for col in input_cells.iter_mut() {
+                        while col.len() < bind_rows {
+                            col.push(zero_anchor.clone());
+                        }
                     }
                 }
 
@@ -2243,7 +2403,7 @@ impl<F: Field + Ord> TestChip<F> {
                     0,
                     || Value::known(F::from(1u64)),
                 )?;
-                Ok(out)
+                Ok((out, input_cells))
             },
         )
     }
@@ -2712,10 +2872,10 @@ mod tests {
         // so that Conservation, Non-Membership and Pairwise Consistency all
         // still hold. Only condition (4) can see this, so the circuit must now
         // reject.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         // Checked when the sentinel and profit-pad pins were added: this
         // direction rejects through exactly one constraint, the root equality
@@ -2737,10 +2897,10 @@ mod tests {
         // instance though, and the dangling tuples counted above have no partner
         // in the clean part of the adjacent relation, so a Pairwise Consistency
         // lookup must reject.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = unreduced.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         // Checked when the sentinel and profit-pad pins were added: this
         // direction rejects through Pairwise Consistency lookups only, and

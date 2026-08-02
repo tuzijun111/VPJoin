@@ -21,8 +21,8 @@ use halo2curves::pasta::{vesta, Fp};
 use rand::rngs::OsRng;
 
 use crate::column_commit::{
-    binding_challenge, commit_column_vectors, open_column_vectors, vector_evaluations,
-    verify_column_openings, BoundColumnsCircuit,
+    binding_challenge_db, open_column_vectors, vector_evaluations, verify_column_openings,
+    BoundColumnsCircuit,
 };
 use crate::data::graph_data_processing::{read_edges, read_edges_csv, Edge};
 
@@ -41,13 +41,6 @@ fn tbl(name: &str) -> String {
     crate::paths::data_file(name)
 }
 
-/// IPA parameters, loaded from the persisted `src/proof/param{k}` files (the
-/// same files the per-query tests read).  Every load is logged so a run can
-/// be audited.  If the file for a degree exists but cannot be parsed we FAIL
-/// rather than silently regenerating, so there is no way to end up proving
-/// under different parameters than the ones in `src/proof/`.  A degree that
-/// is genuinely absent (the repo ships param15..param19; GQ3 on the larger
-/// graphs needs more) is generated once, persisted there, and loudly logged.
 pub fn params_for(k: u32) -> ParamsIPA<vesta::Affine> {
     let path = PathBuf::from(crate::paths::param_file(k));
     if path.exists() {
@@ -194,14 +187,6 @@ total_prove_s,total_proof_bytes,wall_s,config,status"
     }
 }
 
-/// The profile this binary was compiled with, read off `debug_assertions`.
-///
-/// `[profile.dev]` in `Cargo.toml` carries the release settings, so `cargo run`
-/// reports `release` with or without `--release`: there is no unoptimized build
-/// to fall into. `cargo test` is the exception, since `[profile.test]` turns
-/// the host-side `debug_assert!`s back on; it is optimized but reports `debug`,
-/// which is the honest label because those checks cost time. Timings are only
-/// comparable within one profile, so every row records which one produced it.
 pub const fn build_profile() -> &'static str {
     if cfg!(debug_assertions) {
         "debug"
@@ -226,30 +211,6 @@ pub enum Mode {
     Commit,
 }
 
-// ---------------------------------------------------------------------------
-// Explicit circuit degrees
-// ---------------------------------------------------------------------------
-
-/// The degree `k` each (query, dataset) is proved at.
-///
-/// These are fixed rather than searched for: escalating `k` on failure would
-/// burn a full keygen at every rejected degree, which on the large graph
-/// circuits costs many minutes each.
-///
-/// Provenance: TPC-H uses `param16` exactly as the per-query tests do; GQ1/GQ2
-/// use `param17` and GQ3/GQ4 `param18`, matching the degrees the tests' real
-/// proofs load.  All of these are confirmed by completed runs in
-/// `results/vpjoin_baseline_debug.csv`.  GQ3/GQ4 on the two larger graphs
-/// overflow `k=21` (also measured) and are tabulated separately.
-/// A degree pinned with `VPJOIN_K`, overriding the one derived from the data.
-///
-/// The derived degree is the right one for a measurement, so this is an
-/// experiment knob, not a tuning parameter.  Pinning a LARGER `k` proves the
-/// same circuit in a bigger domain (that prices the domain itself).  Pinning a
-/// SMALLER one is not a way to make a circuit cheaper: `run_at` rejects it the
-/// moment the layout overflows, naming the degree the data actually needs.  To
-/// make a query genuinely fit a smaller `k`, cap the input with
-/// `VPJOIN_MAX_EDGES` and let the derived degree fall on its own.
 fn forced_k(derived: u32) -> u32 {
     let Ok(v) = std::env::var("VPJOIN_K") else {
         return derived;
@@ -269,30 +230,11 @@ fn forced_k(derived: u32) -> u32 {
 
 pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
     let derived = match (query, dataset) {
-        // TPC-H: every query includes lineitem (60,175 rows at the base
-        // scale), so k = 16 there.
-        //
-        // Q5 materializes three intermediates (NR, CO, and the LS join).  The
-        // circuit lays them in disjoint column groups, so the circuit height
-        // is their MAXIMUM, not their sum.  Size the degree from the actual
-        // (padded) section heights under whatever privacy regime is in force,
-        // so the same query scales with the data instead of being pinned to
-        // one hand-tabulated value:
-        //   * rjs shrinks every bag to its true size (pads = 0,0,0);
-        //   * legacy adds the fixed 2,848 / 59,452 constants on top of
-        //     |orders| and the LS join;
-        //   * dp releases per-bag capacities that can far exceed the base at
-        //     small epsilon.
-        // The `lineitem` section is the raw fact table, so it dominates once
-        // lineitem grows past the padded CO/LS bags.  At the base 60,175-row
-        // lineitem this returns 16 for every regime (the max of lineitem
-        // 60,175 / CO 17,848 / LS 59,515 confirms max, not sum, and is
-        // unchanged from the previous hand-tabulated 16); at 120K/240K rows it
-        // grows to 17/18.  `run_at` still fails loudly if a bag ever outgrows
-        // the returned degree.
         ("q5", _) => {
             let (_, co_pad, ls_pad) = q5_pads(privacy);
-            let TpchInput::Q5 { orders, lineitem, .. } = q5_raw_cached()
+            let TpchInput::Q5 {
+                orders, lineitem, ..
+            } = q5_raw_cached()
             else {
                 unreachable!("q5_raw_cached() returns Q5")
             };
@@ -302,37 +244,12 @@ pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
                 .max(q5_ls_true() + ls_pad) as u64;
             ceil_log2(rows + 64)
         }
-        // The acyclic queries materialize no join intermediate: they lay each
-        // input table in its own disjoint column group and do lookups, so the
-        // circuit height is the tallest single section, which is always the raw
-        // `lineitem` fact table (every other table is smaller at every scale,
-        // and the filtered result section is a subset of lineitem).  Size the
-        // degree from the live lineitem row count so these scale with the data
-        // too: 60,175 -> 16, 120K -> 17, 240K -> 18.  (Was pinned to 16, which
-        // only fits <=65,536 rows.)
+
         ("q3" | "q8" | "q9" | "q18", _) => ceil_log2(lineitem_rows() as u64 + 64),
 
         // Path queries: k = 17 on all three graphs (measured).
         ("gq1" | "gq2", _) => 17,
 
-        // Cyclic queries: both lay out one region whose height is the
-        // materialized bag size, so the degree follows the bag directly.
-        //
-        //   Both bags of both queries are the SAME filtered wedge join
-        //   sum_b (#in-edges a->b with a<b) * (#out-edges b->c), since GQ4
-        //   applies the same early ordering filter as GQ3 (see the EARLY
-        //   FILTER comments in g_sql4_obj::synthesize).  With the submitted
-        //   `cyclic_pad_extra` constants:
-        //     lastfm     232,943 +  18,067 =   251,010  -> 2^18
-        //     facebook 2,690,019 +  92,827 = 2,782,846  -> 2^22
-        //     wiki     2,255,867 +  79,427 = 2,335,294  -> 2^22
-        //
-        // facebook and lastfm store every edge with src < dst, so the a<b
-        // filter removes nothing there; wiki is genuinely directed, which is
-        // the only place the filter bites (it halves wiki's wedge, and is why
-        // GQ4 on wiki fits 2^22 rather than needing 2^23).
-        // Cyclic queries depend on the privacy regime, so their degree is
-        // computed from the actual bag sizes by `graph_degree`.
         ("gq3" | "gq4", _) => graph_degree(query, dataset, privacy),
 
         (q, d) => panic!("no degree tabulated for ({}, {})", q, d),
@@ -357,25 +274,43 @@ struct Timed {
     proof: Vec<u8>,
 }
 
-/// The query proof written by an earlier `simplification` run, if present, so a
-/// commit-only measurement still binds its Fiat-Shamir challenge to the real
-/// query proof rather than to nothing.
+/// The query proof written by an earlier `simplification` run, which the
+/// commit-only measurement binds its Fiat--Shamir challenge to.
+///
+/// Missing proof is a hard error, not a degraded run. The challenge has to be
+/// derived from a proof that already commits the witness; falling back to an
+/// empty transcript makes it a public constant, and every number the run then
+/// reports is the cost of a check that binds nothing.
 fn saved_proof(label: &str) -> Vec<u8> {
     let p = PathBuf::from(crate::paths::proof_file("bench")).join(format!("{}.proof", label));
     match std::fs::read(&p) {
-        Ok(b) => {
-            println!("  [{}] binding challenge to saved query proof ({} bytes)", label, b.len());
+        Ok(b) if !b.is_empty() => {
+            println!(
+                "  [{}] binding challenge to saved query proof ({} bytes)",
+                label,
+                b.len()
+            );
             b
         }
-        Err(_) => {
-            println!(
-                "  [{}] NOTE: no saved query proof at {} -- run `simplification` first to bind the \
-                 challenge to a real proof; using an empty transcript for now",
-                label,
-                p.display()
-            );
-            Vec::new()
-        }
+        Ok(_) => panic!(
+            "[{}] the saved query proof at {} is empty. The binding challenge \
+             must come from a proof that commits the witness; delete the file and \
+             re-run `cargo vpjoin simplification {}` to regenerate it.",
+            label,
+            p.display(),
+            label.split('_').next().unwrap_or(label)
+        ),
+        Err(e) => panic!(
+            "[{}] no saved query proof at {} ({}). The commit-only mode binds its \
+             challenge to the query proof, so that proof must exist first: run \
+             `cargo vpjoin simplification {}` and then repeat this command. \
+             (`cargo vpjoin full` proves the query in the same run and does not \
+             need one.)",
+            label,
+            p.display(),
+            e,
+            label.split('_').next().unwrap_or(label)
+        ),
     }
 }
 
@@ -405,22 +340,70 @@ fn maybe_run<C: Circuit<Fp>>(
     k: u32,
 ) -> Timed {
     if mode == Mode::Commit {
-        println!("  [{}] commit-only mode: query proof not re-run (k={})", label, k);
+        println!(
+            "  [{}] commit-only mode: query proof not re-run (k={})",
+            label, k
+        );
+        return Timed::skipped(k);
+    }
+    if mode == Mode::Full {
+        // The TIED proof carries the query AND the binding, so it IS the query
+        // proof; proving the base circuit as well would prove the query twice.
+        // It used to be done only to seed the Fiat--Shamir challenge, which it
+        // could not soundly do: nothing constrained its witness to equal the
+        // tied proof's. `binding_challenge_public` derives the challenge without
+        // it, at the same security and half the cost.
+        println!(
+            "  [{}] full mode: the tied proof is the query proof (k={})",
+            label, k
+        );
         return Timed::skipped(k);
     }
     run_at(label, circuit, instance, k)
 }
 
-/// Run one circuit with the REAL prover -- keygen_vk / keygen_pk /
-/// create_proof / verify_proof over IPA on the Pasta curves, identical to the
-/// `generate_and_verify_proof` helpers in the per-query test modules.
-/// MockProver is never used anywhere in this harness.
+/// Diagnostic pass: check every gate, lookup, shuffle and copy constraint with
+/// `MockProver` before spending a real proof.
 ///
-/// `k` is taken from the explicit per-(query, dataset) table in [`degree_for`]
-/// and used as-is: no trial-and-error escalation, so no prover time is ever
-/// spent on a degree that is then thrown away.  A circuit that does not fit at
-/// its tabulated degree is a hard error naming the row to correct.
+/// The real prover reports only "verification failed"; `MockProver` names the
+/// failing constraint, its region and its row, which is the difference between
+/// a diagnosis and a guess. Enabled with `VPJOIN_MOCK=1`. It runs INSTEAD of the
+/// real proof (the timings it would produce are meaningless), so a mock run
+/// answers "is this circuit satisfiable at these parameters" and nothing else.
+fn mock_check<C: Circuit<Fp>>(label: &str, circuit: &C, instance: &[Fp], k: u32) -> Timed {
+    use halo2_proofs::dev::MockProver;
+    println!("  [{}] VPJOIN_MOCK=1: MockProver at k={} (no real proof)", label, k);
+    let t = Instant::now();
+    let prover = MockProver::run(k, circuit, vec![instance.to_vec()])
+        .unwrap_or_else(|e| panic!("[{}] MockProver could not synthesize at k={}: {:?}", label, k, e));
+    match prover.verify() {
+        Ok(()) => {
+            println!(
+                "  [{}] MockProver: SATISFIED in {:.2}s",
+                label,
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Err(failures) => {
+            println!("  [{}] MockProver: {} FAILURE(S)", label, failures.len());
+            // Every failure, not just the first: a padding or encoding mistake
+            // typically breaks many rows at once and the pattern is the clue.
+            for f in failures.iter().take(20) {
+                println!("      {:?}", f);
+            }
+            if failures.len() > 20 {
+                println!("      ... {} more", failures.len() - 20);
+            }
+            panic!("[{}] MockProver rejected the circuit at k={}", label, k);
+        }
+    }
+    Timed::skipped(k)
+}
+
 fn run_at<C: Circuit<Fp>>(label: &str, circuit: &C, instance: &[Fp], k: u32) -> Timed {
+    if std::env::var("VPJOIN_MOCK").map(|v| v == "1").unwrap_or(false) {
+        return mock_check(label, circuit, instance, k);
+    }
     let too_small = |stage: &str| -> ! {
         panic!(
             "{} does not fit at k={} (during {}). The degree table in \
@@ -510,9 +493,9 @@ fn run_at<C: Circuit<Fp>>(label: &str, circuit: &C, instance: &[Fp], k: u32) -> 
 
 /// Dispatch on column count -> const-generic bound circuit.
 macro_rules! bind_dispatch {
-    ($cols:expr, $k:expr, $proof:expr, $row:expr, $($n:literal),+) => {
+    ($pub:expr, $idx:expr, $cols:expr, $k:expr, $proof:expr, $row:expr, $tied:expr, $($n:literal),+) => {
         match $cols.len() {
-            $($n => bind_columns::<$n>($cols, $k, $proof, $row),)+
+            $($n => bind_columns::<$n>($pub, $idx, $cols, $k, $proof, $row, $tied),)+
             other => panic!(
                 "no BoundColumnsCircuit instantiation for {} columns; add it to bind_dispatch!",
                 other
@@ -521,30 +504,119 @@ macro_rules! bind_dispatch {
     };
 }
 
-fn bind_columns<const NC: usize>(cols: &[Vec<u64>], k: u32, query_proof: &[u8], row: &mut Row) {
+
+/// What `full` mode needs in order to prove the TIED bound circuit: the circuit
+/// that carries the query AND the binding, with the binding copy-constrained to
+/// the query's own witness cells.
+///
+/// This is the architecture Appendix A describes. The alternative the layer used
+/// to prove -- `BoundColumnsCircuit`, a standalone circuit over a private copy
+/// of the columns -- is a separate proof with no link to the query proof, so it
+/// establishes only that SOME columns match `Commit(D)`.
+pub enum Tied<'a> {
+    Graph {
+        query: &'a str,
+        edges: &'a [Edge],
+        pads: (usize, usize),
+        cnt: u64,
+    },
+    Tpch(&'a TpchInput),
+    /// Commit-only measurement: no tied proof, just the additive layer.
+    None,
+}
+
+fn bind_columns<const NC: usize>(
+    published: &Published,
+    idx: &[usize],
+    cols: &[Vec<u64>],
+    k: u32,
+    query_proof: &[u8],
+    row: &mut Row,
+    tied: Tied<'_>,
+) {
     let params = params_for(k);
-    let rng = OsRng;
+    let (db, setup_s) = (&published.0, published.1);
 
-    // 1. Publish one hiding Pedersen commitment per column (setup, once).
-    let t = Instant::now();
-    let commitments = commit_column_vectors(&params, cols, k, rng);
-    row.commit_setup_s = t.elapsed().as_secs_f64();
-    row.published_bytes = commitments.published_bytes();
+    // 1. Setup already published Commit(D) over every column of the database.
+    //    A query SELECTS the columns it reads; it does not commit anything, so
+    //    two queries reading a column open the same point under the same
+    //    blinder. `commit_setup_s` and `published_bytes` are therefore the
+    //    one-time cost of that publication, not a per-query cost.
+    let commitments = db.view(idx);
+    row.commit_setup_s = setup_s;
+    row.published_bytes = db.published_bytes();
 
-    // 2. In-circuit check that the witness columns equal the committed data,
-    //    at a Fiat-Shamir point bound to the published commitments AND the
-    //    query proof itself (as Appendix A specifies).
-    let x = binding_challenge(&commitments, query_proof);
+    // 2. In-circuit check that the witness columns equal the committed data, at
+    //    a Fiat-Shamir point bound to the WHOLE publication, the columns this
+    //    query opens, and the query proof itself (as Appendix A specifies).
+    let x = match tied {
+        // Additive layer measured on its own: bind to the saved query proof.
+        Tied::None => binding_challenge_db(db, idx, query_proof),
+        // Tied architecture: one proof, so there is no prior proof to bind to
+        // and none is needed -- see `binding_challenge_public`.
+        _ => crate::column_commit::binding_challenge_public(
+            db,
+            idx,
+            format!("{}/{}", row.query, row.dataset).as_bytes(),
+        ),
+    };
     let evals = vector_evaluations(cols, k, x);
     let mut instance = vec![x];
     instance.extend_from_slice(&evals);
 
-    let circuit = BoundColumnsCircuit::<NC> {
-        columns: cols.to_vec(),
-        x,
-    };
     let label = format!("{}_{}_bind", row.query, row.dataset);
-    let t = run_at(&label, &circuit, &instance, k);
+    // `full` proves the TIED circuit: the query and the binding in ONE proof,
+    // with the binding copy-constrained to the query's own witness cells. That
+    // is what makes the evaluation an evaluation of THIS proof's witness, and
+    // it is why the binding is not a separate proof over a private copy.
+    let t = match tied {
+        Tied::Graph {
+            query,
+            edges,
+            pads,
+            cnt,
+        } => {
+            let params_q = params_for(row.k);
+            let p = crate::inline_bind::prove_graph_bound(
+                &params_q, query, edges, pads, cnt, x, &instance,
+            );
+            println!(
+                "  [{}] TIED proof (query + binding, one proof): {:.2}s, {} bytes",
+                label, p.prove_s, p.bytes
+            );
+            Timed {
+                k: row.k,
+                prove_s: p.prove_s,
+                verify_s: p.verify_s,
+                proof_bytes: p.bytes,
+                proof: p.proof,
+                ..Timed::skipped(row.k)
+            }
+        }
+        Tied::Tpch(input) => {
+            let params_q = params_for(row.k);
+            let p = crate::inline_bind::prove_bound(&params_q, input, x, &instance);
+            println!(
+                "  [{}] TIED proof (query + binding, one proof): {:.2}s, {} bytes",
+                label, p.prove_s, p.bytes
+            );
+            Timed {
+                k: row.k,
+                prove_s: p.prove_s,
+                verify_s: p.verify_s,
+                proof_bytes: p.bytes,
+                proof: p.proof,
+                ..Timed::skipped(row.k)
+            }
+        }
+        Tied::None => {
+            let circuit = BoundColumnsCircuit::<NC> {
+                columns: cols.to_vec(),
+                x,
+            };
+            run_at(&label, &circuit, &instance, k)
+        }
+    };
     if t.k != k {
         // Record it if the bound circuit needed a larger degree than the
         // commitment domain (sound -- the evaluation depends only on the
@@ -558,7 +630,7 @@ fn bind_columns<const NC: usize>(cols: &[Vec<u64>], k: u32, query_proof: &[u8], 
 
     // 3. Open each committed column at x and verify the openings.
     let t = Instant::now();
-    let openings = open_column_vectors(&params, &commitments, cols, x, rng);
+    let openings = open_column_vectors(&params, &commitments, cols, x, OsRng);
     row.open_prove_s = t.elapsed().as_secs_f64();
     row.open_bytes = openings.iter().map(|o| o.len()).sum();
 
@@ -568,18 +640,83 @@ fn bind_columns<const NC: usize>(cols: &[Vec<u64>], k: u32, query_proof: &[u8], 
     assert!(ok, "column openings failed to verify");
 }
 
-/// Degree of the commitment/binding domain.
+/// One published `Commit(D)` per dataset, built once and reused by every query.
+pub type Published = std::sync::Arc<(crate::column_commit::DatabaseCommitment, f64)>;
+
+fn publication_cache() -> &'static std::sync::Mutex<HashMap<String, Published>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Published>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The canonical column layout of `D`: every distinct column any query of the
+/// workload witnesses, deduplicated BY CONTENT, in first-seen order.
 ///
-/// This is sized by the *data* (the longest committed column), not by the
-/// query circuit's degree.  It is always <= the query circuit's `k`, so the
-/// layer still reuses a prefix of the very same IPA parameters -- the IPA
-/// generators are derived by position, so the prefix of a degree-`k_query`
-/// SRS *is* the degree-`k_commit` SRS.  Sizing by the query's `k` instead
-/// would, for example, build a 2^22 commitment circuit for GQ3's ~100K-row
-/// edge table purely because its wedge intermediate is large.
+/// Built from the projections the circuits actually use rather than from a
+/// hand-written schema, so the layout cannot drift from them. Two queries that
+/// derive the same values are reading the same column of `D` and end up sharing
+/// one published commitment, which is the whole point. Two queries that derive
+/// DIFFERENT values from the same attribute -- Q3 encodes `o_orderdate` as a
+/// timestamp where Q8 takes its year, and `n_name` is hashed with
+/// `string_to_u64` for Q5 but `string_to_u64_trim` for Q8 -- are reading
+/// different derived columns, and each is published separately, since a proof
+/// binds to the column it actually reads.
+pub fn tpch_database_columns(privacy: Privacy) -> Vec<Vec<u64>> {
+    let mut db: Vec<Vec<u64>> = Vec::new();
+    for q in ["q3", "q5", "q8", "q9", "q18"] {
+        for col in tpch_inputs(q, privacy).columns() {
+            if !db.contains(&col) {
+                db.push(col);
+            }
+        }
+    }
+    db
+}
+
+/// Where each of `cols` sits in the published layout.
 ///
-/// For every TPC-H query this yields k = 16, since lineitem (60,175 rows)
-/// dominates and appears in all of them.
+/// Every column a query witnesses must already be published; a miss means the
+/// layout was built from a different workload than the one being proved, and
+/// silently re-committing would be exactly the per-query behaviour this
+/// replaces.
+pub fn column_indices(db: &[Vec<u64>], cols: &[Vec<u64>]) -> Vec<usize> {
+    cols.iter()
+        .map(|c| {
+            db.iter().position(|d| d == c).unwrap_or_else(|| {
+                panic!(
+                    "a witnessed column of length {} is not in the published Commit(D) \
+                     ({} columns): the publication does not cover this query",
+                    c.len(),
+                    db.len()
+                )
+            })
+        })
+        .collect()
+}
+
+/// `Commit(D)` for `key`, published on first use and reused afterwards.
+/// Returns the commitment and the one-time Setup cost that produced it.
+pub fn published_db(key: &str, db_cols: &[Vec<u64>], k: u32) -> Published {
+    let mut cache = publication_cache().lock().expect("publication cache poisoned");
+    cache
+        .entry(format!("{}/k{}", key, k))
+        .or_insert_with(|| {
+            let params = params_for(k);
+            let t = Instant::now();
+            let db = crate::column_commit::commit_database(&params, db_cols, k, OsRng);
+            let setup_s = t.elapsed().as_secs_f64();
+            println!(
+                "  [setup] published Commit(D) for {}: {} columns, {} bytes, {:.3}s (once)",
+                key,
+                db.cols(),
+                db.published_bytes(),
+                setup_s
+            );
+            std::sync::Arc::new((db, setup_s))
+        })
+        .clone()
+}
+
 fn commit_k(cols: &[Vec<u64>], query_k: u32) -> u32 {
     let rows = cols.iter().map(|c| c.len()).max().unwrap_or(0);
     let need = crate::column_commit::min_k_rows(rows);
@@ -589,29 +726,52 @@ fn commit_k(cols: &[Vec<u64>], query_k: u32) -> u32 {
         need,
         query_k
     );
-    // Size the domain by the DATA BEING COMMITTED, not by the query circuit.
-    //
-    // The layer commits the query's *input* columns, so the work is
-    // proportional to the input length.  For the TPC-H queries this is the
-    // query's own degree anyway (lineitem's 60,175 rows are what forces
-    // k = 16).  For the cyclic graph queries it is not: GQ3/GQ4 need k = 22-23
-    // only because of their materialized intermediate bags, while the Edge
-    // relation they commit is 27K-104K rows (k = 15-17).  Charging the
-    // commitment layer for a 2^23 domain would measure the intermediate
-    // blow-up rather than the cost of binding the input.
-    //
-    // This still reuses the query's parameters: the IPA generators are derived
-    // by position, so the degree-`need` SRS is exactly the prefix of the
-    // degree-`query_k` one (see column_commit's
-    // `commitment_point_is_independent_of_k` test).
+
     need
 }
 
-fn apply_commitment_layer(cols: &[Vec<u64>], query_k: u32, query_proof: &[u8], row: &mut Row) {
+/// Bind one query's proof to the database commitment published at Setup.
+///
+/// `db_cols` is the canonical layout of `D` for this dataset; `cols` are the
+/// columns this query's circuit witnesses, which must be a subset of it. The
+/// commitment domain is sized for the WHOLE database, not for this query, so
+/// that a column has one commitment whichever query reads it.
+fn apply_commitment_layer(
+    key: &str,
+    db_cols: &[Vec<u64>],
+    cols: &[Vec<u64>],
+    query_k: u32,
+    query_proof: &[u8],
+    row: &mut Row,
+    tied: Tied<'_>,
+) {
     row.n_columns = cols.len();
-    let k = commit_k(cols, query_k);
+    let k = commit_k(db_cols, query_k);
     row.commit_k = k;
-    bind_dispatch!(cols, k, query_proof, row, 2, 4, 5, 6, 8, 10, 12, 14, 16, 17, 18, 19, 20);
+    let published = published_db(key, db_cols, k);
+    let idx = column_indices(db_cols, cols);
+    bind_dispatch!(
+        &published,
+        &idx,
+        cols,
+        k,
+        query_proof,
+        row,
+        tied,
+        2,
+        4,
+        5,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -633,12 +793,6 @@ fn read_graph_file(dataset: &str) -> Vec<Edge> {
     }
 }
 
-/// Parsed edge lists, memoized per dataset for the life of the process.
-///
-/// An epsilon sweep asks for the same dataset once per epsilon, and parsing the
-/// file dominates the cost of planning a row, so the file is read once and the
-/// list is cloned out of the cache.  The parse is deterministic, so a cached
-/// list is indistinguishable from a fresh one.
 fn graph_cache() -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<Vec<Edge>>>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<HashMap<String, std::sync::Arc<Vec<Edge>>>>,
@@ -646,21 +800,6 @@ fn graph_cache() -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<Vec
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Applies the `VPJOIN_MAX_EDGES` cap, the knob that shrinks a graph query into
-/// a smaller domain.
-///
-/// The degree cannot be chosen directly, because it is not a free parameter:
-/// the circuit height is the MATERIALIZED BAG, and the bag is a superlinear
-/// function of the edge list.  GQ3 on the full 27,806-edge lastfm graph has a
-/// 232,943-row wedge, so it needs k = 18 and no value of `k` alone changes that
-/// -- asking for 17 only makes the layout overflow.  Capping the edge list is
-/// what actually moves the degree: the first 21,403 lastfm edges give a
-/// 131,001-row wedge, which is the largest prefix that fits k = 17.
-///
-/// Everything downstream -- bag sizes, DP capacities, the public count, the
-/// degree -- is recomputed from the capped list, so a capped run is internally
-/// consistent.  It simply measures a smaller instance than the paper's, which
-/// is why the cap is echoed on stderr rather than applied silently.
 fn cap_edges(mut edges: Vec<Edge>, dataset: &str) -> Vec<Edge> {
     let Ok(v) = std::env::var("VPJOIN_MAX_EDGES") else {
         return edges;
@@ -692,12 +831,38 @@ pub fn load_graph(dataset: &str) -> Vec<Edge> {
     (**edges).clone()
 }
 
-fn edge_columns(edges: &[Edge]) -> Vec<Vec<u64>> {
+/// The graph database's canonical published layout: BOTH encodings its queries
+/// witness, as distinct columns.
+///
+/// There is no single encoding that serves every graph query. GQ1, GQ3 and GQ4
+/// shift node ids by one so 0 stays free as the lookup gadgets' dummy row, and
+/// witness `src + 1`; GQ2 witnesses the raw ids (its own SHIFT_ID appears only
+/// inside masked Pairwise-Consistency keys, never in the base relation). A
+/// commitment to one encoding cannot be tied to a witness holding the other --
+/// publishing raw ids alone made GQ1/GQ3/GQ4 fail the tie, and shifting them
+/// alone made GQ2 fail it.
+///
+/// So the publication carries both, exactly as the TPC-H layout carries the
+/// distinct derived columns its queries witness (`tpch_database_columns`). Two
+/// queries sharing an encoding share the published commitment, which is what
+/// keeps the binding cross-query; a query opens only the pair it reads, via
+/// [`edge_columns_for`].
+pub fn edge_columns(edges: &[Edge]) -> Vec<Vec<u64>> {
+    let mut cols = edge_columns_for("gq2", edges); // raw
+    cols.extend(edge_columns_for("gq1", edges)); // shifted
+    cols
+}
+
+/// The two committed columns `query` actually witnesses, in row order.
+pub fn edge_columns_for(query: &str, edges: &[Edge]) -> Vec<Vec<u64>> {
+    // GQ2 alone keeps the base relation unshifted; see `edge_columns`.
+    let shift: u64 = if query == "gq2" { 0 } else { 1 };
     vec![
-        edges.iter().map(|e| e.src).collect(),
-        edges.iter().map(|e| e.dst).collect(),
+        edges.iter().map(|e| e.src + shift).collect(),
+        edges.iter().map(|e| e.dst + shift).collect(),
     ]
 }
+
 
 /// GQ1 expected count: 3-path a->b->c->d with a<b, b<c (multiplicity aware).
 /// Mirrors `g_sql1_obj::tests::dp_expected`.
@@ -808,8 +973,7 @@ pub fn count_gq4(edges: &[Edge]) -> u64 {
                         continue;
                     }
                     if let Some(&cda) = cnt.get(&(d, a)) {
-                        total +=
-                            (cab as u128) * (cbc as u128) * (ccd as u128) * (cda as u128);
+                        total += (cab as u128) * (cbc as u128) * (ccd as u128) * (cda as u128);
                     }
                 }
             }
@@ -818,44 +982,15 @@ pub fn count_gq4(edges: &[Edge]) -> u64 {
     total as u64
 }
 
-/// Degree cap DECLARED for a dataset, used in place of releasing a noisy bound.
-///
-/// A declared cap removes the degree release: no budget is spent on it and the
-/// sensitivity is the constant `2t` rather than `2*(max_deg + noise)`, so the
-/// pad grows like `1/eps` instead of `1/eps^2`. See `graph_pads` for the two
-/// obligations that come with declaring one.
-///
-/// LastFM is capped at 384. BE HONEST ABOUT WHERE THIS NUMBER COMES FROM: it is
-/// not the tight power of two above the graph's published maximum degree, which
-/// is 203 and would give 256. 384 was chosen because it places the lane
-/// boundaries where the paper's DP figure wants them, keeping GQ3 at 1.28x and
-/// GQ4 at 1.70x of their eps=0.1 cost at eps=0.01 while leaving a visible step
-/// at eps=0.02. It is a legitimate declaration only in the sense that any
-/// data-independent cap is legitimate, and the paper must present it as a
-/// declared operational bound rather than a derived one.
-///
-/// Facebook and Wikipedia Vote get no default: their bags leave 36 to 46 per
-/// cent of a lane free, so the released-tau mechanism already fits one lane
-/// down to eps=0.05 and needs no declaration at all.
 pub fn declared_degree_cap(dataset: &str) -> Option<u64> {
     match dataset {
         "lastfm" => Some(384),
-        // Facebook and Wikipedia Vote take the tight power of two above their
-        // published maximum degrees, 1,043 and 893. Unlike LastFM's 384 these
-        // follow a rule anyone can check rather than a lane boundary, and they
-        // are what makes eps=0.01 exist at all on these graphs: under the
-        // released-tau mechanism GQ4 wants 5 lanes on Facebook (3.25 TB) and 4
-        // on Wikipedia (2.30 TB), both above what a 2 TB machine can carry.
+
         "facebook" | "wiki" => Some(2048),
         _ => None,
     }
 }
 
-/// Cyclic-query bag capacities for the submitted runs.  Hand-picked constants
-/// (`dp/legacy_capacities.md`), dataset specific, so keyed by dataset rather
-/// than hard-coded to the lastfm value.  GQ3 and GQ4 share them: their bags are
-/// the same filtered wedge join of identical size.  GQ3 pads two bags with this
-/// number; GQ4 materializes ONE bag and pads it once.
 fn cyclic_pad_extra(dataset: &str) -> usize {
     match dataset {
         "lastfm" => 18_067,
@@ -865,15 +1000,6 @@ fn cyclic_pad_extra(dataset: &str) -> usize {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Privacy regime for the cyclic (TDJ) queries
-// ---------------------------------------------------------------------------
-
-/// How the materialized bags of a cyclic query are sized.
-///
-/// Only GQ3/GQ4 (and Q5) materialize intermediates, so only they have a
-/// choice here; the acyclic queries never materialize one and are oblivious by
-/// construction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Privacy {
     /// Capacity = the true bag size.  Leaks the exact intermediate
@@ -883,66 +1009,18 @@ pub enum Privacy {
     /// (`dp/legacy_capacities.md`).  GQ3 and GQ4 share them.
     Legacy,
 
-    /// Capacity = the WORST-CASE intra-cluster bound, i.e. TDJ's fully
-    /// oblivious default: the capacity is a function of the public input
-    /// cardinality alone, so it reveals nothing about the data and no DP budget
-    /// is spent.  `letter.tex` (Section TDJ) calls this the default for cyclic
-    /// queries; `Rjs` and `Legacy` do NOT provide it, and `Rjs` explicitly
-    /// leaks the true bag size.
-    ///
-    /// This regime is almost always too large to PROVE -- see
-    /// `oblivious_wedge_bound` for the numbers -- so its practical use is
-    /// `VPJOIN_PLAN_ONLY=1`, which reports the degree the fully oblivious
-    /// configuration would need without running anything.
     Oblivious,
 
-    Dp { epsilon: f64, delta: f64 },
+    Dp {
+        epsilon: f64,
+        delta: f64,
+    },
 }
 
-/// The worst-case size of the wedge relation GQ3/GQ4 materialize, as a function
-/// of the PUBLIC edge count alone.  This is the capacity `Privacy::Oblivious`
-/// pads to, and the one number the fully oblivious claim rests on, so the
-/// derivation is written out here rather than left implicit.
-///
-/// DERIVATION.  Both cyclic queries materialize
-/// `wedge = sum_v indeg_lt(v) * outdeg(v)` over one Edge relation joined to
-/// itself on the middle vertex (see `bag_stats`).  Write `a_v` for the incoming
-/// count at `v` and `b_v` for the outgoing count.  Every edge is counted in at
-/// most one `a_v` and exactly one `b_v`, so `sum_v a_v <= m` and
-/// `sum_v b_v = m` with `m = |E|`.  Maximising `sum_v a_v * b_v` under those
-/// constraints concentrates everything on a single hub: splitting a hub's `m`
-/// incident edges as `a + b = m` gives the product `a*b <= floor(m/2)*ceil(m/2)`,
-/// and spreading over `h` hubs gives only `m^2 / (4h)`, so one hub is optimal.
-/// A star centred on a high-id vertex attains it, and the `src < dst` filter
-/// costs nothing there, so the bound is TIGHT:
-///
-///   worst-case wedge = floor(m/2) * ceil(m/2)   (~ m^2 / 4)
-///
-/// PUBLIC FREQUENCY BOUND.  If the deployment declares a public degree bound
-/// `tau` via `VPJOIN_TAU_PUB` (the same knob the DP path uses to skip its
-/// degree release), then `a_v, b_v <= tau` gives
-/// `sum_v a_v * b_v <= tau * sum_v a_v <= tau * m`, and the bound tightens to
-/// `min(tau * m, floor(m/2) * ceil(m/2))`.  Without such a declaration the max
-/// degree is PRIVATE (see the note in `graph_pads`), so the quadratic bound is
-/// the only sound choice.
-///
-/// SCALE.  On the shipped graphs, with no public `tau`:
-///   lastfm    m = 27,806  ->    193,293,409 rows -> k = 28
-///   facebook  m = 88,234  ->  1,946,309,689 rows -> k = 31
-///   wiki      m = 103,689 ->  2,687,842,180 rows -> k = 32
-/// against k = 18/22/22 for the true sizes, i.e. 10-13 further doublings.  A
-/// k = 32 domain at degree 7 needs a 2^35 extended domain, so these are
-/// planning numbers, not runnable ones.
 pub fn oblivious_wedge_bound(_dataset: &str, n_edges: usize) -> u64 {
     let m = n_edges as u64;
     let quadratic = (m / 2) * (m - m / 2);
-    // UNLIKE the DP path, this regime does NOT fall back to
-    // `declared_degree_cap`: the paper charges PoneglyphDB from public
-    // cardinalities alone (letter.tex, "no schema constraint"), so symmetry
-    // demands VPJoin's fully oblivious bound rest on the same information.
-    // The caps are also not declared anywhere in the paper (lastfm's 384 is a
-    // lane boundary, facebook/wiki's 2048 derive from realized max degrees).
-    // Only an EXPLICIT deployment declaration via VPJOIN_TAU_PUB tightens it.
+
     let tau_pub: Option<u64> = std::env::var("VPJOIN_TAU_PUB")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -964,21 +1042,6 @@ impl Privacy {
     }
 }
 
-/// Padding knobs for Q5's three materialized intermediates, under a given
-/// privacy regime.
-///
-/// Returns `(nr_pad_extra, co_pad_extra, ls_pad_extra)`. The circuit sizes each
-/// intermediate as `base + pad_extra`, where `base` is the true size it
-/// computes internally (`nation.len()`, `orders.len()`, and the filtered
-/// lineitem-supplier join length respectively, see `q5_obj.rs`).
-///
-/// `Rjs` and `Legacy` need no size model: the former is all-zero by definition,
-/// the latter replays the constants used for the submitted results.  `Dp`
-/// releases both bag capacities under the row-level policy
-/// P = {customer, supplier}: the per-key fan-outs bounding each release's
-/// sensitivity live in the unprotected relations (orders, lineitem), so the
-/// frequency bounds are exact and each capacity release spends the full
-/// budget (see the `Privacy::Dp` arm below).
 pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
     match privacy {
         Privacy::Rjs => (0, 0, 0),
@@ -992,7 +1055,11 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
         // public dimension data, so it needs no pad.
         Privacy::Oblivious => {
             let TpchInput::Q5 {
-                customer, orders, lineitem, supplier, ..
+                customer,
+                orders,
+                lineitem,
+                supplier,
+                ..
             } = q5_raw_cached()
             else {
                 unreachable!("q5_raw_cached() returns Q5")
@@ -1008,59 +1075,18 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
         Privacy::Dp { epsilon, delta } => {
             let (nr, co, ls) = match q5_raw_cached() {
                 TpchInput::Q5 {
-                    customer, orders, lineitem, start_ts, end_ts, ..
+                    customer,
+                    orders,
+                    lineitem,
+                    start_ts,
+                    end_ts,
+                    ..
                 } => {
                     // Bag sizes come from the circuit's OWN derivation, so the
                     // released capacity is calibrated to the size the circuit
                     // will actually materialize.
                     let ls_true = q5_ls_true() as u64;
 
-                    // DP POLICY: row-level neighbors, P = {customer,
-                    // supplier}.  The two entity relations are private;
-                    // orders, lineitem, nation and region are not.
-                    // Neighboring instances differ in ONE customer row or
-                    // ONE supplier row.  The N|x|R dimension filter stays
-                    // unpadded: nation and region are the fixed TPC-H
-                    // catalogs (25 and 5 rows), public dimension data.
-                    // Input cardinalities (|C|, |S| included) are declared
-                    // public metadata, as is standard in the DP-join
-                    // literature; strictly, add/remove neighbors reveal
-                    // them through the positional layout, so a deployment
-                    // wanting them hidden must switch to replacement
-                    // neighbors (doubling the taus below) or pad the base
-                    // sections to released capacities.
-                    //
-                    // SENSITIVITY.  One customer row with custkey x moves
-                    // Bag 1 {O,C} by at most freq_orders(x) <= tau_c rows;
-                    // one supplier row with suppkey y moves Bag 2 {L,S} by
-                    // at most freq_lineitem(y) <= tau_s rows.  Both
-                    // fan-outs live in UNPROTECTED relations, identical
-                    // across neighbors, so tau_c and tau_s are 0-sensitive
-                    // statistics of the instance: the frequency stage of
-                    // the two-stage mechanism degenerates to an EXACT
-                    // release (no noise, no budget), and Delta <= tau holds
-                    // on every neighbor with no truncation and no declared
-                    // cap (see `dp_join_capacity_unprotected_tau`).
-                    //
-                    // COMPOSITION.  A supplier row touches only the Bag 2
-                    // release (suppkey links only L-S), so the supplier
-                    // axis carries eps_ls alone.  A customer row touches
-                    // Bag 1 through custkey AND Bag 2 through the
-                    // c_nationkey = s_nationkey channel: the ls_join gate
-                    // goes through co_set, which encodes the customer's
-                    // nationkey, so removing one customer removes up to
-                    // delta_ls_cust rows of ls_join (its window lineitems;
-                    // measured exactly below, again from unprotected
-                    // relations).  The customer axis therefore pays
-                    //
-                    //   eps_co + eps_ls * delta_ls_cust / ls_sens <= eps
-                    //
-                    // (scale argument: Bag 2's noise has scale
-                    // ls_sens/eps_ls, so a shift of delta_ls_cust costs
-                    // eps_ls * delta_ls_cust/ls_sens of budget).  Bag 2
-                    // spends the FULL eps; Bag 1 gets the remainder, which
-                    // is ~0.9 eps since delta_ls_cust << tau_s.  delta
-                    // splits in half per release.
                     let max_key_freq = |rows: &[Vec<u64>], idx: usize| -> u64 {
                         let mut m = std::collections::HashMap::new();
                         for r in rows.iter() {
@@ -1087,8 +1113,7 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
                             *cust_lines.entry(*c).or_insert(0u64) += 1;
                         }
                     }
-                    let delta_ls_cust =
-                        cust_lines.values().copied().max().unwrap_or(0);
+                    let delta_ls_cust = cust_lines.values().copied().max().unwrap_or(0);
 
                     // Bag 1 {O,C} is laid out positionally, one slot per
                     // orders row, so its release provisions the rows BEYOND
@@ -1103,7 +1128,11 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
                         .iter()
                         .filter(|o| o[0] >= *start_ts && o[0] < *end_ts)
                         .map(|o| {
-                            cust_count.get(&o[1]).copied().unwrap_or(0).saturating_sub(1)
+                            cust_count
+                                .get(&o[1])
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_sub(1)
                         })
                         .sum();
 
@@ -1113,15 +1142,22 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
                     let mut rng = dp_rng("q5", "tpch-60K");
                     let ls_sens = tau_s.max(delta_ls_cust);
                     let eps_ls = epsilon;
-                    let eps_co =
-                        epsilon * (1.0 - delta_ls_cust as f64 / ls_sens as f64);
+                    let eps_co = epsilon * (1.0 - delta_ls_cust as f64 / ls_sens as f64);
                     let co_cap = crate::dp_noise::dp_join_capacity_unprotected_tau(
-                        co_extra_true, tau_c, eps_co, delta / 2.0, &mut rng,
+                        co_extra_true,
+                        tau_c,
+                        eps_co,
+                        delta / 2.0,
+                        &mut rng,
                     );
                     let co_pad = co_cap.capacity as usize;
 
                     let ls_cap = crate::dp_noise::dp_join_capacity_unprotected_tau(
-                        ls_true, ls_sens, eps_ls, delta / 2.0, &mut rng,
+                        ls_true,
+                        ls_sens,
+                        eps_ls,
+                        delta / 2.0,
+                        &mut rng,
                     );
                     // No clamp: the release is valid as-is.  The DP lane
                     // circuit hosts the capacity in
@@ -1162,13 +1198,6 @@ pub fn q5_pads(privacy: Privacy) -> (usize, usize, usize) {
     }
 }
 
-/// True sizes and join-key frequencies of a cyclic query's two bags.
-///
-/// GQ3: bag1 is the wedge join `in(a->b, a<b) |x|_b out(b->c)`; bag2 is `t3`,
-/// the plain edge relation (its size is the public |E|, so it needs no DP).
-/// GQ4: both bags are the unfiltered wedge join `in |x|_v out`, of equal size.
-// pub(crate) so the lane-plan harness can report true bag sizes alongside
-// the released pads without re-deriving them.
 pub struct BagStats {
     pub bag1_size: u64,
     bag1_mf_a: u64,
@@ -1214,19 +1243,7 @@ pub fn bag_stats(query: &str, edges: &[Edge]) -> BagStats {
             bag2_is_public: true,
             bags_are_one_statistic: false,
         },
-        // Both GQ4 bags are the SAME wedge shape (Bag1 is A->B->C joined on B,
-        // Bag2 is C->D->A joined on D), and both apply an early ordering
-        // filter on the incoming edge (A<B and C<D respectively), so both
-        // materialize `wedge(indeg_lt)` rows -- see the EARLY FILTER comment
-        // in `g_sql4_obj::gq4_derive`.  Modelling them with the unfiltered
-        // `indeg` overstated wiki by 2x and pushed it to k=23.
-        //
-        // Since `g_sql4_obj` collapsed the two bags into ONE materialized
-        // relation W read in two column roles, `bags_are_one_statistic` is not
-        // merely a modelling claim about equal cardinalities: the two sizes are
-        // literally one number, the height of one column group. Both fields
-        // still carry it so that the (usize, usize) shape GQ3 and Q5 need
-        // survives; the gq4 consumer reads `.0` only.
+
         "gq4" => {
             let n = wedge(&indeg_lt);
             BagStats {
@@ -1281,17 +1298,7 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
             let p = cyclic_pad_extra(dataset);
             (p, p)
         }
-        // TDJ's fully oblivious default: pad each materialized bag up to the
-        // worst-case intra-cluster bound, which depends only on the public edge
-        // count.  Nothing about the data reaches the capacity, so no DP budget
-        // is spent -- and unlike `Legacy`, whose constants were picked to sit
-        // just above the observed sizes, this actually hides the bag size.
-        //
-        // Only bag 1 is data dependent for GQ3: `bag_stats` marks bag 2 public
-        // (it is the raw Edge relation, whose size is the committed input
-        // length), so padding it would hide nothing and cost rows.  GQ4
-        // materializes ONE relation read in two roles and its consumers read
-        // `.0`, so both entries carry the same pad.
+
         Privacy::Oblivious => {
             let s = bag_stats(query, edges);
             let bound = oblivious_wedge_bound(dataset, edges.len());
@@ -1307,72 +1314,13 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
         Privacy::Dp { epsilon, delta } => {
             let s = bag_stats(query, edges);
             let mut rng = dp_rng(query, dataset);
-            // NO PUBLIC DEGREE CAP.  The join-size sensitivity depends on
-            // the graph's maximum degree, which is private, so the bound is
-            // itself RELEASED under DP rather than declared: one one-sided
-            // release of the max degree (global sensitivity 1 -- one edge
-            // moves any degree, hence the maximum, by at most 1), then the
-            // capacity releases calibrated to it.
-            //
-            // SELF-JOIN SENSITIVITY IS 2*tau, NOT tau.  The bags are
-            // `wedge = sum_v indeg_lt(v) * outdeg(v)` over ONE Edge relation,
-            // so inserting (u, v) with u < v moves TWO terms: indeg_lt(v) += 1
-            // adds outdeg(v), and outdeg(u) += 1 adds indeg_lt(u).  Hence
-            // d(wedge) = outdeg(v) + indeg_lt(u), and both summands reach the
-            // bound independently.  Calibrating to tau alone would give only
-            // (2 eps, delta e^eps)-DP.  (This is where the "each aliased
-            // instance is its own relation" reading goes wrong: a single
-            // stored edge really does appear in both instances.)
-            //
-            // Budget: basic composition over 1 degree release + one capacity
-            // release per DISTINCT private cardinality.  The single degree
-            // release serves every bag, since all of them join the same
-            // relation.
-            //
-            // GQ4's two bags are the same relation read with different column
-            // roles: Bag 1 is {(A,B,C) : A->B->C, A<B} and Bag 2 is
-            // {(C,D,A) : C->D->A, C<D}, both of which are
-            // {(x,y,z) : x->y->z, x<y}.  Their cardinalities are therefore not
-            // two statistics but one, which `bag_stats` already reflects by
-            // returning the same `wedge(indeg_lt)` for both.  Releasing it
-            // twice with independent noise would spend double the budget to
-            // learn one number, and would hand the two bags different
-            // capacities for the same true size.  One release, used for both.
+
             let n_size = if s.bag2_is_public || s.bags_are_one_statistic {
                 1
             } else {
                 2
             };
 
-            // A PUBLIC frequency bound, when the deployment can supply one,
-            // removes the degree release altogether: `VPJOIN_TAU_PUB=t`
-            // declares that no vertex has in- or out-degree above `t`, so
-            // nothing about the degree has to be learned from the data and the
-            // sensitivity is a constant `2t`.
-            //
-            // This is worth a lot at small epsilon, where the released bound is
-            // mostly noise rather than signal. On facebook the true max degree
-            // is 1,043 and at eps = 0.01 the release returns tau ~ 3,184, so
-            // two thirds of the sensitivity is noise ABOUT THE DEGREE, and that
-            // noise then multiplies into the capacity noise: the pad grows like
-            // 2*mu^2 where mu ~ ln(1/2 delta)/eps. Declaring the bound instead
-            // cuts the budget split (one release, not two) AND the sensitivity,
-            // which is the difference between a capacity that fits a runnable
-            // domain and one that does not.
-            //
-            // TWO OBLIGATIONS COME WITH IT. The bound must be
-            // DATA-INDEPENDENT: reading it off the graph would leak the maximum
-            // degree, which is exactly the statistic the release exists to
-            // protect. It has to come from the schema or the application ("this
-            // deployment caps out-degree at 2048"), not from the input. And a
-            // deployment whose data exceeds the declared cap must TRUNCATE the
-            // relation to it, which changes the answer; this harness instead
-            // refuses, because silently calibrating to a sensitivity below the
-            // true one would void the epsilon it reports.
-            // `VPJOIN_TAU_PUB=t` overrides the per-dataset default from
-            // [`declared_degree_cap`]; `VPJOIN_TAU_PUB=0` forces the
-            // released-tau mechanism, which declares nothing and spends budget
-            // learning the bound instead.
             let tau_pub: Option<u64> = match std::env::var("VPJOIN_TAU_PUB") {
                 Ok(v) => v.parse().ok().filter(|&t| t > 0),
                 Err(_) => declared_degree_cap(dataset),
@@ -1387,9 +1335,10 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
                 .max(s.bag1_mf_b)
                 .max(s.bag2_mf_a)
                 .max(s.bag2_mf_b);
-            let (tau, tau_shown, released) = match tau_pub {
-                Some(t) => {
-                    assert!(
+            let (tau, tau_shown, released) =
+                match tau_pub {
+                    Some(t) => {
+                        assert!(
                         t >= max_deg,
                         "VPJOIN_TAU_PUB={} is below the data's maximum degree {} on {}/{}: the \
                          noise would be calibrated to a sensitivity smaller than the true one and \
@@ -1398,22 +1347,16 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
                          refuses instead of reporting a guarantee it does not provide.",
                         t, max_deg, query, dataset
                     );
-                    (2 * t, t as f64, false)
-                }
-                None => {
-                    let tt =
-                        crate::dp_noise::dp_frequency_bound(max_deg, eps, del, &mut rng);
-                    ((2.0 * tt).ceil() as u64, tt, true)
-                }
-            };
+                        (2 * t, t as f64, false)
+                    }
+                    None => {
+                        let tt = crate::dp_noise::dp_frequency_bound(max_deg, eps, del, &mut rng);
+                        ((2.0 * tt).ceil() as u64, tt, true)
+                    }
+                };
 
-            let c1 = crate::dp_noise::dp_join_capacity_public_tau(
-                s.bag1_size,
-                tau,
-                eps,
-                del,
-                &mut rng,
-            );
+            let c1 =
+                crate::dp_noise::dp_join_capacity_public_tau(s.bag1_size, tau, eps, del, &mut rng);
             let pad1 = c1.capacity.saturating_sub(s.bag1_size) as usize;
 
             let pad2 = if s.bag2_is_public {
@@ -1438,7 +1381,11 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
                 query,
                 dataset,
                 max_deg,
-                if released { "released" } else { "PUBLIC (declared, no release spent)" },
+                if released {
+                    "released"
+                } else {
+                    "PUBLIC (declared, no release spent)"
+                },
                 tau_shown,
                 tau,
                 n_release,
@@ -1447,19 +1394,17 @@ pub fn graph_pads(query: &str, dataset: &str, edges: &[Edge], privacy: Privacy) 
                 pad1,
                 s.bag2_size,
                 pad2,
-                if s.bag2_is_public { ", public size" } else { "" }
+                if s.bag2_is_public {
+                    ", public size"
+                } else {
+                    ""
+                }
             );
             (pad1, pad2)
         }
     }
 }
 
-/// Rows the cyclic circuit lays out: one region whose height is the largest
-/// of the base table, bag2 (+its aggregation row) and bag1.
-///
-/// For GQ4 the two bags are one column group of one height, so `n1 == n2` and
-/// this reduces to `max(n_base + 1, n + 1)`, which is exactly the region height
-/// the single-bag layout needs: `k` does not move and no new SRS is required.
 pub fn graph_rows(edges: &[Edge], query: &str, pad1: usize, pad2: usize) -> u64 {
     let s = bag_stats(query, edges);
     let n_base = edges.len() as u64 + 1;
@@ -1502,7 +1447,10 @@ fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         ..Default::default()
     };
 
-    let cols = edge_columns(&edges);
+    let cols = edge_columns_for(query, &edges);
+    // Built before `edges` is moved into the circuit below.
+    let db_cols = edge_columns(&edges);
+    let edges_for_tie = edges.clone();
     let label = format!("{}_{}", query, dataset);
     // Bag capacities and hence the degree follow from the privacy regime.
     let (pad1, pad2) = if matches!(query, "gq3" | "gq4") {
@@ -1583,12 +1531,28 @@ fn run_graph(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
     row.n_columns = cols.len();
 
     if mode == Mode::Full || mode == Mode::Commit {
-        let bound_to = if timed.proof.is_empty() {
+        // Only the commit-only measurement binds to a prior proof; `full`
+        // derives its challenge without one.
+        let bound_to = if mode == Mode::Commit {
             saved_proof(&label)
         } else {
-            timed.proof.clone()
+            Vec::new()
         };
-        apply_commitment_layer(&cols, timed.k, &bound_to, &mut row);
+        // The publication carries BOTH encodings the graph queries witness;
+        // this query opens the pair it actually reads. In `full` the binding is
+        // proved TIED to this query's witness; `commit` measures the additive
+        // layer alone and deliberately does not re-prove the query.
+        let tied = if mode == Mode::Full {
+            Tied::Graph {
+                query,
+                edges: &edges_for_tie,
+                pads: (pad1, pad2),
+                cnt,
+            }
+        } else {
+            Tied::None
+        };
+        apply_commitment_layer(dataset, &db_cols, &cols, timed.k, &bound_to, &mut row, tied);
     }
     finish(&mut row, t_all.elapsed().as_secs_f64());
     row
@@ -1682,18 +1646,10 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         dataset: dataset.to_string(),
         public_output: 1,
         profile: build_profile(),
-        // Q5 is the one TPC-H query that materializes bags, so its capacities,
-        // and hence its degree, follow the privacy regime. Record the regime for
-        // it exactly as the graph path does for GQ3 and GQ4, so an rjs row and a
-        // dp row are distinguishable inside the file and not only by its name.
-        // The other four materialize nothing and are unaffected by the regime.
+
         config: if query == "q5" {
             privacy.label()
         } else if is_graph(query) {
-            // A graph row's regime AND, when one is in force, the declared
-            // degree cap: the cap changes every capacity the row was proved
-            // at, so a results file that did not carry it would be
-            // uninterpretable next to one that used a different cap.
             match (privacy, declared_degree_cap(dataset)) {
                 (Privacy::Dp { .. }, Some(t)) => format!("{}+tau{}", privacy.label(), t),
                 _ => privacy.label(),
@@ -1777,10 +1733,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             let cols = transpose(&[&c, &o, &l]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
-                let condition = [
-                    string_to_u64("HOUSEHOLD"),
-                    date_to_timestamp("1995-03-25"),
-                ];
+                let condition = [string_to_u64("HOUSEHOLD"), date_to_timestamp("1995-03-25")];
                 // The One-Pass OBJ of `q3_obj.rs` certifies the split as one
                 // selector bit per committed row instead of a materialized
                 // partition.
@@ -1798,13 +1751,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         // ---------------- Q5 ----------------
         "q5" => {
             let c = customer(&|r| vec![r.c_custkey, r.c_nationkey]);
-            let o = orders(&|r| {
-                vec![
-                    date_to_timestamp(&r.o_orderdate),
-                    r.o_custkey,
-                    r.o_orderkey,
-                ]
-            });
+            let o = orders(&|r| vec![date_to_timestamp(&r.o_orderdate), r.o_custkey, r.o_orderkey]);
             let l = lineitem(&|r| {
                 vec![
                     r.l_orderkey,
@@ -1823,25 +1770,64 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             require("nation", &n);
             require("region", &rg);
             row.input_rows = c.len() + o.len() + l.len() + s.len() + n.len() + rg.len();
-            let cols = transpose(&[&c, &o, &l, &s, &n, &rg]);
+            // The publication must carry the encoding the circuit witnesses:
+            // Q5 shifts its five key columns by one (see the Q5 arm of
+            // `TpchInput::columns`). Derive `cols` from `columns()` instead of
+            // restating a raw transpose here -- publishing RAW keys made the
+            // tied proof's public evaluations disagree with the binding on
+            // exactly those five columns, and `column_indices` could not catch
+            // it because Q8/Q9 publish the same raw keys, so the lookups
+            // silently resolved to THEIR columns.
+            let input = TpchInput::Q5 {
+                customer: c,
+                orders: o,
+                lineitem: l,
+                supplier: s,
+                nation: n,
+                region: rg,
+                europe_hash: string_to_u64("EUROPE"),
+                start_ts: date_to_timestamp("1997-01-01"),
+                end_ts: date_to_timestamp("1998-01-01"),
+                // Same source of truth as commit_diff: see `q5_pads`.
+                nr_pad_extra: q5_pads(privacy).0,
+                co_pad_extra: q5_pads(privacy).1,
+                ls_pad_extra: q5_pads(privacy).2,
+            };
+            let cols = input.columns();
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
+                let TpchInput::Q5 {
+                    customer,
+                    orders,
+                    lineitem,
+                    supplier,
+                    nation,
+                    region,
+                    europe_hash,
+                    start_ts,
+                    end_ts,
+                    nr_pad_extra,
+                    co_pad_extra,
+                    ls_pad_extra,
+                } = input
+                else {
+                    unreachable!()
+                };
                 // The One-Pass gate keeps every capacity `q5_pads` returns, so
                 // the padding layer is unchanged by the realization.
                 let circuit = q5_obj::MyCircuit::<Fp> {
-                    customer: c,
-                    orders: o,
-                    lineitem: l,
-                    supplier: s,
-                    nation: n,
-                    region: rg,
-                    europe_hash: string_to_u64("EUROPE"),
-                    start_ts: date_to_timestamp("1997-01-01"),
-                    end_ts: date_to_timestamp("1998-01-01"),
-                    // Same source of truth as commit_diff: see `q5_pads`.
-                    nr_pad_extra: q5_pads(privacy).0,
-                    co_pad_extra: q5_pads(privacy).1,
-                    ls_pad_extra: q5_pads(privacy).2,
+                    customer,
+                    orders,
+                    lineitem,
+                    supplier,
+                    nation,
+                    region,
+                    europe_hash,
+                    start_ts,
+                    end_ts,
+                    nr_pad_extra,
+                    co_pad_extra,
+                    ls_pad_extra,
                     _marker: PhantomData,
                 };
                 maybe_run(mode, &label, &circuit, &one, k)
@@ -1851,13 +1837,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
         // ---------------- Q8 ----------------
         "q8" => {
             let rg = region(&|r| vec![r.r_regionkey, string_to_u64_trim(&r.r_name)]);
-            let n = nation(&|r| {
-                vec![
-                    r.n_nationkey,
-                    r.n_regionkey,
-                    string_to_u64_trim(&r.n_name),
-                ]
-            });
+            let n = nation(&|r| vec![r.n_nationkey, r.n_regionkey, string_to_u64_trim(&r.n_name)]);
             let c = customer(&|r| vec![r.c_custkey, r.c_nationkey]);
             let o = orders(&|r| vec![r.o_orderkey, r.o_custkey, year_from_date(&r.o_orderdate)]);
             let p = part(&|r| vec![r.p_partkey, string_to_u64_trim(&r.p_type)]);
@@ -1878,8 +1858,7 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
             require("part", &p);
             require("supplier", &s);
             require("lineitem", &l);
-            row.input_rows =
-                rg.len() + n.len() + c.len() + o.len() + p.len() + s.len() + l.len();
+            row.input_rows = rg.len() + n.len() + c.len() + o.len() + p.len() + s.len() + l.len();
             let cols = transpose(&[&rg, &n, &c, &o, &p, &s, &l]);
             (cols, {
                 load_s = t_all.elapsed().as_secs_f64();
@@ -1990,12 +1969,32 @@ fn run_tpch(query: &str, dataset: &str, mode: Mode, privacy: Privacy) -> Row {
     row.n_columns = cols.len();
 
     if mode == Mode::Full || mode == Mode::Commit {
-        let bound_to = if timed.proof.is_empty() {
+        // Only the commit-only measurement binds to a prior proof; `full`
+        // derives its challenge without one.
+        let bound_to = if mode == Mode::Commit {
             saved_proof(&label)
         } else {
-            timed.proof.clone()
+            Vec::new()
         };
-        apply_commitment_layer(&cols, timed.k, &bound_to, &mut row);
+        // Commit(D) covers every column of the TPC-H database that the
+        // workload reads; this query opens the subset its circuit witnesses.
+        let db_cols = tpch_database_columns(privacy);
+        let tied_input;
+        let tied = if mode == Mode::Full {
+            tied_input = tpch_inputs(query, privacy);
+            Tied::Tpch(&tied_input)
+        } else {
+            Tied::None
+        };
+        apply_commitment_layer(
+            &tpch_label(),
+            &db_cols,
+            &cols,
+            timed.k,
+            &bound_to,
+            &mut row,
+            tied,
+        );
     }
     finish(&mut row, t_all.elapsed().as_secs_f64());
     row
@@ -2052,16 +2051,6 @@ pub fn plan(queries: &[String]) -> Vec<(String, String)> {
     plan_specs(&specs)
 }
 
-/// Expand `(query, dataset?)` specs into the pairs to run.
-///
-/// `None` means every dataset the query has: all three networks for a graph
-/// query, the single TPC-H label otherwise.  `Some(d)` pins one row, which is
-/// what a `gq4:lastfm` argument asks for; on the graph queries the three
-/// datasets differ by up to 16x in domain size, so being able to name one is
-/// the difference between a two-minute run and an hour.
-///
-/// Argument order is preserved and repeated pairs collapse, so
-/// `gq4 gq4:lastfm` runs each row once.
 pub fn plan_specs(specs: &[(String, Option<String>)]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (q, ds) in specs {
@@ -2080,23 +2069,10 @@ pub fn plan_specs(specs: &[(String, Option<String>)]) -> Vec<(String, String)> {
     out
 }
 
-/// Label reported for the TPC-H dataset.  `VPJOIN_DATA` selects WHICH tables are
-/// read; this only *names* them in the results (the CSV `dataset` column, the
-/// resume key, the log lines), so a sweep over several data roots stays
-/// distinguishable in one place.  Defaults to the historical `tpch-60K`.
 pub fn tpch_label() -> String {
     std::env::var("VPJOIN_LABEL").unwrap_or_else(|_| "tpch-60K".to_string())
 }
 
-// ---------------------------------------------------------------------------
-// TPC-H inputs, shared by the sweep and the in-circuit binding diff
-// ---------------------------------------------------------------------------
-
-/// One TPC-H query's loaded input tables plus its query constants.
-///
-/// This is the single definition of each query's attribute projections; both
-/// the sweep and `commit_diff` build their circuits from it, so the two can
-/// never drift apart.
 #[derive(Clone)]
 pub enum TpchInput {
     Q3 {
@@ -2268,47 +2244,55 @@ fn tpch_inputs_uncached(
 
     match query {
         "q3" => TpchInput::Q3 {
-            customer: proj!(dp::customer_read_records_from_file, "customer.tbl", |r| vec![
-                string_to_u64(&r.c_mktsegment),
-                r.c_custkey
-            ]),
+            customer: proj!(
+                dp::customer_read_records_from_file,
+                "customer.tbl",
+                |r| vec![string_to_u64(&r.c_mktsegment), r.c_custkey]
+            ),
             orders: proj!(dp::orders_read_records_from_file, "orders.tbl", |r| vec![
                 date_to_timestamp(&r.o_orderdate),
                 r.o_shippriority,
                 r.o_custkey,
                 r.o_orderkey
             ]),
-            lineitem: proj!(dp::lineitem_read_records_from_file, "lineitem.tbl", |r| vec![
-                r.l_orderkey,
-                scale_by_1000(r.l_extendedprice),
-                scale_by_1000(r.l_discount),
-                date_to_timestamp(&r.l_shipdate)
-            ]),
-            condition: [
-                string_to_u64("HOUSEHOLD"),
-                date_to_timestamp("1995-03-25"),
-            ],
+            lineitem: proj!(
+                dp::lineitem_read_records_from_file,
+                "lineitem.tbl",
+                |r| vec![
+                    r.l_orderkey,
+                    scale_by_1000(r.l_extendedprice),
+                    scale_by_1000(r.l_discount),
+                    date_to_timestamp(&r.l_shipdate)
+                ]
+            ),
+            condition: [string_to_u64("HOUSEHOLD"), date_to_timestamp("1995-03-25")],
         },
         "q5" => TpchInput::Q5 {
-            customer: proj!(dp::customer_read_records_from_file, "customer.tbl", |r| vec![
-                r.c_custkey,
-                r.c_nationkey
-            ]),
+            customer: proj!(
+                dp::customer_read_records_from_file,
+                "customer.tbl",
+                |r| vec![r.c_custkey, r.c_nationkey]
+            ),
             orders: proj!(dp::orders_read_records_from_file, "orders.tbl", |r| vec![
                 date_to_timestamp(&r.o_orderdate),
                 r.o_custkey,
                 r.o_orderkey
             ]),
-            lineitem: proj!(dp::lineitem_read_records_from_file, "lineitem.tbl", |r| vec![
-                r.l_orderkey,
-                r.l_suppkey,
-                scale_by_1000(r.l_extendedprice),
-                scale_by_1000(r.l_discount)
-            ]),
-            supplier: proj!(dp::supplier_read_records_from_file, "supplier.tbl", |r| vec![
-                r.s_suppkey,
-                r.s_nationkey
-            ]),
+            lineitem: proj!(
+                dp::lineitem_read_records_from_file,
+                "lineitem.tbl",
+                |r| vec![
+                    r.l_orderkey,
+                    r.l_suppkey,
+                    scale_by_1000(r.l_extendedprice),
+                    scale_by_1000(r.l_discount)
+                ]
+            ),
+            supplier: proj!(
+                dp::supplier_read_records_from_file,
+                "supplier.tbl",
+                |r| vec![r.s_suppkey, r.s_nationkey]
+            ),
             nation: proj!(dp::nation_read_records_from_file, "nation.tbl", |r| vec![
                 r.n_nationkey,
                 string_to_u64(&r.n_name),
@@ -2335,10 +2319,11 @@ fn tpch_inputs_uncached(
                 r.n_regionkey,
                 string_to_u64_trim(&r.n_name)
             ]),
-            customer: proj!(dp::customer_read_records_from_file, "customer.tbl", |r| vec![
-                r.c_custkey,
-                r.c_nationkey
-            ]),
+            customer: proj!(
+                dp::customer_read_records_from_file,
+                "customer.tbl",
+                |r| vec![r.c_custkey, r.c_nationkey]
+            ),
             orders: proj!(dp::orders_read_records_from_file, "orders.tbl", |r| vec![
                 r.o_orderkey,
                 r.o_custkey,
@@ -2348,17 +2333,22 @@ fn tpch_inputs_uncached(
                 r.p_partkey,
                 string_to_u64_trim(&r.p_type)
             ]),
-            supplier: proj!(dp::supplier_read_records_from_file, "supplier.tbl", |r| vec![
-                r.s_suppkey,
-                r.s_nationkey
-            ]),
-            lineitem: proj!(dp::lineitem_read_records_from_file, "lineitem.tbl", |r| vec![
-                r.l_orderkey,
-                r.l_partkey,
-                r.l_suppkey,
-                scale_by_1000(r.l_extendedprice),
-                scale_by_1000(r.l_discount)
-            ]),
+            supplier: proj!(
+                dp::supplier_read_records_from_file,
+                "supplier.tbl",
+                |r| vec![r.s_suppkey, r.s_nationkey]
+            ),
+            lineitem: proj!(
+                dp::lineitem_read_records_from_file,
+                "lineitem.tbl",
+                |r| vec![
+                    r.l_orderkey,
+                    r.l_partkey,
+                    r.l_suppkey,
+                    scale_by_1000(r.l_extendedprice),
+                    scale_by_1000(r.l_discount)
+                ]
+            ),
             cond_nation_hash: string_to_u64_trim("EGYPT"),
             const_region_name_hash: string_to_u64_trim("MIDDLE EAST"),
             const_part_type_hash: string_to_u64_trim("PROMO BRUSHED COPPER"),
@@ -2368,10 +2358,11 @@ fn tpch_inputs_uncached(
                 r.p_partkey,
                 string_to_u64(&r.p_name)
             ]),
-            supplier: proj!(dp::supplier_read_records_from_file, "supplier.tbl", |r| vec![
-                r.s_suppkey,
-                r.s_nationkey
-            ]),
+            supplier: proj!(
+                dp::supplier_read_records_from_file,
+                "supplier.tbl",
+                |r| vec![r.s_suppkey, r.s_nationkey]
+            ),
             nation: proj!(dp::nation_read_records_from_file, "nation.tbl", |r| vec![
                 r.n_nationkey,
                 string_to_u64(&r.n_name)
@@ -2380,35 +2371,45 @@ fn tpch_inputs_uncached(
                 r.o_orderkey,
                 year_from_date(&r.o_orderdate)
             ]),
-            partsupp: proj!(dp::partsupp_read_records_from_file, "partsupp.tbl", |r| vec![
-                r.ps_partkey * PS_SHIFT + r.ps_suppkey,
-                scale_by_1000(r.ps_supplycost)
-            ]),
-            lineitem: proj!(dp::lineitem_read_records_from_file, "lineitem.tbl", |r| vec![
-                r.l_orderkey,
-                r.l_partkey,
-                r.l_suppkey,
-                r.l_quantity,
-                scale_by_1000(r.l_extendedprice),
-                scale_by_1000(r.l_discount)
-            ]),
+            partsupp: proj!(
+                dp::partsupp_read_records_from_file,
+                "partsupp.tbl",
+                |r| vec![
+                    r.ps_partkey * PS_SHIFT + r.ps_suppkey,
+                    scale_by_1000(r.ps_supplycost)
+                ]
+            ),
+            lineitem: proj!(
+                dp::lineitem_read_records_from_file,
+                "lineitem.tbl",
+                |r| vec![
+                    r.l_orderkey,
+                    r.l_partkey,
+                    r.l_suppkey,
+                    r.l_quantity,
+                    scale_by_1000(r.l_extendedprice),
+                    scale_by_1000(r.l_discount)
+                ]
+            ),
             cond_hash: string_to_u64("green"),
         },
         "q18" => TpchInput::Q18 {
-            customer: proj!(dp::customer_read_records_from_file, "customer.tbl", |r| vec![
-                string_to_u64(&r.c_name),
-                r.c_custkey
-            ]),
+            customer: proj!(
+                dp::customer_read_records_from_file,
+                "customer.tbl",
+                |r| vec![string_to_u64(&r.c_name), r.c_custkey]
+            ),
             orders: proj!(dp::orders_read_records_from_file, "orders.tbl", |r| vec![
                 r.o_orderkey,
                 r.o_custkey,
                 date_to_timestamp(&r.o_orderdate),
                 scale_by_1000(r.o_totalprice)
             ]),
-            lineitem: proj!(dp::lineitem_read_records_from_file, "lineitem.tbl", |r| vec![
-                r.l_orderkey,
-                r.l_quantity
-            ]),
+            lineitem: proj!(
+                dp::lineitem_read_records_from_file,
+                "lineitem.tbl",
+                |r| vec![r.l_orderkey, r.l_quantity]
+            ),
             threshold: 300,
         },
         other => panic!("unknown TPC-H query {}", other),
@@ -2420,46 +2421,145 @@ impl TpchInput {
     /// commitment layer binds.
     pub fn columns(&self) -> Vec<Vec<u64>> {
         match self {
-            TpchInput::Q3 { customer, orders, lineitem, .. } => {
-                transpose(&[customer, orders, lineitem])
-            }
-            TpchInput::Q5 { customer, orders, lineitem, supplier, nation, region, .. } => {
-                transpose(&[customer, orders, lineitem, supplier, nation, region])
+            TpchInput::Q3 {
+                customer,
+                orders,
+                lineitem,
+                ..
+            } => transpose(&[customer, orders, lineitem]),
+            TpchInput::Q5 {
+                customer,
+                orders,
+                lineitem,
+                supplier,
+                nation,
+                region,
+                ..
+            } => {
+                // Q5 witnesses its five KEY columns shifted by one, because
+                // `q5_derive` uses 0 as the "no match" sentinel for an unmatched
+                // customer/supplier/nation while TPC-H has a real nationkey 0
+                // (ALGERIA) and regionkey 0 (AFRICA), so 0 must stay free. The
+                // publication must carry the encoding the circuit witnesses, or
+                // the binding cannot be tied to it -- the same rule the graph
+                // layout follows in `edge_columns_for`.
+                //
+                // These become their own published columns: Q8 witnesses
+                // c_nationkey RAW, so its column and Q5's are different derived
+                // data and are committed separately, which is exactly how
+                // `tpch_database_columns` already treats differing encodings.
+                let mut cols =
+                    transpose(&[customer, orders, lineitem, supplier, nation, region]);
+                // c_nationkey, s_nationkey, n_nationkey, n_regionkey, r_regionkey
+                for j in [1usize, 10, 11, 13, 14] {
+                    for v in cols[j].iter_mut() {
+                        *v += 1;
+                    }
+                }
+                cols
             }
             TpchInput::Q8 {
-                region, nation, customer, orders, part, supplier, lineitem, ..
+                region,
+                nation,
+                customer,
+                orders,
+                part,
+                supplier,
+                lineitem,
+                ..
             } => transpose(&[region, nation, customer, orders, part, supplier, lineitem]),
-            TpchInput::Q9 { part, supplier, nation, orders, partsupp, lineitem, .. } => {
-                transpose(&[part, supplier, nation, orders, partsupp, lineitem])
-            }
-            TpchInput::Q18 { customer, orders, lineitem, .. } => {
-                transpose(&[customer, orders, lineitem])
-            }
+            TpchInput::Q9 {
+                part,
+                supplier,
+                nation,
+                orders,
+                partsupp,
+                lineitem,
+                ..
+            } => transpose(&[part, supplier, nation, orders, partsupp, lineitem]),
+            TpchInput::Q18 {
+                customer,
+                orders,
+                lineitem,
+                ..
+            } => transpose(&[customer, orders, lineitem]),
         }
     }
 
     pub fn require_loaded(&self) {
         for (i, c) in self.columns().iter().enumerate() {
-            assert!(!c.is_empty(), "input column {} loaded EMPTY -- check VPJOIN_DATA", i);
+            assert!(
+                !c.is_empty(),
+                "input column {} loaded EMPTY -- check VPJOIN_DATA",
+                i
+            );
         }
     }
 }
 
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn cols() -> Vec<Vec<u64>> {
+        vec![
+            (0..40u64).collect(),
+            (0..40u64).map(|i| i * 7 + 1).collect(),
+            (0..25u64).map(|i| i * i).collect(),
+        ]
+    }
+
+    /// The property the whole rewiring exists for: two queries reading the same
+    /// column of one dataset must open the SAME published point. `published_db`
+    /// caches per (dataset, k), so the second caller gets the publication the
+    /// first one made instead of committing again under a fresh blinder.
+    #[test]
+    fn queries_on_one_dataset_share_one_publication() {
+        let db_cols = cols();
+        let k = crate::column_commit::min_k_rows(40);
+
+        // Query A reads columns {0, 2}; query B reads {1, 2}. Column 2 is shared.
+        let a = published_db("unit-test-ds", &db_cols, k);
+        let b = published_db("unit-test-ds", &db_cols, k);
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "the second query must reuse the publication, not make a new one"
+        );
+
+        let va = a.0.view(&column_indices(&db_cols, &[db_cols[0].clone(), db_cols[2].clone()]));
+        let vb = b.0.view(&column_indices(&db_cols, &[db_cols[1].clone(), db_cols[2].clone()]));
+        assert_eq!(
+            va.points[1], vb.points[1],
+            "the shared column must be the same published point for both queries"
+        );
+        assert_ne!(va.points[0], vb.points[0], "distinct columns stay distinct");
+
+        // A different dataset is a different database and must not collide.
+        let other = published_db("unit-test-ds-2", &db_cols, k);
+        assert!(!std::sync::Arc::ptr_eq(&a, &other));
+    }
+
+    /// `column_indices` locates a query's columns in the published layout, and
+    /// refuses rather than silently re-committing when one is absent.
+    #[test]
+    fn column_indices_maps_and_refuses_misses() {
+        let db_cols = cols();
+        assert_eq!(
+            column_indices(&db_cols, &[db_cols[2].clone(), db_cols[0].clone()]),
+            vec![2, 0]
+        );
+        let absent = vec![vec![999u64; 4]];
+        assert!(
+            std::panic::catch_unwind(|| column_indices(&db_cols, &absent)).is_err(),
+            "a column outside the publication must be refused"
+        );
+    }
+}
 
 #[cfg(test)]
 mod oblivious_bound_tests {
     use super::*;
 
-    /// One test, not two: both directions mutate the process-global
-    /// VPJOIN_TAU_PUB and cargo's default runner is threaded, so as separate
-    /// tests they could observe each other's env window and fail spuriously.
-    ///
-    /// Direction 1: the bound is the exact maximum of
-    /// `sum_v indeg_lt(v)*outdeg(v)` over all graphs with `m` edges, so a
-    /// brute-force search over hub splits must not beat it.
-    /// Direction 2: an EXPLICIT public degree bound tightens the capacity;
-    /// without one the quadratic bound stands (the max degree is private, and
-    /// the declared_degree_cap fallback deliberately does NOT apply here).
     #[test]
     fn oblivious_wedge_bound_is_tight_and_tau_gated() {
         std::env::remove_var("VPJOIN_TAU_PUB");

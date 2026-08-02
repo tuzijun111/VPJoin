@@ -10,6 +10,9 @@ use ff::Field;
 /// Binding columns and gates added to a host circuit's constraint system.
 #[derive(Clone, Debug)]
 pub struct BindConfig {
+    /// The columns the Horner gates read. When `borrowed` these ARE the query
+    /// circuit's own input columns, so the accumulation is over the witness the
+    /// query proves about, not over a private copy of it.
     data: Vec<Column<Advice>>,
     acc: Vec<Column<Advice>>,
     pow: Column<Advice>,
@@ -24,8 +27,26 @@ pub struct BindConfig {
 ///
 /// Call this from the host circuit's `configure`, after the query's own
 /// `configure`, so both sets of gates share one constraint system.
+/// Allocate the binding columns and Horner gates.
+///
+/// The `data` columns are the binding's own. On their own they prove only that
+/// SOME columns evaluate to the committed values; [`tie_columns`] is what makes
+/// them the query's witness, by copy-constraining each cell to the chip's
+/// corresponding input cell. Halo2 tracks assignment per REGION, so the gates
+/// cannot simply read the chip's columns -- a region may only query cells it
+/// assigns -- which is why the tie is copy constraints and not shared columns.
 pub fn configure_bind(meta: &mut ConstraintSystem<Fp>, nc: usize) -> BindConfig {
     let data: Vec<Column<Advice>> = (0..nc).map(|_| meta.advice_column()).collect();
+    // Equality-enabled so `tie_columns` can copy-constrain them to the chip's
+    // input cells.
+    for c in data.iter() {
+        meta.enable_equality(*c);
+    }
+    configure_bind_inner(meta, data)
+}
+
+fn configure_bind_inner(meta: &mut ConstraintSystem<Fp>, data: Vec<Column<Advice>>) -> BindConfig {
+    let nc = data.len();
     let acc: Vec<Column<Advice>> = (0..nc).map(|_| meta.advice_column()).collect();
     let pow = meta.advice_column();
     let xcol = meta.advice_column();
@@ -90,22 +111,25 @@ pub fn configure_bind(meta: &mut ConstraintSystem<Fp>, nc: usize) -> BindConfig 
 /// `columns` are the query's input columns, zero-extended to a common height;
 /// `x` is the Fiat-Shamir challenge derived from the published commitments and
 /// the query proof.
-pub fn assign_bind(
+/// Assign the binding region and expose the evaluations, returning the data
+/// cells so the caller can tie them to the query's witness via [`tie_columns`].
+pub fn assign_bind_cells(
     layouter: &mut impl Layouter<Fp>,
     config: &BindConfig,
     columns: &[Vec<u64>],
     x: Fp,
-) -> Result<(), Error> {
+) -> Result<Vec<Vec<AssignedCell<Fp, Fp>>>, Error> {
     let nc = config.data.len();
     assert_eq!(columns.len(), nc, "expected {} columns", nc);
     let rows = columns.iter().map(|c| c.len()).max().unwrap_or(0).max(1);
 
-    let cells = layouter.assign_region(
+    let (cells, data_cells) = layouter.assign_region(
         || "inlined witness binding",
         |mut region| {
             let mut acc = vec![Fp::ZERO; nc];
             let mut pow = Fp::ONE;
             let mut out = Vec::new();
+            let mut dat: Vec<Vec<AssignedCell<Fp, Fp>>> = vec![Vec::new(); nc];
 
             for i in 0..rows {
                 if i == 0 {
@@ -122,7 +146,11 @@ pub fn assign_bind(
                 for j in 0..nc {
                     let v = columns[j].get(i).copied().unwrap_or(0);
                     let fv = Fp::from(v);
-                    region.assign_advice(|| "data", config.data[j], i, || Value::known(fv))?;
+                    // Borrowed columns are the chip's; it already wrote them,
+                    // and writing again would be a double assignment.
+                    let dcell =
+                        region.assign_advice(|| "data", config.data[j], i, || Value::known(fv))?;
+                    dat[j].push(dcell);
                     if i == 0 {
                         acc[j] = fv;
                     } else {
@@ -135,7 +163,7 @@ pub fn assign_bind(
                     }
                 }
             }
-            Ok(out)
+            Ok((out, dat))
         },
     )?;
 
@@ -143,7 +171,61 @@ pub fn assign_bind(
     for (j, cell) in cells.into_iter().enumerate() {
         layouter.constrain_instance(cell.cell(), config.instance, 1 + j)?;
     }
-    Ok(())
+    Ok(data_cells)
+}
+
+/// Backwards-compatible entry point for wrappers that have not yet been tied to
+/// their circuit's witness. Measures the layer's cost; establishes nothing about
+/// whose witness was evaluated. Prefer [`assign_bind_cells`] + [`tie_columns`].
+pub fn assign_bind(
+    layouter: &mut impl Layouter<Fp>,
+    config: &BindConfig,
+    columns: &[Vec<u64>],
+    x: Fp,
+) -> Result<(), Error> {
+    assign_bind_cells(layouter, config, columns, x).map(|_| ())
+}
+
+/// Copy-constrain the binding's data cells to the query circuit's own input
+/// cells, row by row.
+///
+/// This is the step that turns "some columns match Commit(D)" into "THIS
+/// proof's witness matches Commit(D)", i.e. what Appendix A requires and what
+/// discharges Threat (i). `witness[j][i]` must be the chip's cell holding the
+/// same datum as committed column `j` at row `i`.
+pub fn tie_columns(
+    layouter: &mut impl Layouter<Fp>,
+    bind_cells: &[Vec<AssignedCell<Fp, Fp>>],
+    witness: &[Vec<AssignedCell<Fp, Fp>>],
+) -> Result<(), Error> {
+    assert_eq!(bind_cells.len(), witness.len(), "column count mismatch");
+    layouter.assign_region(
+        || "bind: tie to query witness",
+        |mut region| {
+            for (b, w) in bind_cells.iter().zip(witness.iter()) {
+                // A witness-free configuration (cost probes, `without_witnesses`)
+                // has nothing to tie; `assign_bind_cells` still lays out one
+                // padding row. Skip rather than fail -- there is no witness to
+                // bind. A NON-empty witness must cover every committed row, or
+                // the untied rows would be exactly the substitution this exists
+                // to prevent.
+                if w.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    b.len(),
+                    w.len(),
+                    "the binding covers {} rows but the witness has {}",
+                    b.len(),
+                    w.len()
+                );
+                for (bc, wc) in b.iter().zip(w.iter()) {
+                    region.constrain_equal(bc.cell(), wc.cell())?;
+                }
+            }
+            Ok(())
+        },
+    )
 }
 
 /// The public instance for the binding column: `[x, v_0 .. v_{NC-1}]`.
@@ -191,6 +273,7 @@ pub use crate::sql::{
 };
 
 use crate::data::graph_data_processing::Edge;
+use halo2_proofs::circuit::AssignedCell;
 use halo2_proofs::circuit::SimpleFloorPlanner;
 use halo2_proofs::plonk::Circuit;
 // ---------------------------------------------------------------------------
@@ -229,8 +312,51 @@ fn prove_one<C: Circuit<Fp>>(
     circuit: &C,
     instances: &[&[Fp]],
 ) -> Proved {
+    // Every tied proof funnels through here, so this is the one place the
+    // diagnostic switch has to reach. `bench_queries::run_at` covers the BASE
+    // circuits; without this hook `VPJOIN_MOCK=1` would miss exactly the bound
+    // circuits, which is where a tie failure lives.
+    if std::env::var("VPJOIN_MOCK").map(|v| v == "1").unwrap_or(false) {
+        return mock_one(params, circuit, instances);
+    }
     let pk = keygen_for(params, circuit);
     prove_with(params, &pk, circuit, instances)
+}
+
+/// MockProver pass over a tied circuit: names the failing constraint, its
+/// region and its row, where the real prover reports only that verification
+/// failed. Returns a zeroed [`Proved`] -- a mock run yields no timings.
+fn mock_one<C: Circuit<Fp>>(
+    params: &ParamsIPA<vesta::Affine>,
+    circuit: &C,
+    instances: &[&[Fp]],
+) -> Proved {
+    use halo2_proofs::dev::MockProver;
+    use halo2_proofs::poly::commitment::Params;
+    let k = params.k();
+    println!("  [mock] MockProver over the TIED circuit at k={}", k);
+    let inst: Vec<Vec<Fp>> = instances.iter().map(|i| i.to_vec()).collect();
+    let prover = MockProver::run(k, circuit, inst)
+        .unwrap_or_else(|e| panic!("[mock] could not synthesize at k={}: {:?}", k, e));
+    match prover.verify() {
+        Ok(()) => println!("  [mock] TIED circuit SATISFIED at k={}", k),
+        Err(failures) => {
+            println!("  [mock] TIED circuit: {} FAILURE(S)", failures.len());
+            for f in failures.iter().take(25) {
+                println!("      {:?}", f);
+            }
+            if failures.len() > 25 {
+                println!("      ... {} more", failures.len() - 25);
+            }
+            panic!("[mock] TIED circuit rejected at k={}", k);
+        }
+    }
+    Proved {
+        prove_s: 0.0,
+        verify_s: 0.0,
+        bytes: 0,
+        proof: Vec::new(),
+    }
 }
 
 /// Build the proving key once, so it can be reused across repetitions.
@@ -427,11 +553,12 @@ pub fn prove_bound(
 }
 
 /// Edge columns (src, dst) of a graph -- the columns the layer commits.
-pub fn edge_columns(edges: &[Edge]) -> Vec<Vec<u64>> {
-    vec![
-        edges.iter().map(|e| e.src).collect(),
-        edges.iter().map(|e| e.dst).collect(),
-    ]
+/// The graph database's committed columns. Single definition lives in
+/// `bench_queries`; this used to be a second copy publishing RAW ids while the
+/// circuits witness shifted ones, and the two drifting apart is precisely what
+/// broke the witness tie. Delegate rather than duplicate.
+pub fn edge_columns(query: &str, edges: &[Edge]) -> Vec<Vec<u64>> {
+    crate::bench_queries::edge_columns_for(query, edges)
 }
 
 /// Prove a graph query exactly as the submission runs it.
@@ -495,7 +622,7 @@ pub fn prove_graph_bound(
     x: Fp,
     bind_pub: &[Fp],
 ) -> Proved {
-    let columns = edge_columns(edges);
+    let columns = edge_columns(query, edges);
     let out = [Fp::from(cnt)];
     let inst: &[&[Fp]] = &[&out, bind_pub];
     match query {
@@ -543,6 +670,7 @@ pub fn prove_graph_bound(
 pub struct CsShape {
     pub gates: usize,
     pub lookups: usize,
+    pub shuffles: usize,
     pub advice: usize,
     pub fixed: usize,
 }
@@ -558,8 +686,40 @@ pub fn cs_shape<C: Circuit<Fp>>() -> CsShape {
     CsShape {
         gates: cs.gates().len(),
         lookups: cs.lookups().len(),
+        shuffles: cs.shuffles().len(),
         advice: cs.num_advice_columns(),
         fixed: cs.num_fixed_columns(),
+    }
+}
+
+
+/// Structural prover-overhead ratio of a query's bound circuit over its base:
+/// added advice columns / base advice columns. Advice-linear work (column
+/// commitments, FFTs, quotient evaluation) dominates the binding's cost, so
+/// `ratio x measured base proof time` is a DERIVED estimate of the in-circuit
+/// binding cost for rows where time-differencing cannot resolve it. Empirical
+/// anchor: for gq3 at k=13, where the effect IS resolvable, the measured
+/// overhead was +6.0% mean / +4.7% median against a 2.8% structural ratio, so
+/// treat the derived value as good to about a factor of two.
+pub fn advice_overhead_ratio(query: &str) -> f64 {
+    use crate::graph_sql::{g_sql1_obj, g_sql2_obj, g_sql3_obj, g_sql4_obj};
+    use crate::sql::{q18_obj, q3_obj, q5_obj, q8_obj, q9_obj};
+    fn r<B: Circuit<Fp>, D: Circuit<Fp>>() -> f64 {
+        let b = cs_shape::<B>();
+        let d = cs_shape::<D>();
+        (d.advice - b.advice) as f64 / b.advice as f64
+    }
+    match query {
+        "q3" => r::<q3_obj::MyCircuit<Fp>, BoundQ3>(),
+        "q5" => r::<q5_obj::MyCircuit<Fp>, BoundQ5>(),
+        "q8" => r::<q8_obj::MyCircuit<Fp>, BoundQ8>(),
+        "q9" => r::<q9_obj::MyCircuit<Fp>, BoundQ9>(),
+        "q18" => r::<q18_obj::MyCircuit<Fp>, BoundQ18>(),
+        "gq1" => r::<g_sql1_obj::Path3OrdCircuit<Fp>, BoundGq1>(),
+        "gq2" => r::<g_sql2_obj::GraphPath4OrderCircuit<Fp>, BoundGq2>(),
+        "gq3" => r::<g_sql3_obj::MyCircuit<Fp>, BoundGq3>(),
+        "gq4" => r::<g_sql4_obj::MyCircuit<Fp>, BoundGq4>(),
+        other => panic!("no circuit pair for {}", other),
     }
 }
 
@@ -586,6 +746,17 @@ pub fn assert_bound_superset<B: Circuit<Fp>, D: Circuit<Fp>>(label: &str) {
     assert_eq!(
         d.lookups, b.lookups,
         "{}: binding adds no lookups, so the counts must match ({:?} vs {:?})",
+        label, b, d
+    );
+    // Shuffles carry the One-Pass Conservation Checks. A wrapper that lost one
+    // would prove a weaker statement AND measure faster, exactly like the
+    // missing-lookup case above -- and this dimension went unchecked until a
+    // -18s gq3 reading forced the question (the counts were equal; the reading
+    // was ambient load. The assertion stays so the next regression is caught
+    // structurally instead of statistically).
+    assert_eq!(
+        d.shuffles, b.shuffles,
+        "{}: binding adds no shuffles, so the counts must match ({:?} vs {:?})",
         label, b, d
     );
 }
@@ -869,7 +1040,7 @@ pub fn graph_paired(
     use crate::graph_sql::{g_sql1_obj, g_sql2_obj, g_sql3_obj, g_sql4_obj};
     use std::marker::PhantomData;
 
-    let columns = edge_columns(edges);
+    let columns = edge_columns(query, edges);
     let out = [Fp::from(cnt)];
     let bi: &[&[Fp]] = &[&out];
     let di: &[&[Fp]] = &[&out, bind_pub];
@@ -1175,5 +1346,72 @@ pub fn tpch_selftest(
             customer: customer.clone(), orders: orders.clone(),
             lineitem: lineitem.clone(), threshold: *threshold, _marker: PhantomData,
         }),
+    }
+}
+
+#[cfg(test)]
+mod bound_to_witness_tests {
+    use super::*;
+    use crate::data::graph_data_processing::Edge;
+    use halo2_proofs::dev::MockProver;
+
+    fn edges() -> Vec<Edge> {
+        [(1u64, 2u64), (1, 3), (2, 3), (2, 4), (3, 4), (3, 5), (4, 5), (1, 4)]
+            .into_iter()
+            .map(|(src, dst)| Edge { src, dst })
+            .collect()
+    }
+
+    /// The committed columns must carry the SAME encoding the circuit
+    /// witnesses. gq1 shifts node ids by SHIFT_ID so 0 stays free for the
+    /// gadgets' dummy row, so a commitment over raw ids cannot be tied to the
+    /// witness by equality -- see the note in `bench_queries::edge_columns`.
+    fn cols(e: &[Edge]) -> Vec<Vec<u64>> {
+        const SHIFT_ID: u64 = 1;
+        vec![
+            e.iter().map(|x| x.src + SHIFT_ID).collect(),
+            e.iter().map(|x| x.dst + SHIFT_ID).collect(),
+        ]
+    }
+
+    /// The honest prover: the committed columns ARE the circuit's edges.
+    #[test]
+    fn binding_accepts_the_committed_witness() {
+        let e = edges();
+        let x = Fp::from(7u64);
+        let c = cols(&e);
+        let circuit = BoundGq1 { edges: e.clone(), columns: c.clone(), x };
+        let inst = vec![vec![Fp::from(crate::bench_queries::count_gq1(&e))], bind_instance(&c, x)];
+        MockProver::run(12, &circuit, inst).unwrap().assert_satisfied();
+    }
+
+    /// THE POINT OF THE WHOLE EXERCISE. The prover answers the query over one
+    /// edge list while claiming the evaluation of a DIFFERENT one -- exactly
+    /// the substitution Threat (i) is about. Before the Horner gates read the
+    /// circuit's own `r[0]`, both were private copies and this verified: the
+    /// binding proved that some columns matched Commit(D), never that the
+    /// query's witness did.
+    #[test]
+    fn binding_rejects_a_witness_that_is_not_the_committed_data() {
+        let e = edges();
+        let x = Fp::from(7u64);
+        let honest = cols(&e);
+
+        // Same length, same multiset per column, one row swapped: a shuffle or
+        // multiset argument would miss this; a random-point evaluation does not.
+        let mut tampered = e.clone();
+        tampered.swap(0, 2);
+
+        let circuit = BoundGq1 {
+            edges: tampered,
+            columns: honest.clone(),
+            x,
+        };
+        let inst = vec![vec![Fp::from(crate::bench_queries::count_gq1(&e))], bind_instance(&honest, x)];
+        let verdict = MockProver::run(12, &circuit, inst).unwrap().verify();
+        assert!(
+            verdict.is_err(),
+            "a witness differing from the committed columns must not verify"
+        );
     }
 }

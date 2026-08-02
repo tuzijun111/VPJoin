@@ -33,14 +33,42 @@ const PAD_QSUM: u64 = 0;
 /// can catch it. This is exactly the cheat a residual-side-only argument
 /// misses, so the negative test in this module is what shows the Cardinality
 /// Preservation Check is not vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and selects every row. Both channels of
 /// condition (3) then agree on every row, so the two root sums match for free.
 /// This is exactly the escape that Pairwise Consistency has to close, and the
 /// third direction of the test in this module is what shows it does.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -153,6 +181,19 @@ impl<F: Field + Ord> Q18Chip<F> {
         let customer = vec![meta.advice_column(), meta.advice_column()];
         let orders = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let lineitem = vec![meta.advice_column(), meta.advice_column()];
+
+        // These eight columns ARE the committed relation, in the order
+        // `bench_queries::TpchInput::columns()` publishes it for Q18
+        // (customer[name, custkey] | orders[okey, custkey, date, total] |
+        // lineitem[okey, qty]). Equality is what lets the bound wrapper
+        // copy-constrain the binding's data columns to the cells THIS proof
+        // witnesses; without it the binding would only say that some columns
+        // match Commit(D). `configure_conserve` below already enables it as a
+        // side effect of its permutation argument, but the tie must not depend
+        // on that, and `enable_equality` is idempotent.
+        for &c in customer.iter().chain(orders.iter()).chain(lineitem.iter()) {
+            meta.enable_equality(c);
+        }
 
         // condition
         let cond_thresh = meta.advice_column();
@@ -800,6 +841,10 @@ impl<F: Field + Ord> Q18Chip<F> {
         }
     }
 
+    /// Assign the circuit without keeping the committed input cells.
+    ///
+    /// A thin wrapper over [`Q18Chip::assign_with_input_cells`] so the base
+    /// circuit and the bound wrapper share one assignment path.
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
@@ -808,6 +853,53 @@ impl<F: Field + Ord> Q18Chip<F> {
         lineitem_u64: Vec<Vec<u64>>, // [okey, qty]
         threshold: u64,
     ) -> Result<AssignedCell<F, F>, Error> {
+        self.assign_with_input_cells(
+            layouter,
+            customer_u64,
+            orders_u64,
+            lineitem_u64,
+            threshold,
+            0,
+        )
+        .map(|(cell, _)| cell)
+    }
+
+    /// Assign the circuit. Returns the public output cell and, for the bound
+    /// wrapper, the committed input cells, one vector per committed column in
+    /// the order `bench_queries::TpchInput::columns()` publishes them for Q18:
+    ///
+    ///   0 c_name, 1 c_custkey | 2 o_orderkey, 3 o_custkey, 4 o_orderdate,
+    ///   5 o_totalprice | 6 l_orderkey, 7 l_quantity
+    ///
+    /// ENCODING: every one of the eight cells holds the committed value
+    /// VERBATIM. This circuit derives `l_sorted`, the result table and the
+    /// partition witnesses from the base tables, but it never rewrites the base
+    /// columns themselves -- no shift, no packing, no hash -- so the tie is to
+    /// exactly the values the publication carries.
+    ///
+    /// ROW ORDER: cell `i` of column `j` is committed row `i`. The base tables
+    /// are assigned in input order; the sort that Q18 needs happens in the
+    /// separate `l_sorted` view, which is tied to `lineitem` by a shuffle and
+    /// is NOT what this returns.
+    ///
+    /// `bind_rows` is the height the binding lays out, i.e. the longest
+    /// committed column. Q18's three relations have different lengths, and the
+    /// binding zero-extends every column to that common height, so each
+    /// relation's columns are zero-extended here to match. Those padding cells
+    /// are outside every selector this circuit enables, so they add no
+    /// constraint; they exist only to be copy-constrained, and a prover who put
+    /// anything but 0 there would change the binding's evaluation and fail the
+    /// public check. `bind_rows = 0` means "no binding": nothing is padded and
+    /// no cells are collected, which is the base circuit's path.
+    pub fn assign_with_input_cells(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        customer_u64: Vec<Vec<u64>>, // [name, custkey]
+        orders_u64: Vec<Vec<u64>>,   // [okey, custkey, date, total]
+        lineitem_u64: Vec<Vec<u64>>, // [okey, qty]
+        threshold: u64,
+        bind_rows: usize,
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         // The HAVING comparison is a NUM_BYTES-byte Lt chip and the threshold is
         // now range-checked to that width in circuit, so a wider parameter has no
         // witness at all. Fail here rather than with an unsatisfied constraint.
@@ -989,7 +1081,7 @@ impl<F: Field + Ord> Q18Chip<F> {
         // partition still conserves every relation and both channels of
         // condition (4) then agree on every row, so only Pairwise Consistency
         // can see that the clean side is not the reduced instance.
-        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let all_clean = mark_all_clean();
         let (mut cln_c, mut cln_o, mut cln_l) = if all_clean {
             (
                 vec![1u64; customer_u64.len()],
@@ -1003,7 +1095,7 @@ impl<F: Field + Ord> Q18Chip<F> {
         // test hook only: hide one joinable lineitem tuple and re-reduce around
         // it, so the partition is still a valid reduced instance of a smaller
         // input and only condition (4) can see the difference
-        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed) && !all_clean;
+        let tamper = hide_one_clean_tuple() && !all_clean;
         if tamper {
             if let Some(pos) = cln_l.iter().position(|&f| f == 1) {
                 alive_l[pos] = false;
@@ -1029,19 +1121,34 @@ impl<F: Field + Ord> Q18Chip<F> {
         // its own: the bits ride on the committed rows and the four lookups run
         // between the committed key columns, gated by those bits.
 
+        // The committed input cells, filled on the real assignment pass. The
+        // floor planner runs the closure below twice (once to measure the
+        // region's shape, once for real), so this is written, not pushed to,
+        // and the second write is the one the caller ties.
+        let mut input_cells_out: Vec<Vec<AssignedCell<F, F>>> = Vec::new();
+
         // assign region
-        layouter.assign_region(
+        let out_cell = layouter.assign_region(
             || "Q18 witness",
             |mut region| {
+                // One vector per committed column, in publication order:
+                // customer[name, custkey] | orders[okey, custkey, date, total]
+                // | lineitem[okey, qty].
+                let mut cells: Vec<Vec<AssignedCell<F, F>>> = vec![Vec::new(); 8];
+                let bind = bind_rows > 0;
+
                 // base tables
                 for i in 0..customer_u64.len() {
                     for j in 0..2 {
-                        region.assign_advice(
+                        let c = region.assign_advice(
                             || "customer",
                             self.config.customer[j],
                             i,
                             || Value::known(F::from(customer_u64[i][j])),
                         )?;
+                        if bind {
+                            cells[j].push(c);
+                        }
                     }
                     self.config.q_row[0].enable(&mut region, i)?;
                     region.assign_advice(
@@ -1051,14 +1158,29 @@ impl<F: Field + Ord> Q18Chip<F> {
                         || Value::known(F::from(cln_c[i])),
                     )?;
                 }
+                // Zero-extension to the binding's height; see the doc comment.
+                for i in customer_u64.len()..bind_rows {
+                    for j in 0..2 {
+                        let c = region.assign_advice(
+                            || "customer bind pad",
+                            self.config.customer[j],
+                            i,
+                            || Value::known(F::ZERO),
+                        )?;
+                        cells[j].push(c);
+                    }
+                }
                 for i in 0..orders_u64.len() {
                     for j in 0..4 {
-                        region.assign_advice(
+                        let c = region.assign_advice(
                             || "orders",
                             self.config.orders[j],
                             i,
                             || Value::known(F::from(orders_u64[i][j])),
                         )?;
+                        if bind {
+                            cells[2 + j].push(c);
+                        }
                     }
                     self.config.q_row[1].enable(&mut region, i)?;
                     region.assign_advice(
@@ -1068,14 +1190,28 @@ impl<F: Field + Ord> Q18Chip<F> {
                         || Value::known(F::from(cln_o[i])),
                     )?;
                 }
+                for i in orders_u64.len()..bind_rows {
+                    for j in 0..4 {
+                        let c = region.assign_advice(
+                            || "orders bind pad",
+                            self.config.orders[j],
+                            i,
+                            || Value::known(F::ZERO),
+                        )?;
+                        cells[2 + j].push(c);
+                    }
+                }
                 for i in 0..lineitem_u64.len() {
                     for j in 0..2 {
-                        region.assign_advice(
+                        let c = region.assign_advice(
                             || "lineitem",
                             self.config.lineitem[j],
                             i,
                             || Value::known(F::from(lineitem_u64[i][j])),
                         )?;
+                        if bind {
+                            cells[6 + j].push(c);
+                        }
                     }
                     self.config.q_row[2].enable(&mut region, i)?;
                     region.assign_advice(
@@ -1085,6 +1221,18 @@ impl<F: Field + Ord> Q18Chip<F> {
                         || Value::known(F::from(cln_l[i])),
                     )?;
                 }
+                for i in lineitem_u64.len()..bind_rows {
+                    for j in 0..2 {
+                        let c = region.assign_advice(
+                            || "lineitem bind pad",
+                            self.config.lineitem[j],
+                            i,
+                            || Value::known(F::ZERO),
+                        )?;
+                        cells[6 + j].push(c);
+                    }
+                }
+                input_cells_out = cells;
 
                 // condition column (threshold) over n rows (like your Q3 condition)
                 for i in 0..n {
@@ -1405,7 +1553,9 @@ impl<F: Field + Ord> Q18Chip<F> {
                 )?;
                 Ok(out)
             },
-        )
+        )?;
+
+        Ok((out_cell, input_cells_out))
     }
 
     pub fn expose_public(
@@ -1864,10 +2014,10 @@ mod tests {
         // still a valid reduced instance of a smaller input and the Selector
         // Check and Pairwise Consistency both still hold. Only the Cardinality
         // Preservation Check can see this, so the circuit must now reject.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         let failures = verdict.expect_err("condition (3) accepted a hidden joinable tuple");
         assert!(
@@ -1886,10 +2036,10 @@ mod tests {
         // it sees. The two key columns are looked up in each other rather than
         // in a table the prover fills, so this direction tests the condition
         // itself and insists that every one of the four lookups reject.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let all_clean = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = all_clean.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         let failures = verdict.expect_err("condition (2) accepted the all-clean selection");
         assert!(

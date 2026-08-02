@@ -38,7 +38,22 @@ pub(crate) const SHIFT_NATION: u64 = 1u64 << 8; // nationkey_shift <= 25+1 fits
 /// Pairwise Consistency and only condition (4) can catch it. This is exactly
 /// the cheat a residual-side-only argument misses, so the negative test in this
 /// module is what shows the Cardinality Preservation Check is not vacuous.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL: `cargo test` runs modules in parallel threads while synthesis
+/// is single-threaded, so a process-wide flag corrupts every other circuit being
+/// assigned at that moment. That is not hypothetical -- as an `AtomicBool` this
+/// made the q5 witness-binding tests pass in isolation and fail in the full
+/// suite. Same fix as `conserve_idx::set_misplace_one_occurrence`.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook, off in every benchmark path: when set, the prover skips the
 /// semijoin reduction entirely and declares every tuple that passes its
@@ -46,7 +61,22 @@ pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
 /// holds and both channels of condition (4) then agree row by row, so this is the
 /// escape that only Pairwise Consistency can close, and the negative direction
 /// for it in this module is what shows condition (3) is doing work.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL: `cargo test` runs modules in parallel threads while synthesis
+/// is single-threaded, so a process-wide flag corrupts every other circuit being
+/// assigned at that moment. That is not hypothetical -- as an `AtomicBool` this
+/// made the q5 witness-binding tests pass in isolation and fail in the full
+/// suite. Same fix as `conserve_idx::set_misplace_one_occurrence`.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -298,6 +328,30 @@ impl<F: Field + Ord> Q5Chip<F> {
             meta.advice_column(),
         ];
         let region_file = vec![meta.advice_column(), meta.advice_column()];
+
+        // These sixteen columns ARE the committed input columns, in the order
+        // `bench_queries::TpchInput::columns` publishes them for Q5 (customer 2,
+        // orders 3, lineitem 4, supplier 2, nation 3, region 2). Equality-enable
+        // them so a bound wrapper can copy-constrain the binding's data columns
+        // to THESE cells (`inline_bind::tie_columns`). `enable_equality` is
+        // idempotent, so re-enabling elsewhere is safe.
+        //
+        // NOTE for whoever writes that tie: five of the sixteen are NOT stored
+        // verbatim. `assign_with_input_cells` writes `c_nationkey + 1`,
+        // `s_nationkey + 1`, `n_nationkey + 1`, `n_regionkey + 1` and
+        // `r_regionkey + 1`, because 0 is reserved as the "no match" sentinel of
+        // the three tuple lookups and TPC-H really has nationkey 0. See the
+        // doc comment on `assign_with_input_cells`.
+        for c in customer
+            .iter()
+            .chain(orders.iter())
+            .chain(lineitem.iter())
+            .chain(supplier.iter())
+            .chain(nation.iter())
+            .chain(region_file.iter())
+        {
+            meta.enable_equality(*c);
+        }
 
         // conditions
         let cond_europe = meta.advice_column();
@@ -1199,7 +1253,90 @@ impl<F: Field + Ord> Q5Chip<F> {
         }
     }
 
+    /// The baseline entry point, kept so the plain circuit and `q5_obj_dp` are
+    /// unchanged. A thin wrapper over [`Self::assign_with_input_cells`], which
+    /// additionally hands back the cells of the committed input columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn assign(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        customer: Vec<Vec<u64>>,
+        orders: Vec<Vec<u64>>,
+        lineitem: Vec<Vec<u64>>,
+        supplier: Vec<Vec<u64>>,
+        nation: Vec<Vec<u64>>,
+        region_file: Vec<Vec<u64>>,
+        europe_hash: u64,
+        start_ts: u64,
+        end_ts: u64,
+        nr_pad_extra: usize,
+        co_pad_extra: usize,
+        ls_pad_extra: usize,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        self.assign_with_input_cells(
+            layouter,
+            customer,
+            orders,
+            lineitem,
+            supplier,
+            nation,
+            region_file,
+            europe_hash,
+            start_ts,
+            end_ts,
+            nr_pad_extra,
+            co_pad_extra,
+            ls_pad_extra,
+        )
+        .map(|(out, _)| out)
+    }
+
+    /// Same assignment, but also returns the cells holding the sixteen
+    /// committed input columns, in the order `bench_queries::TpchInput::columns`
+    /// publishes them for Q5:
+    ///
+    /// ```text
+    ///    0.. 2  customer  [c_custkey, c_nationkey]
+    ///    2.. 5  orders    [o_orderdate_ts, o_custkey, o_orderkey]
+    ///    5.. 9  lineitem  [l_orderkey, l_suppkey, l_extendedprice*1000, l_discount*1000]
+    ///    9..11  supplier  [s_suppkey, s_nationkey]
+    ///   11..14  nation    [n_nationkey, n_name_hash, n_regionkey]
+    ///   14..16  region    [r_regionkey, r_name_hash]
+    /// ```
+    ///
+    /// `out[j][i]` is this proof's own cell for committed column `j` at row `i`.
+    /// The base relations are never permuted here (only the derived `ls_sorted`
+    /// and `res_sorted` views are, in their own columns), so row `i` of the
+    /// commitment is row `i` of the witness.
+    ///
+    /// ENCODING, which the tie has to respect. Eleven columns hold the committed
+    /// value VERBATIM: 0 (c_custkey), 2..5 (all of orders), 5..9 (all of
+    /// lineitem), 9 (s_suppkey), 12 (n_name_hash) and 15 (r_name_hash). The
+    /// other FIVE hold the committed value PLUS ONE:
+    ///
+    /// ```text
+    ///    1  c_nationkey  ->  c_nationkey + 1
+    ///   10  s_nationkey  ->  s_nationkey + 1
+    ///   11  n_nationkey  ->  n_nationkey + 1
+    ///   13  n_regionkey  ->  n_regionkey + 1
+    ///   14  r_regionkey  ->  r_regionkey + 1
+    /// ```
+    ///
+    /// The shift is load-bearing and cannot be dropped: `q5_derive` maps a
+    /// customer (resp. supplier) with no matching row to nationkey 0 and a
+    /// nation with no matching region to region 0, and TPC-H has a real
+    /// nationkey 0 (ALGERIA) and a real regionkey 0 (AFRICA), so 0 has to stay
+    /// free as the "no match" sentinel. A bound wrapper therefore cannot
+    /// equality-tie those five columns to the binding's data columns directly;
+    /// see the `+1` adapter gate in `q5_bound.rs`.
+    ///
+    /// The binding zero-extends every committed column to the height of the
+    /// tallest relation, so the short relations are extended here with explicit
+    /// zero cells on those rows. No selector covers them, so no gate, lookup or
+    /// permutation of the query reads them; they exist only so that every row
+    /// the binding accumulates is a row this proof witnesses.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn assign_with_input_cells(
         &self,
         layouter: &mut impl Layouter<F>,
         // base inputs
@@ -1216,7 +1353,7 @@ impl<F: Field + Ord> Q5Chip<F> {
         nr_pad_extra: usize,
         co_pad_extra: usize,
         ls_pad_extra: usize,
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         // chips
         let iz_nr_chip = IsZeroChip::construct(self.config.iz_nr.clone());
 
@@ -1342,7 +1479,7 @@ impl<F: Field + Ord> Q5Chip<F> {
         // test hook only: hide one joinable LS tuple in the residual side. The
         // CO and NR indicators below are then recomputed from the reduced clean
         // LS set, so the neighbours are re-reduced around it.
-        let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+        let tamper = hide_one_clean_tuple();
         if tamper {
             if let Some(i) = ls_cln_b.iter().position(|&b| b == 1) {
                 ls_cln_b[i] = 0;
@@ -1353,7 +1490,7 @@ impl<F: Field + Ord> Q5Chip<F> {
         // predicate is declared clean, so all three residual sections come out
         // empty and both channels of condition (4) agree row by row. Only
         // condition (3) can reject this.
-        let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+        let all_clean = mark_all_clean();
         if all_clean {
             for b in ls_cln_b.iter_mut() {
                 *b = 1;
@@ -1548,6 +1685,19 @@ impl<F: Field + Ord> Q5Chip<F> {
         layouter.assign_region(
             || "q5 witness",
             |mut region| {
+                // The cells of the sixteen committed input columns, in the order
+                // `TpchInput::columns` publishes them; see the doc comment for
+                // the offsets and for which five carry the +1 key encoding.
+                let rows_max = customer
+                    .len()
+                    .max(orders.len())
+                    .max(lineitem.len())
+                    .max(supplier.len())
+                    .max(nation.len())
+                    .max(region_file.len());
+                let mut input_cells: Vec<Vec<AssignedCell<F, F>>> =
+                    (0..16).map(|_| Vec::with_capacity(rows_max)).collect();
+
                 // base tables
                 for i in 0..customer.len() {
                     for j in 0..2 {
@@ -1557,12 +1707,13 @@ impl<F: Field + Ord> Q5Chip<F> {
                         } else {
                             customer[i][j]
                         };
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "customer",
                             self.config.customer[j],
                             i,
                             || Value::known(F::from(v)),
                         )?;
+                        input_cells[j].push(cell);
                     }
                 }
                 // TABLE side of the orders->customer lookup: exactly the assigned
@@ -1572,12 +1723,13 @@ impl<F: Field + Ord> Q5Chip<F> {
                 }
                 for i in 0..orders.len() {
                     for j in 0..3 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "orders",
                             self.config.orders[j],
                             i,
                             || Value::known(F::from(orders[i][j])),
                         )?;
+                        input_cells[2 + j].push(cell);
                     }
                     region.assign_advice(
                         || "cond_start",
@@ -1598,12 +1750,13 @@ impl<F: Field + Ord> Q5Chip<F> {
                 }
                 for i in 0..lineitem.len() {
                     for j in 0..4 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "lineitem",
                             self.config.lineitem[j],
                             i,
                             || Value::known(F::from(lineitem[i][j])),
                         )?;
+                        input_cells[5 + j].push(cell);
                     }
                 }
                 // TABLE side of the lineitem->supplier lookup
@@ -1617,52 +1770,87 @@ impl<F: Field + Ord> Q5Chip<F> {
                         } else {
                             supplier[i][j]
                         };
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "supplier",
                             self.config.supplier[j],
                             i,
                             || Value::known(F::from(v)),
                         )?;
+                        input_cells[9 + j].push(cell);
                     }
                 }
                 for i in 0..nation.len() {
                     // nation: shift n_nationkey and n_regionkey
-                    region.assign_advice(
+                    let c_nk = region.assign_advice(
                         || "nation_nk",
                         self.config.nation[0],
                         i,
                         || Value::known(F::from(nation[i][0] + 1)),
                     )?;
-                    region.assign_advice(
+                    let c_nm = region.assign_advice(
                         || "nation_nm",
                         self.config.nation[1],
                         i,
                         || Value::known(F::from(nation[i][1])),
                     )?;
-                    region.assign_advice(
+                    let c_rk = region.assign_advice(
                         || "nation_rk",
                         self.config.nation[2],
                         i,
                         || Value::known(F::from(nation[i][2] + 1)),
                     )?;
+                    input_cells[11].push(c_nk);
+                    input_cells[12].push(c_nm);
+                    input_cells[13].push(c_rk);
                 }
                 // TABLE side of the nation->region lookup
                 for i in 0..region_file.len() {
                     self.config.q_region_tbl.enable(&mut region, i)?;
                 }
                 for i in 0..region_file.len() {
-                    region.assign_advice(
+                    let c_rk = region.assign_advice(
                         || "region_rk",
                         self.config.region_file[0],
                         i,
                         || Value::known(F::from(region_file[i][0] + 1)),
                     )?;
-                    region.assign_advice(
+                    let c_nm = region.assign_advice(
                         || "region_nm",
                         self.config.region_file[1],
                         i,
                         || Value::known(F::from(region_file[i][1])),
                     )?;
+                    input_cells[14].push(c_rk);
+                    input_cells[15].push(c_nm);
+                }
+
+                // The binding zero-extends every committed column to the height
+                // of the tallest relation, so a shorter relation needs a cell of
+                // THIS circuit on those rows too, or the extra rows would be
+                // untied -- exactly the gap the tie exists to close. No selector
+                // covers them (`q_cust_tbl`, `q_oc_join`/`q_co_*`, `q_ls_join`,
+                // `q_supp_tbl`, `q_nr_join`/`q_nr_pred` and `q_region_tbl` all
+                // stop at their own relation's length), so nothing else in the
+                // circuit reads them.
+                for (base, len, off) in [
+                    (&self.config.customer, customer.len(), 0usize),
+                    (&self.config.orders, orders.len(), 2),
+                    (&self.config.lineitem, lineitem.len(), 5),
+                    (&self.config.supplier, supplier.len(), 9),
+                    (&self.config.nation, nation.len(), 11),
+                    (&self.config.region_file, region_file.len(), 14),
+                ] {
+                    for i in len..rows_max {
+                        for (j, col) in base.iter().enumerate() {
+                            let cell = region.assign_advice(
+                                || "committed column zero-extension",
+                                *col,
+                                i,
+                                || Value::known(F::ZERO),
+                            )?;
+                            input_cells[off + j].push(cell);
+                        }
+                    }
                 }
 
                 // ---------- NR materialization assignments (real nation rows) ----------
@@ -2014,17 +2202,41 @@ impl<F: Field + Ord> Q5Chip<F> {
                     &self.config.row_idx,
                     nr_total.max(co_total).max(lineitem.len()),
                 )?;
+                // NR and CO span their DP CAPACITY, not their input length: the
+                // loops above fill rows [n, *_total) with (PAD, PAD) and a zero
+                // indicator, and the conserved relation is that whole extent, so
+                // the witness handed over must carry the same padding. Slicing
+                // the UNPADDED witness to `*_total` instead panics the moment a
+                // released capacity exceeds the input size, which under dp it
+                // always does -- at eps=0.1 the CO release is 4,036 rows on top
+                // of |orders| = 15,000, and `vpjoin full q5` died on exactly
+                // that. Same defect, same fix, as `q5_obj_dp.rs`; `rjs` hid it
+                // because its capacities are zero.
+                let pad_pair = |src: &[Vec<u64>], n: usize, total: usize| -> Vec<Vec<u64>> {
+                    (0..total)
+                        .map(|i| {
+                            if i < n {
+                                src[i].clone()
+                            } else {
+                                vec![PAD_U64, PAD_U64]
+                            }
+                        })
+                        .collect()
+                };
+                let pad_flag = |src: &[u64], n: usize, total: usize| -> Vec<u64> {
+                    (0..total).map(|i| if i < n { src[i] } else { 0 }).collect()
+                };
                 assign_conserve(
                     &mut region,
                     &self.config.cons_nr,
-                    &nr_pair_u64[..nr_total],
-                    &cln_nr[..nr_total],
+                    &pad_pair(&nr_pair_u64, nation.len(), nr_total),
+                    &pad_flag(&cln_nr, nation.len(), nr_total),
                 )?;
                 assign_conserve(
                     &mut region,
                     &self.config.cons_co,
-                    &co_pair_u64[..co_total],
-                    &cln_co[..co_total],
+                    &pad_pair(&co_pair_u64, orders.len(), co_total),
+                    &pad_flag(&cln_co, orders.len(), co_total),
                 )?;
                 assign_conserve(
                     &mut region,
@@ -2254,7 +2466,7 @@ impl<F: Field + Ord> Q5Chip<F> {
                     0,
                     || Value::known(F::from(1u64)),
                 )?;
-                Ok(out)
+                Ok((out, input_cells))
             },
         )
     }
@@ -2858,6 +3070,127 @@ mod tests {
     /// Fast correctness check of the Cardinality Preservation Check: a truncated
     /// slice of the dataset under MockProver, which verifies every gate, shuffle
     /// and lookup of the circuit without paying for a real proof.
+    /// A released NR/CO capacity LARGER than the input table -- the only regime
+    /// `dp` ever produces, and the one no other q5 test covers.
+    #[test]
+    fn dp_capacity_beyond_the_input_tables() {
+        let k = 14;
+
+        // customer, supplier, nation and region are taken whole because the three
+        // tuple lookups of the bag materialization require every referenced key to
+        // be present in its dimension table. orders and lineitem are truncated.
+        //
+        // On this slice every bag really does split, so no section of any
+        // partition is vacuous: NR is 4 clean / 1 residual / 20 pad rows, CO is
+        // 13 clean / 601 residual / 1386 pad rows, LS is 13 clean / 7987
+        // residual, and both sides of condition (4) count 13 join results.
+        const N_ORD: usize = 2000;
+        const N_LINE: usize = 8000;
+
+        let mut customer: Vec<Vec<u64>> = vec![];
+        if let Ok(records) = data_processing::customer_read_records_from_file(
+            &crate::paths::data_file("customer.tbl"),
+        ) {
+            customer = records
+                .iter()
+                .map(|r| vec![r.c_custkey, r.c_nationkey])
+                .collect();
+        }
+
+        let mut orders: Vec<Vec<u64>> = vec![];
+        if let Ok(records) =
+            data_processing::orders_read_records_from_file(&crate::paths::data_file("orders.tbl"))
+        {
+            orders = records
+                .iter()
+                .take(N_ORD)
+                .map(|r| vec![date_to_timestamp(&r.o_orderdate), r.o_custkey, r.o_orderkey])
+                .collect();
+        }
+
+        let mut lineitem: Vec<Vec<u64>> = vec![];
+        if let Ok(records) = data_processing::lineitem_read_records_from_file(
+            &crate::paths::data_file("lineitem.tbl"),
+        ) {
+            lineitem = records
+                .iter()
+                .take(N_LINE)
+                .map(|r| {
+                    vec![
+                        r.l_orderkey,
+                        r.l_suppkey,
+                        scale_by_1000(r.l_extendedprice),
+                        scale_by_1000(r.l_discount),
+                    ]
+                })
+                .collect();
+        }
+
+        let mut supplier: Vec<Vec<u64>> = vec![];
+        if let Ok(records) = data_processing::supplier_read_records_from_file(
+            &crate::paths::data_file("supplier.tbl"),
+        ) {
+            supplier = records
+                .iter()
+                .map(|r| vec![r.s_suppkey, r.s_nationkey])
+                .collect();
+        }
+
+        let mut nation: Vec<Vec<u64>> = vec![];
+        if let Ok(records) =
+            data_processing::nation_read_records_from_file(&crate::paths::data_file("nation.tbl"))
+        {
+            nation = records
+                .iter()
+                .map(|r| vec![r.n_nationkey, string_to_u64(&r.n_name), r.n_regionkey])
+                .collect();
+        }
+
+        let mut region: Vec<Vec<u64>> = vec![];
+        if let Ok(records) =
+            data_processing::region_read_records_from_cvs(&crate::paths::data_file("region.cvs"))
+        {
+            region = records
+                .iter()
+                .map(|r| vec![r.r_regionkey, string_to_u64(&r.r_name)])
+                .collect();
+        }
+
+        assert!(
+            !customer.is_empty()
+                && !orders.is_empty()
+                && !lineitem.is_empty()
+                && !supplier.is_empty()
+                && !nation.is_empty()
+                && !region.is_empty(),
+            "dataset files not found under {}",
+            crate::paths::data_file("customer.tbl")
+        );
+
+        let circuit = MyCircuit::<Fp> {
+            customer,
+            orders,
+            lineitem,
+            supplier,
+            nation,
+            region,
+            europe_hash: string_to_u64("EUROPE"),
+            start_ts: date_to_timestamp("1996-01-01"),
+            end_ts: date_to_timestamp("1998-01-01"),
+            // BOTH strictly greater than 0, so nr_total > |nation| and
+            // co_total > |orders|: the regime `dp` always produces and the one
+            // every other q5 test misses, since they all run at rjs where the
+            // capacities are zero. Slicing the unpadded witness to the capacity
+            // panicked here -- `vpjoin full q5` died on exactly this.
+            nr_pad_extra: 7,
+            co_pad_extra: 20,
+            ls_pad_extra: 30,
+            _marker: PhantomData,
+        };
+
+        let prover = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
+        prover.assert_satisfied();
+    }
     #[test]
     fn test_cardinality_preservation() {
         let k = 14;
@@ -2976,10 +3309,10 @@ mod tests {
         // in the residual side, and the CO and NR bags re-reduced around it so
         // that Conservation, Non-Membership and Pairwise Consistency all still
         // hold. Only condition (4) can see this, so the circuit must now reject.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         let failures = verdict.expect_err("condition (4) accepted a hidden joinable tuple");
         // `all`, not `any`: this direction must reject through the single root-sum
@@ -3002,10 +3335,10 @@ mod tests {
         // channels then agree row by row, so this is the escape that condition (3)
         // exists to close. The two child bags now carry dangling tuples as well,
         // which is what the mirror direction of each edge catches.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = unreduced.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         // Three of the four Pairwise Consistency lookups fire here: LS^c now
         // carries lineitems whose packed key is in no kept order and whose nation

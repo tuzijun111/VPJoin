@@ -295,7 +295,11 @@ fn measure<const NC: usize>(
         &[],
     );
 
-    // bound: inputs + in-circuit evaluation at the Fiat-Shamir challenge
+    // bound: inputs + in-circuit evaluation at the Fiat-Shamir challenge.
+    // COST ONLY: the transcript is a constant stand-in rather than a query
+    // proof, so this `x` is public before the witness is chosen and binds
+    // nothing. The circuit costs the same at any `x`, so the number stands;
+    // the binding does not.
     let x = binding_challenge(&commitments, &[0u8; 32]);
     let evals = vector_evaluations(&columns, k, x);
     let mut instance = vec![x];

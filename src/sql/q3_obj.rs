@@ -29,16 +29,58 @@ const PAD_REV: u64 = 0; // pad revenue (min -> last when DESC)
 
 /// Test hook: deselect one participating order and re-reduce its neighbours
 /// around it, so that (1) and (2) still hold and only (3) can object.
-pub static HIDE_ONE_CLEAN_TUPLE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static HIDE_ONE_CLEAN_TUPLE_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_hide_one_clean_tuple(on: bool) {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.set(on));
+}
+
+fn hide_one_clean_tuple() -> bool {
+    HIDE_ONE_CLEAN_TUPLE_TL.with(|c| c.get())
+}
 
 /// Test hook: select every row that passes its predicate, i.e. no reduction at
 /// all. Both channels of (3) then coincide, so only (2) can object.
-pub static MARK_ALL_CLEAN: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static MARK_ALL_CLEAN_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_mark_all_clean(on: bool) {
+    MARK_ALL_CLEAN_TL.with(|c| c.set(on));
+}
+
+fn mark_all_clean() -> bool {
+    MARK_ALL_CLEAN_TL.with(|c| c.get())
+}
 
 /// Test hook: additionally select one customer row that FAILS the mktsegment
 /// predicate. Only the predicate half of (1) can object, which is the half the
 /// revision added.
-pub static SELECT_A_FILTERED_ROW: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static SELECT_A_FILTERED_ROW_TL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THREAD-LOCAL, not a process-wide flag: `cargo test` runs modules in parallel
+/// threads while circuit synthesis is single-threaded, so a global would corrupt
+/// every other circuit being assigned at that moment. As an `AtomicBool` this
+/// made witness-binding tests pass in isolation and fail in the full suite.
+pub fn set_select_a_filtered_row(on: bool) {
+    SELECT_A_FILTERED_ROW_TL.with(|c| c.set(on));
+}
+
+fn select_a_filtered_row() -> bool {
+    SELECT_A_FILTERED_ROW_TL.with(|c| c.get())
+}
 
 pub trait Field: PrimeField<Repr = [u8; 32]> {}
 impl<F> Field for F where F: PrimeField<Repr = [u8; 32]> {}
@@ -211,14 +253,14 @@ fn build_witness(
 
     // test hook only: no reduction at all, everything that passes its predicate
     // declared clean
-    let all_clean = MARK_ALL_CLEAN.load(Ordering::Relaxed);
+    let all_clean = mark_all_clean();
     if all_clean {
         cln_o = o_check.clone();
     }
 
     // test hook only: deselect one participating order and re-reduce the
     // neighbours around it, so (1) and (2) survive and only (3) objects
-    let tamper = HIDE_ONE_CLEAN_TUPLE.load(Ordering::Relaxed);
+    let tamper = hide_one_clean_tuple();
     if tamper {
         if let Some(i) = cln_o.iter().position(|&f| f == 1) {
             cln_o[i] = 0;
@@ -250,7 +292,7 @@ fn build_witness(
     };
 
     // test hook only: select a customer row that fails its predicate
-    if SELECT_A_FILTERED_ROW.load(Ordering::Relaxed) {
+    if select_a_filtered_row() {
         if let Some(i) = c_check.iter().position(|&b| b == 0) {
             cln_c[i] = 1;
         }
@@ -388,6 +430,16 @@ impl<F: Field + Ord> TestChip<F> {
         let customer = vec![meta.advice_column(), meta.advice_column()];
         let orders = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let lineitem = (0..4).map(|_| meta.advice_column()).collect::<Vec<_>>();
+
+        // These ten columns ARE the committed input columns, in the order
+        // `bench_queries::TpchInput::columns` publishes them (customer 2,
+        // orders 4, lineitem 4). `configure_conserve` already enables equality
+        // on them through `PermAnyChip`, but the bound wrapper's tie to the
+        // binding's data columns must not depend on a side effect of the
+        // Conservation Check, so state it here. `enable_equality` is idempotent.
+        for c in customer.iter().chain(orders.iter()).chain(lineitem.iter()) {
+            meta.enable_equality(*c);
+        }
 
         let condition = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
         let check = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
@@ -1017,6 +1069,10 @@ impl<F: Field + Ord> TestChip<F> {
         }
     }
 
+    /// The baseline entry point, kept so the plain circuit and every other
+    /// caller are unchanged. It is a thin wrapper over
+    /// [`Self::assign_with_input_cells`], which additionally hands back the
+    /// cells of the committed input columns.
     pub fn assign(
         &self,
         layouter: &mut impl Layouter<F>,
@@ -1025,6 +1081,42 @@ impl<F: Field + Ord> TestChip<F> {
         lineitem: Vec<Vec<u64>>,
         condition: [u64; 2],
     ) -> Result<AssignedCell<F, F>, Error> {
+        self.assign_with_input_cells(layouter, customer, orders, lineitem, condition)
+            .map(|(out, _)| out)
+    }
+
+    /// Same assignment, but also returns the cells holding the ten committed
+    /// input columns, in the order `bench_queries::TpchInput::columns`
+    /// publishes them for Q3:
+    ///
+    /// ```text
+    ///   0..2  customer  [c_mktsegment, c_custkey]
+    ///   2..6  orders    [o_orderdate, o_shippriority, o_custkey, o_orderkey]
+    ///   6..10 lineitem  [l_orderkey, l_extendedprice, l_discount, l_shipdate]
+    /// ```
+    ///
+    /// `out[j][i]` is this proof's own cell for committed column `j` at row
+    /// `i`, holding the value VERBATIM (no shift, packing or hashing anywhere
+    /// on this path) and at the committed row position (the base relations are
+    /// never permuted; only the derived `l_sorted` view is sorted, in its own
+    /// columns). That is what lets `inline_bind::tie_columns` copy-constrain the
+    /// binding's data columns to them, so the exposed evaluation is an
+    /// evaluation of THIS proof's witness.
+    ///
+    /// The three relations have different heights and the binding zero-extends
+    /// every committed column to the tallest, so the short columns are extended
+    /// here with explicit zero cells on the same rows. Those rows carry no
+    /// selector, so no gate, lookup or permutation of the query reads them; they
+    /// exist only so that every row the binding accumulates is a row this proof
+    /// witnesses.
+    pub fn assign_with_input_cells(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        customer: Vec<Vec<u64>>,
+        orders: Vec<Vec<u64>>,
+        lineitem: Vec<Vec<u64>>,
+        condition: [u64; 2],
+    ) -> Result<(AssignedCell<F, F>, Vec<Vec<AssignedCell<F, F>>>), Error> {
         // chips
         let equal_chip = IsZeroChip::construct(self.config.equal_condition[0].clone());
 
@@ -1076,17 +1168,24 @@ impl<F: Field + Ord> TestChip<F> {
         layouter.assign_region(
             || "witness",
             |mut region| {
+                // The cells of the ten committed input columns, in publication
+                // order: customer 2, orders 4, lineitem 4.
+                let rows_max = n_c.max(n_o).max(n_l);
+                let mut input_cells: Vec<Vec<AssignedCell<F, F>>> =
+                    (0..10).map(|_| Vec::with_capacity(rows_max)).collect();
+
                 // ---------------- base tables, predicate bits, selectors ----------------
                 for i in 0..n_c {
                     self.config.q_enable[0].enable(&mut region, i)?;
                     self.config.q_row[0].enable(&mut region, i)?;
                     for j in 0..2 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "customer",
                             self.config.customer[j],
                             i,
                             || Value::known(F::from(customer[i][j])),
                         )?;
+                        input_cells[j].push(cell);
                     }
                     region.assign_advice(
                         || "check0",
@@ -1112,12 +1211,13 @@ impl<F: Field + Ord> TestChip<F> {
                     self.config.q_enable[1].enable(&mut region, i)?;
                     self.config.q_row[1].enable(&mut region, i)?;
                     for j in 0..4 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "orders",
                             self.config.orders[j],
                             i,
                             || Value::known(F::from(orders[i][j])),
                         )?;
+                        input_cells[2 + j].push(cell);
                     }
                     region.assign_advice(
                         || "check1",
@@ -1143,12 +1243,13 @@ impl<F: Field + Ord> TestChip<F> {
                     self.config.q_enable[2].enable(&mut region, i)?;
                     self.config.q_row[2].enable(&mut region, i)?;
                     for j in 0..4 {
-                        region.assign_advice(
+                        let cell = region.assign_advice(
                             || "lineitem",
                             self.config.lineitem[j],
                             i,
                             || Value::known(F::from(lineitem[i][j])),
                         )?;
+                        input_cells[6 + j].push(cell);
                     }
                     region.assign_advice(
                         || "check2",
@@ -1174,6 +1275,29 @@ impl<F: Field + Ord> TestChip<F> {
                         i,
                         || Value::known(F::from(l_key_sel_u64[i])),
                     )?;
+                }
+
+                // The binding zero-extends every committed column to the height
+                // of the tallest relation, so a shorter relation needs a cell of
+                // THIS circuit on those rows too, or the extra rows would be
+                // untied -- exactly the gap the tie exists to close. No selector
+                // covers them, so nothing else in the circuit reads them.
+                for (base, len, off, width) in [
+                    (&self.config.customer, n_c, 0usize, 2usize),
+                    (&self.config.orders, n_o, 2, 4),
+                    (&self.config.lineitem, n_l, 6, 4),
+                ] {
+                    for i in len..rows_max {
+                        for j in 0..width {
+                            let cell = region.assign_advice(
+                                || "committed column zero-extension",
+                                base[j],
+                                i,
+                                || Value::known(F::ZERO),
+                            )?;
+                            input_cells[off + j].push(cell);
+                        }
+                    }
                 }
 
                 // the query parameters: constant down each condition column,
@@ -1273,7 +1397,7 @@ impl<F: Field + Ord> TestChip<F> {
                     self.config.q_cp_mu.enable(&mut region, i)?;
                 }
                 let (cp_all, cp_cln) = assign_cp_root(&mut region, &self.config.cp_root, &cp_mu)?;
-                if !tamper && !all_clean && !SELECT_A_FILTERED_ROW.load(Ordering::Relaxed) {
+                if !tamper && !all_clean && !select_a_filtered_row() {
                     debug_assert_eq!(
                         cp_all, cp_cln,
                         "cardinality preservation: |R^c join| != |R^p join|"
@@ -1442,7 +1566,7 @@ impl<F: Field + Ord> TestChip<F> {
                     0,
                     || Value::known(F::from(1)),
                 )?;
-                Ok(out)
+                Ok((out, input_cells))
             },
         )
     }
@@ -1838,10 +1962,10 @@ mod tests {
         // One participating order deselected, its neighbours re-reduced around
         // it, so the Selector Check and Pairwise Consistency both still hold.
         // Only the Cardinality Preservation Check can see this.
-        super::HIDE_ONE_CLEAN_TUPLE.store(true, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(true);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
-        super::HIDE_ONE_CLEAN_TUPLE.store(false, Ordering::Relaxed);
+        super::set_hide_one_clean_tuple(false);
 
         let failures = verdict.expect_err("condition (3) accepted a hidden participating tuple");
         assert!(
@@ -1855,10 +1979,10 @@ mod tests {
         // No reduction at all: every row that passes its predicate selected.
         // Both channels of (3) then agree row by row, so this is the escape
         // that Pairwise Consistency exists to close.
-        super::MARK_ALL_CLEAN.store(true, Ordering::Relaxed);
+        super::set_mark_all_clean(true);
         let unreduced = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = unreduced.verify();
-        super::MARK_ALL_CLEAN.store(false, Ordering::Relaxed);
+        super::set_mark_all_clean(false);
 
         let failures = verdict.expect_err("condition (2) accepted an unreduced clean instance");
         assert!(
@@ -1986,10 +2110,10 @@ mod tests {
             _marker: PhantomData,
         };
 
-        super::SELECT_A_FILTERED_ROW.store(true, Ordering::Relaxed);
+        super::set_select_a_filtered_row(true);
         let tampered = MockProver::run(k, &circuit, vec![vec![Fp::from(1)]]).unwrap();
         let verdict = tampered.verify();
-        super::SELECT_A_FILTERED_ROW.store(false, Ordering::Relaxed);
+        super::set_select_a_filtered_row(false);
 
         let failures = verdict.expect_err("the Selector Check accepted a filtered-out row");
         assert!(
