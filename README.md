@@ -92,21 +92,12 @@ cargo vpjoin full
 ```
 
 
-
-
 **2. Additional in-circuit cost of binding a proof to a committed database.**
 
 ```bash
 cargo commit-diff reps=10 q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4
 ```
 
-
-
-`commit_diff` builds its own paired circuits (`inline_bind::tpch_paired` /
-`graph_paired`) rather than going through the shared query dispatch. The bound
-wrappers in `*_bound.rs` delegate to the `*_obj.rs` chips, so each pair is the
-One-Pass circuit with and without the binding gates, over the same circuit the
-commands above prove.
 
 **3. DP-guided padding** for the three cyclic queries.
 
