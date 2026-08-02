@@ -68,15 +68,6 @@ cargo build --release
 
 ## Running the Benchmarks
 
-
-The three-condition One-Pass OBJ is the only realization each query ships.
-`src/sql/*_obj.rs` and `src/graph_sql/*_obj.rs`, and the DP-padded
-`*_obj_dp.rs` variants, all certify (7) Conservation, (9) Pairwise Consistency
-and (10) Cardinality Preservation as selector bits on the committed rows, and
-every command below proves that. The earlier four-condition circuits that
-materialized a partition are gone, so no environment variable selects between
-realizations and the `config` column no longer carries a `+new` tag.
-
 **1. VPJoin proving time**, 5 TPC-H queries plus 4 graph queries on 3 datasets without
 the database-commitment layer:
 
