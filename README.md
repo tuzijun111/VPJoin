@@ -97,7 +97,7 @@ cargo vpjoin full
 **2. Additional in-circuit cost of binding a proof to a committed database.**
 
 ```bash
-cargo commit-diff reps=5 q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4
+cargo commit-diff reps=10 q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4
 ```
 
 
@@ -111,7 +111,7 @@ commands above prove.
 **3. DP-guided padding** for the three cyclic queries.
 
 ```bash
-VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=3 q5 gq3 gq4
+VPJOIN_EPS=0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10 VPJOIN_DP_SEED=1 cargo run --bin dp_lane_bench -- reps=10 q5 gq3 gq4
 ```
 
 
