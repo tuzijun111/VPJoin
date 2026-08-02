@@ -247,8 +247,13 @@ pub fn degree_for(query: &str, dataset: &str, privacy: Privacy) -> u32 {
 
         ("q3" | "q8" | "q9" | "q18", _) => ceil_log2(lineitem_rows() as u64 + 64),
 
-        // Path queries: k = 17 on all three graphs (measured).
-        ("gq1" | "gq2", _) => 17,
+        // Path queries: every section of the circuit is |E| rows tall in its
+        // own columns, so the row budget is the Edge relation plus its
+        // sentinel row -- the same convention `graph_rows` uses -- and the
+        // degree follows the dataset instead of pinning the largest graphs'
+        // k = 17 on all three. LastFM derives 15 (MockProver-verified),
+        // Facebook and Wikipedia still derive 17.
+        ("gq1" | "gq2", _) => ceil_log2(load_graph(dataset).len() as u64 + 2 + 64),
 
         ("gq3" | "gq4", _) => graph_degree(query, dataset, privacy),
 

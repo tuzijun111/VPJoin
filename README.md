@@ -84,11 +84,6 @@ the database-commitment layer:
 cargo vpjoin simplification
 ```
 
-Cyclic queries by revealing the true join results size.
-```bash
-VPJOIN_PRIVACY=rjs cargo vpjoin simplification q5 gq3 gq4
-```
-
 The same harness proves the **full** system, query circuit plus the complete
 database-commitment layer:
 
@@ -96,19 +91,16 @@ database-commitment layer:
 cargo vpjoin full
 ```
 
-Prefix any of these with `VPJOIN_PLAN_ONLY=1` to print the planned degrees and
-check the parameter files exist without proving anything.
 
 
-**2. Additional in-circuit cost of binding a proof to a committed database.** The reported cost is the median paired difference:
 
-```bash
-cargo commit-diff reps=3 q3 q8 q9 q18 gq1 gq2
-```
+**2. Additional in-circuit cost of binding a proof to a committed database.**
 
 ```bash
-VPJOIN_PRIVACY=rjs cargo commit-diff reps=3 q5 gq3 gq4
+cargo commit-diff reps=5 q3 q5 q8 q9 q18 gq1 gq2 gq3 gq4
 ```
+
+
 
 `commit_diff` builds its own paired circuits (`inline_bind::tpch_paired` /
 `graph_paired`) rather than going through the shared query dispatch. The bound

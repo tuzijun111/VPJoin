@@ -795,11 +795,19 @@ mod tests {
                 name, b.advice, d.advice, d.advice - b.advice, 100.0 * frac, base_s, frac * base_s
             );
         }
-        row::<q3_obj::MyCircuit<Fp>, BoundQ3>("q3", 24.2);
-        row::<q8_obj::MyCircuit<Fp>, BoundQ8>("q8", 18.1);
-        row::<q9_obj::MyCircuit<Fp>, BoundQ9>("q9", 20.1);
-        row::<q18_obj::MyCircuit<Fp>, BoundQ18>("q18", 12.6);
-        row::<g_sql2_obj::GraphPath4OrderCircuit<Fp>, BoundGq2>("gq2", 96.5);
+        // Base times: `simplification.csv`, 2026-08-02 (dp eps=0.1 for
+        // q5/gq3/gq4; graph rows are per dataset, largest k shown).
+        row::<q3_obj::MyCircuit<Fp>, BoundQ3>("q3", 43.9);
+        row::<q5_obj::MyCircuit<Fp>, BoundQ5>("q5", 82.6);
+        row::<q8_obj::MyCircuit<Fp>, BoundQ8>("q8", 89.2);
+        row::<q9_obj::MyCircuit<Fp>, BoundQ9>("q9", 73.4);
+        row::<q18_obj::MyCircuit<Fp>, BoundQ18>("q18", 39.0);
+        row::<g_sql1_obj::Path3OrdCircuit<Fp>, BoundGq1>("gq1:wiki", 85.4);
+        row::<g_sql2_obj::GraphPath4OrderCircuit<Fp>, BoundGq2>("gq2:wiki", 126.7);
+        row::<g_sql3_obj::MyCircuit<Fp>, BoundGq3>("gq3:lastfm", 371.6);
+        row::<g_sql3_obj::MyCircuit<Fp>, BoundGq3>("gq3:wiki", 2673.1);
+        row::<g_sql4_obj::MyCircuit<Fp>, BoundGq4>("gq4:lastfm", 394.4);
+        row::<g_sql4_obj::MyCircuit<Fp>, BoundGq4>("gq4:wiki", 3108.6);
     }
 
     /// Post-compression gate cost: `compress_selectors` runs inside keygen and
