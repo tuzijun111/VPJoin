@@ -144,6 +144,6 @@ VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=21403 cargo vpjoin simplification gq3:lastfm
 
 ## 📚 Citation
 
-This work will appear in the Proceedings of ACM SIGMOD 2027.
+This work will appear in the Proceedings of ACM SIGMOD 2027. The paper is available at [https://tuzijun111.github.io/](https://tuzijun111.github.io/).
 
 Citation details will be added once available.
