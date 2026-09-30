@@ -140,3 +140,10 @@ VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=65520 VPJOIN_K=16 cargo vpjoin simplificatio
 ```bash
 VPJOIN_PRIVACY=rjs VPJOIN_MAX_EDGES=21403 cargo vpjoin simplification gq3:lastfm gq4:lastfm
 ```
+
+
+## 📚 Citation
+
+This work will appear in the Proceedings of ACM SIGMOD 2027.
+
+Citation details will be added once available.
